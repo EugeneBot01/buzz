@@ -3416,7 +3416,15 @@ mod tests {
         )
         .await;
 
-        assert_ne!(expected, axum::http::StatusCode::FORBIDDEN);
+        // Unbound host → 404; bound host → NIP-11 fallback → 200. Anything
+        // else means an upstream failure that could mask the comparison.
+        assert!(
+            matches!(
+                expected,
+                axum::http::StatusCode::OK | axum::http::StatusCode::NOT_FOUND
+            ),
+            "no-map baseline must be 200 or 404, got {expected}"
+        );
         assert_eq!(
             status, expected,
             "WS admission for a key NOT in the deny map must reach the no-map downstream outcome"

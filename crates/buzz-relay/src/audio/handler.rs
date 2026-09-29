@@ -5609,7 +5609,8 @@ mod tests {
     //      still PASSES.
     //      Use W_admin_disconnect_at_deny_check (hook at before_deny_set_check,
     //      the old gap) to catch this regression instead — that witness is RED
-    //      under the pass-1 ordering. (See W_addc above.)
+    //      when the sender is registered after that window. (See
+    //      w_admin_disconnect_at_deny_check_delivers_payload_then_terminates below.)
     #[tokio::test]
     async fn admin_disconnect_nip_fi_delivers_restricted_json_then_terminates() {
         use buzz_auth::VerifiedAssertion;
@@ -5821,8 +5822,8 @@ mod tests {
     //   A) Move `set_terminal_frame_sender` to AFTER the hook window (into the B1
     //      block, after the deny-set check)
     //      → when disconnect_nip_fi fires at the before_deny_set_check window, the
-    //      slot is still `None` → nothing enqueued → check_cancel!() drains nothing
-    //      → client sees termination with no preceding Text frame → frame-0
+    //      slot is still `None` → nothing enqueued → the S3 drain-and-drop exit
+    //      has no frame to send → client sees termination with no preceding Text frame → frame-0
     //      assertion panics.
     //   B) Remove `set_terminal_frame_sender` entirely → same outcome as (A).
     #[tokio::test]
