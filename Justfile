@@ -480,7 +480,8 @@ test-unit:
         # abnormal-stream-close fanout, and never-ready-sink writer witnesses —
         # are all selected by audio::join::tests and audio::handler::tests.
         # DB-backed audio join tests use #[ignore] and run in the postgres lane.
-        # NIP-FI (S3) relay witnesses: the wholly-new nip_fi_upgrade module,
+        # NIP-FI (S3/S4) relay witnesses: the wholly-new nip_fi_upgrade and
+        # api::nip_fi modules,
         # the auth metrics contract module, plus the exact NIP-FI tests added,
         # or whose assertions changed, in mixed modules (audio::room,
         # connection, handlers::*, state). nip_fi_config and router are
@@ -517,7 +518,19 @@ test-unit:
                 + test(=handlers::event::tests::p1b_agent_observer_event_barrier_expiry_blocks_fanout_and_ack)
                 + test(=handlers::req::tests::p1a_huddle_liveness_req_barrier_expiry_blocks_query_and_emission)
                 + test(=state::tests::f3_cancellation_during_check_terminates_socket_without_waiting_for_check)
-                + test(=state::tests::on_not_run_runs_once_on_each_deny_arm_and_never_on_admit)'
+                + test(=state::tests::on_not_run_runs_once_on_each_deny_arm_and_never_on_admit)
+                + test(=state::tests::conn_manager_disconnect_nip_fi_ignores_unproven_connection)
+                + test(=state::tests::conn_manager_disconnect_nip_fi_is_issuer_scoped)
+                + test(=state::tests::conn_manager_disconnect_nip_fi_sets_authorization_denied_reason)
+                + test(=state::tests::nip_fi_disconnect_audio_is_issuer_scoped)
+                + test(=state::tests::nip_fi_disconnect_closes_proven_audio_socket_and_sends_policy_close_reason)
+                + test(=state::tests::nip_fi_disconnect_closes_target_audio_only_and_preserves_collocated_peer)
+                + test(=state::tests::nip_fi_disconnect_does_not_close_different_pubkey_audio_socket)
+                + test(=state::tests::nip_fi_disconnect_does_not_close_unproven_audio_socket)
+                + test(=state::tests::community_disconnect_then_nip_fi_keeps_community_deleted_reason)
+                + test(=state::tests::disconnect_community_wins_reason_losing_nip_fi_does_not_enqueue_frame)
+                + test(=state::tests::manager_wins_reason_enqueues_frame_then_losing_delete_does_not)
+                + test(/^api::nip_fi::/)'
         # ACP author-gate and queue tests protect the trust boundary between
         # relay events and agent prompts. They are infra-free; ignored lifecycle
         # tests remain excluded and run in their dedicated integration lanes.

@@ -7646,12 +7646,16 @@ mod postgres_tests {
             conn_id,
             tx,
             ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             None,
             tokio_util::sync::CancellationToken::new(),
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
         );
         state
             .conn_manager
@@ -9334,12 +9338,16 @@ mod postgres_tests {
             conn_id,
             tx,
             ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             None,
             tokio_util::sync::CancellationToken::new(),
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
         );
         state
             .conn_manager
@@ -9599,12 +9607,16 @@ mod postgres_tests {
             conn_id,
             tx,
             ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             None,
             tokio_util::sync::CancellationToken::new(),
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
         );
         state
             .conn_manager
@@ -10474,12 +10486,16 @@ mod postgres_tests {
             conn_id,
             tx,
             ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             None,
             tokio_util::sync::CancellationToken::new(),
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
         );
         state
             .conn_manager
@@ -10734,12 +10750,16 @@ mod postgres_tests {
             conn_id,
             tx,
             ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             None,
             tokio_util::sync::CancellationToken::new(),
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
         );
         state
             .conn_manager
@@ -10932,12 +10952,16 @@ mod postgres_tests {
             conn_id,
             tx,
             ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             None,
             tokio_util::sync::CancellationToken::new(),
             cid,
             std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
         );
         state
             .conn_manager

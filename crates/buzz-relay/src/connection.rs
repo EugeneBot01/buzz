@@ -112,6 +112,10 @@ pub struct ConnectionState {
     pub backpressure_count: Arc<AtomicU8>,
     /// Configurable slow-client grace limit (from `Config::slow_client_grace_limit`).
     pub grace_limit: u8,
+    /// Lifecycle control shared with the community registry; the auth
+    /// handler's post-registration deny check routes its denial through it.
+    /// [FI-TRACE-DENY-SET]
+    pub(crate) community_control: crate::state::CommunityConnectionControl,
 
     /// The NIP-FI assertion presented at upgrade, when enforcement is enabled.
     ///
@@ -595,6 +599,7 @@ async fn handle_active_connection(
         nip_fi_assertion,
         session_deadline,
         nip_fi_gate: nip_fi_gate.clone(),
+        community_control: control.clone(),
     });
 
     info!(conn_id = %conn_id, addr = %addr, "WebSocket connection established");
@@ -625,12 +630,14 @@ async fn handle_active_connection(
         conn_id,
         tx.clone(),
         ctrl_tx.clone(),
+        conn.terminal_ctrl_tx.clone(),
         Some(restart_tx),
         cancel.clone(),
         conn.tenant.community(),
         Arc::clone(&backpressure_count),
         subscriptions,
         state.config.slow_client_grace_limit,
+        control.clone(),
     );
 
     let (ws_send, ws_recv) = socket.split();
@@ -1324,6 +1331,7 @@ pub(crate) mod tests {
             nip_fi_assertion: None,
             session_deadline: None,
             nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+            community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
         };
         (Arc::new(conn), send_rx)
     }
@@ -2641,6 +2649,7 @@ pub(crate) mod tests {
             nip_fi_assertion: None,
             session_deadline: None,
             nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+            community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
         });
 
         let state = crate::state::tests::test_state().await;

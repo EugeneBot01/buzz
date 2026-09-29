@@ -44,6 +44,8 @@ pub(crate) type ScopedPubkeyKey = (CommunityId, [u8; 32]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommunityDisconnectReason {
     CommunityDeleted,
+    /// NIP-FI: the connection's proven pubkey was added to the deny set.
+    AuthorizationDenied,
 }
 
 impl CommunityDisconnectReason {
@@ -53,7 +55,24 @@ impl CommunityDisconnectReason {
                 code: axum::extract::ws::close_code::POLICY,
                 reason: WsUtf8Bytes::from_static("community deleted"),
             })),
+            Self::AuthorizationDenied => WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+                code: axum::extract::ws::close_code::POLICY,
+                reason: WsUtf8Bytes::from_static("authorization denied"),
+            })),
         }
+    }
+}
+
+/// NIP-42-proven key and the NIP-FI issuer a socket was admitted under.
+#[derive(Clone)]
+struct ProvenIdentity {
+    pubkey: Vec<u8>,
+    nip_fi_issuer: Option<String>,
+}
+
+impl ProvenIdentity {
+    fn matches(&self, issuer: &str, pubkey: &[u8]) -> bool {
+        self.pubkey == pubkey && self.nip_fi_issuer.as_deref() == Some(issuer)
     }
 }
 
@@ -62,12 +81,23 @@ impl CommunityDisconnectReason {
 pub(crate) struct CommunityConnectionControl {
     cancel: CancellationToken,
     reason_tx: watch::Sender<Option<CommunityDisconnectReason>>,
+    /// NIP-42-proven pubkey plus the NIP-FI issuer the session was admitted
+    /// under; matched by the registry's `disconnect_nip_fi` scan.  [FI-TRACE-DENY-SET]
+    proven_identity: Arc<std::sync::RwLock<Option<ProvenIdentity>>>,
+    /// Serializes NIP-FI denial writers across reason-win + terminal enqueue,
+    /// and holds the audio terminal-frame sender (root connections leave it `None`).
+    terminal_frame_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<WsMessage>>>>,
 }
 
 impl CommunityConnectionControl {
     pub(crate) fn new(cancel: CancellationToken) -> Self {
         let (reason_tx, _reason_rx) = watch::channel(None);
-        Self { cancel, reason_tx }
+        Self {
+            cancel,
+            reason_tx,
+            proven_identity: Arc::new(std::sync::RwLock::new(None)),
+            terminal_frame_tx: Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
@@ -76,6 +106,111 @@ impl CommunityConnectionControl {
 
     pub(crate) fn disconnect_reason(&self) -> watch::Receiver<Option<CommunityDisconnectReason>> {
         self.reason_tx.subscribe()
+    }
+
+    /// Records the NIP-42-proven pubkey and admitting NIP-FI issuer for this
+    /// connection so the registry can close it via `disconnect_nip_fi`.
+    pub(crate) fn set_proven_identity(&self, pubkey: Vec<u8>, nip_fi_issuer: Option<String>) {
+        if let Ok(mut slot) = self.proven_identity.write() {
+            *slot = Some(ProvenIdentity {
+                pubkey,
+                nip_fi_issuer,
+            });
+        }
+    }
+
+    /// Registers the audio terminal-frame sender so `disconnect_nip_fi` can
+    /// enqueue the denial payload before cancelling.
+    ///
+    /// Called by `handle_active_audio_connection` immediately after the terminal
+    /// channel is created (before any `check_cancel!` or `send_loop`).  The
+    /// sender is optional — root relay connections leave this unset and rely on
+    /// the separate `ctrl_tx` path in `ConnectionManager::disconnect_nip_fi`.
+    pub(crate) fn set_terminal_frame_sender(&self, tx: mpsc::Sender<WsMessage>) {
+        let mut slot = self
+            .terminal_frame_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(tx);
+    }
+
+    /// Terminal transition for the post-registration deny-set check in the
+    /// auth handler: under the transition lock, publishes `AuthorizationDenied`
+    /// first-writer-wins and enqueues the denial frame only if it won.  Does
+    /// not cancel; the caller cancels after this returns.  [FI-TRACE-DENY-SET]
+    pub(crate) fn auth_deny_terminal(
+        &self,
+        frame_tx: &mpsc::Sender<WsMessage>,
+        route: crate::nip_fi_session::NipFiWsRoute,
+    ) {
+        let _lock = self
+            .terminal_frame_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let won = self.reason_tx.send_if_modified(|current| match current {
+            None => {
+                *current = Some(CommunityDisconnectReason::AuthorizationDenied);
+                true
+            }
+            Some(_) => false,
+        });
+        if won {
+            let _ = frame_tx.try_send(crate::nip_fi_session::denial_frame(
+                route,
+                buzz_auth::DenialClass::AuthorizationDenied,
+            ));
+        }
+    }
+
+    /// Denial transition for `ConnectionManager::disconnect_nip_fi`: same
+    /// winner-only enqueue as `auth_deny_terminal`, on the root connection's
+    /// `terminal_ctrl_tx` (drained first by `send_loop` on cancel), then cancels.
+    pub(crate) fn manager_disconnect_nip_fi(&self, frame_tx: &mpsc::Sender<WsMessage>) {
+        let slot = self
+            .terminal_frame_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let won = self.reason_tx.send_if_modified(|current| match current {
+            None => {
+                *current = Some(CommunityDisconnectReason::AuthorizationDenied);
+                true
+            }
+            Some(_) => false,
+        });
+        if won {
+            let _ = frame_tx.try_send(crate::nip_fi_session::denial_frame(
+                crate::nip_fi_session::NipFiWsRoute::Root,
+                buzz_auth::DenialClass::AuthorizationDenied,
+            ));
+        }
+        drop(slot);
+        self.cancel.cancel();
+    }
+
+    /// Denial transition for registry sockets (audio): winner-only enqueue on
+    /// the sender registered by `set_terminal_frame_sender`, then cancel.
+    fn disconnect_nip_fi(&self) {
+        let slot = self
+            .terminal_frame_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let won = self.reason_tx.send_if_modified(|current| match current {
+            None => {
+                *current = Some(CommunityDisconnectReason::AuthorizationDenied);
+                true
+            }
+            Some(_) => false,
+        });
+        if won {
+            if let Some(ref tx) = *slot {
+                let _ = tx.try_send(crate::nip_fi_session::denial_frame(
+                    crate::nip_fi_session::NipFiWsRoute::Audio,
+                    buzz_auth::DenialClass::AuthorizationDenied,
+                ));
+            }
+        }
+        drop(slot);
+        self.cancel.cancel();
     }
 
     fn disconnect_community(&self) {
@@ -97,6 +232,9 @@ struct ConnEntry {
     /// the send loop. Used to deliver a ban-disconnect frame that must reach
     /// the client before the socket is closed (see [`ConnectionManager::disconnect_pubkey`]).
     ctrl_tx: mpsc::Sender<WsMessage>,
+    /// Dedicated one-slot sender for the terminal NIP-FI denial frame, drained
+    /// first by `send_loop` on cancel.
+    terminal_ctrl_tx: mpsc::Sender<WsMessage>,
     restart_tx: Option<mpsc::Sender<RestartClose>>,
     cancel: CancellationToken,
     /// Community resolved from the connection host at handshake. This is the
@@ -107,7 +245,13 @@ struct ConnEntry {
     backpressure_count: Arc<AtomicU8>,
     subscriptions: ConnectionSubscriptions,
     authenticated_pubkey: Arc<std::sync::RwLock<Option<Vec<u8>>>>,
+    /// NIP-FI issuer the session was admitted under.  Written while holding
+    /// the `authenticated_pubkey` write lock and read under its read lock, so
+    /// `disconnect_nip_fi` never sees the pubkey without its issuer.
+    nip_fi_issuer: std::sync::RwLock<Option<String>>,
     grace_limit: u8,
+    /// Lifecycle control used by `disconnect_nip_fi` for the denial transition.
+    community_control: CommunityConnectionControl,
 }
 
 /// Community-scoped lifecycle registry shared by every long-lived socket type.
@@ -155,6 +299,39 @@ impl CommunityConnectionRegistry {
         for entry in self.connections.iter() {
             if entry.value().0 == community_id {
                 entry.value().1.disconnect_community();
+                closed += 1;
+            }
+        }
+        closed
+    }
+
+    /// Disconnects every registered socket admitted under NIP-FI `issuer` whose
+    /// proven pubkey matches `pubkey`, across all communities.  A same-key
+    /// socket admitted under a different issuer (or with no assertion) is not
+    /// matched: this issuer's deny entry cannot block it.  [FI-TRACE-DENY-SET]
+    ///
+    /// Called by the admin disconnect route (`api/nip_fi.rs`) and the cross-pod
+    /// apply closure (`apply_nip_fi_disconnect`), each alongside
+    /// `ConnectionManager::disconnect_nip_fi` for Nostr relay connections.
+    /// A match fires `AuthorizationDenied`, which the send loop turns into a 1008
+    /// close frame before the socket shuts down.  Sockets not yet registered with
+    /// a proven identity are not matched; admission registers the identity first
+    /// and then runs the deny-set check, so such a socket is rejected there.
+    ///
+    /// Returns the number of connections closed.
+    pub fn disconnect_nip_fi(&self, issuer: &str, pubkey: &[u8]) -> usize {
+        let mut closed = 0;
+        for entry in self.connections.iter() {
+            let matches = entry
+                .value()
+                .1
+                .proven_identity
+                .read()
+                .ok()
+                .and_then(|v| v.as_ref().map(|id| id.matches(issuer, pubkey)))
+                .unwrap_or(false);
+            if matches {
+                entry.value().1.disconnect_nip_fi();
                 closed += 1;
             }
         }
@@ -411,12 +588,14 @@ impl ConnectionManager {
         conn_id: Uuid,
         tx: mpsc::Sender<WsMessage>,
         ctrl_tx: mpsc::Sender<WsMessage>,
+        terminal_ctrl_tx: mpsc::Sender<WsMessage>,
         restart_tx: Option<mpsc::Sender<RestartClose>>,
         cancel: CancellationToken,
         community_id: CommunityId,
         backpressure_count: Arc<AtomicU8>,
         subscriptions: ConnectionSubscriptions,
         grace_limit: u8,
+        community_control: CommunityConnectionControl,
     ) {
         let drain_ctrl_tx = ctrl_tx.clone();
         let drain_cancel = cancel.clone();
@@ -425,13 +604,16 @@ impl ConnectionManager {
             ConnEntry {
                 tx,
                 ctrl_tx,
+                terminal_ctrl_tx,
                 restart_tx,
                 cancel,
                 community_id,
                 backpressure_count,
                 subscriptions,
                 authenticated_pubkey: Arc::new(std::sync::RwLock::new(None)),
+                nip_fi_issuer: std::sync::RwLock::new(None),
                 grace_limit,
+                community_control,
             },
         );
         // Insert-then-check pairs with drain_all's store-then-iterate: either
@@ -455,8 +637,24 @@ impl ConnectionManager {
 
     /// Record the authenticated pubkey for a connection after NIP-42 succeeds.
     pub fn set_authenticated_pubkey(&self, conn_id: Uuid, pubkey_bytes: Vec<u8>) {
+        self.set_authenticated_identity(conn_id, pubkey_bytes, None);
+    }
+
+    /// Record the authenticated pubkey and the NIP-FI issuer it was admitted
+    /// under as one unit: the issuer is written while the pubkey write lock is
+    /// held, so a concurrent `disconnect_nip_fi` scan that sees the pubkey also
+    /// sees its issuer.  [FI-TRACE-DENY-SET]
+    pub(crate) fn set_authenticated_identity(
+        &self,
+        conn_id: Uuid,
+        pubkey_bytes: Vec<u8>,
+        nip_fi_issuer: Option<String>,
+    ) {
         if let Some(entry) = self.connections.get(&conn_id) {
             if let Ok(mut slot) = entry.authenticated_pubkey.write() {
+                if let Ok(mut issuer_slot) = entry.nip_fi_issuer.write() {
+                    *issuer_slot = nip_fi_issuer;
+                }
                 *slot = Some(pubkey_bytes);
             }
         }
@@ -545,6 +743,47 @@ impl ConnectionManager {
                     .ctrl_tx
                     .try_send(WsMessage::Text(frame.clone().into()));
                 entry.cancel.cancel();
+                closed += 1;
+            }
+        }
+        closed
+    }
+
+    /// Close all live connections admitted under NIP-FI `issuer` whose proven
+    /// pubkey equals `pubkey`, **across all communities**.
+    ///
+    /// Used by the NIP-FI admin disconnect API: the deny entry is keyed by
+    /// `(issuer, pubkey)` and spans every community this relay serves under
+    /// that issuer, so the scan is issuer-scoped but not community-fenced.  A
+    /// same-key connection admitted under a different issuer (or with no
+    /// assertion) is never matched.  [FI-TRACE-DENY-SET]
+    ///
+    /// Enqueues the `authorization_denied` NOTICE on the dedicated
+    /// `terminal_ctrl_tx` channel before cancelling; the send loop drains that
+    /// channel first on cancel, so the denial is delivered even when the
+    /// ordinary control buffer is full.
+    ///
+    /// Returns the number of connections closed.
+    pub fn disconnect_nip_fi(&self, issuer: &str, pubkey: &[u8]) -> usize {
+        let mut closed = 0usize;
+        for entry in self.connections.iter() {
+            let matches = entry
+                .authenticated_pubkey
+                .read()
+                .ok()
+                .map(|stored| {
+                    stored.as_deref() == Some(pubkey)
+                        && entry
+                            .nip_fi_issuer
+                            .read()
+                            .is_ok_and(|iss| iss.as_deref() == Some(issuer))
+                })
+                .unwrap_or(false);
+            if matches {
+                // Winner-only enqueue on the terminal channel, then cancel.
+                entry
+                    .community_control
+                    .manager_disconnect_nip_fi(&entry.terminal_ctrl_tx);
                 closed += 1;
             }
         }
@@ -962,6 +1201,21 @@ pub struct AppState {
     /// can warm it at startup and drive the background refresh loop.
     /// `None` iff `nip_fi_verifier` is `None`.
     pub nip_fi_jwks_source: Option<Arc<buzz_auth::ProductionJwksSource>>,
+
+    // ── NIP-FI command API (S4) ────────────────────────────────────────────
+    /// Shared in-memory deny set for NIP-FI.  Absent when mode is `Off`.
+    ///
+    /// Written by the admin disconnect endpoint; read at WS admission (S4 item
+    /// 4) and HTTP admission (`nip_fi_http`): one `Arc`, never a second map.
+    pub nip_fi_deny_map: Option<Arc<buzz_auth::NipFiDenyMap>>,
+
+    /// Command JWT verifier for the NIP-FI admin disconnect endpoint.
+    ///
+    /// `None` when mode is `Off` (no command API is reachable).  When
+    /// `Some`, the verifier owns a reference to `nip_fi_deny_map` so the
+    /// atomic jti-reservation + deny-entry insertion happens inside `verify()`.
+    pub nip_fi_command_verifier:
+        Option<Arc<buzz_auth::CommandVerifier<Arc<buzz_auth::ProductionJwksSource>>>>,
 }
 
 impl AppState {
@@ -1145,6 +1399,12 @@ impl AppState {
             mesh: Arc::new(std::sync::OnceLock::new()),
             nip_fi_verifier,
             nip_fi_jwks_source,
+            // NIP-FI deny map and command verifier are initialized lazily by
+            // `build_nip_fi_command_components` in `api::nip_fi`, called from
+            // `main.rs` after startup validation.  `None` is safe before that
+            // call: the endpoint returns 503 when the verifier is absent.
+            nip_fi_deny_map: None,
+            nip_fi_command_verifier: None,
         };
         (
             state,
@@ -1677,14 +1937,391 @@ pub(crate) mod tests {
             conn_id,
             tx,
             ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             None,
             cancel.clone(),
             buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
             Arc::clone(&bp),
             Arc::new(Mutex::new(HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(cancel.clone()),
         );
         (mgr, conn_id, rx, ctrl_rx, cancel, bp)
+    }
+
+    // ── NIP-FI S4 disconnect/deny witnesses ──
+    #[test]
+    fn conn_manager_disconnect_nip_fi_ignores_unproven_connection() {
+        let mgr = ConnectionManager::new();
+        let conn_id = Uuid::new_v4();
+        let pubkey = vec![0xabu8; 32];
+
+        let (tx, _rx) = mpsc::channel(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        let control = CommunityConnectionControl::new(cancel.clone());
+        let reason_rx = control.disconnect_reason();
+
+        mgr.register(
+            conn_id,
+            tx,
+            ctrl_tx,
+            mpsc::channel(1).0,
+            None,
+            cancel.clone(),
+            buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(Mutex::new(HashMap::new())),
+            3,
+            control,
+        );
+        // No set_authenticated_pubkey — simulates pre-NIP-42 state.
+
+        let closed = mgr.disconnect_nip_fi("test-issuer", &pubkey);
+
+        assert_eq!(closed, 0, "unproven connection must not be closed");
+        assert!(!cancel.is_cancelled(), "unproven connection must stay live");
+        assert_eq!(
+            *reason_rx.borrow(),
+            None,
+            "reason must remain None for untouched connection",
+        );
+    }
+
+    // ── Issuer scope: a deny entry keyed (A, K) closes only sessions admitted
+    // under A.  A same-key session admitted under B (or with no assertion) is
+    // untouched — no cancel, no frame.  [FI-TRACE-DENY-SET]
+    #[test]
+    fn conn_manager_disconnect_nip_fi_is_issuer_scoped() {
+        let mgr = ConnectionManager::new();
+        let key = vec![0xabu8; 32];
+        let register = |issuer: Option<&str>| {
+            let conn_id = Uuid::new_v4();
+            let (tx, _rx) = mpsc::channel(8);
+            let (ctrl_tx, _ctrl_rx) = mpsc::channel(8);
+            let (terminal_ctrl_tx, terminal_ctrl_rx) = mpsc::channel(1);
+            let cancel = CancellationToken::new();
+            mgr.register(
+                conn_id,
+                tx,
+                ctrl_tx,
+                terminal_ctrl_tx,
+                None,
+                cancel.clone(),
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                Arc::new(AtomicU8::new(0)),
+                Arc::new(Mutex::new(HashMap::new())),
+                3,
+                CommunityConnectionControl::new(cancel.clone()),
+            );
+            mgr.set_authenticated_identity(conn_id, key.clone(), issuer.map(str::to_owned));
+            (cancel, terminal_ctrl_rx)
+        };
+        let (cancel_a, mut frames_a) = register(Some("https://issuer-a.example"));
+        let (cancel_b, mut frames_b) = register(Some("https://issuer-b.example"));
+        let (cancel_none, mut frames_none) = register(None);
+
+        assert_eq!(mgr.disconnect_nip_fi("https://issuer-a.example", &key), 1);
+
+        assert!(cancel_a.is_cancelled(), "A session must be closed");
+        assert!(
+            frames_a.try_recv().is_ok(),
+            "A session must receive the denial frame"
+        );
+        assert!(!cancel_b.is_cancelled(), "B session must survive an A deny");
+        assert!(
+            frames_b.try_recv().is_err(),
+            "B session must not get a frame"
+        );
+        assert!(
+            !cancel_none.is_cancelled(),
+            "no-assertion session must survive"
+        );
+        assert!(
+            frames_none.try_recv().is_err(),
+            "no-assertion session must not get a frame"
+        );
+    }
+
+    // ── F10: ConnectionManager::disconnect_nip_fi sets AuthorizationDenied ────
+    //
+    // When the deny-API closes an active root-WS connection via
+    // `disconnect_nip_fi`, the `nip_fi_reason_tx` inside `CommunityConnectionControl`
+    // must be set to `AuthorizationDenied` before the cancellation fires.
+    // The send loop reads this reason via `disconnect_reason.borrow()` and
+    // emits a 1008 POLICY close frame instead of a bare Close(None).
+    // [FI-TRACE-CLOSE-CODE]
+    #[test]
+    fn conn_manager_disconnect_nip_fi_sets_authorization_denied_reason() {
+        let mgr = ConnectionManager::new();
+        let conn_id = Uuid::new_v4();
+        let pubkey = vec![0xabu8; 32];
+
+        let (tx, _rx) = mpsc::channel(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(8);
+        let (terminal_ctrl_tx, mut terminal_ctrl_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let control = CommunityConnectionControl::new(cancel.clone());
+        let reason_rx = control.disconnect_reason();
+
+        mgr.register(
+            conn_id,
+            tx,
+            ctrl_tx,
+            terminal_ctrl_tx,
+            None,
+            cancel.clone(),
+            buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(Mutex::new(HashMap::new())),
+            3,
+            control,
+        );
+        mgr.set_authenticated_identity(conn_id, pubkey.clone(), Some("test-issuer".to_owned()));
+
+        let closed = mgr.disconnect_nip_fi("test-issuer", &pubkey);
+
+        assert_eq!(closed, 1, "one matching connection must be closed");
+        assert!(cancel.is_cancelled(), "connection token must be cancelled");
+        assert_eq!(
+            *reason_rx.borrow(),
+            Some(CommunityDisconnectReason::AuthorizationDenied),
+            "reason must be AuthorizationDenied so the send loop emits 1008 POLICY",
+        );
+        // Winner-only enqueue: the denial frame is enqueued on terminal_ctrl_tx.
+        let frame = terminal_ctrl_rx
+            .try_recv()
+            .expect("denial frame must be enqueued");
+        let WsMessage::Text(text) = frame else {
+            panic!("expected Text frame, got {:?}", frame);
+        };
+        assert!(
+            text.contains("authorization denied"),
+            "denial frame must contain 'authorization denied'; got: {text}"
+        );
+    }
+
+    #[test]
+    fn nip_fi_disconnect_audio_is_issuer_scoped() {
+        let registry = CommunityConnectionRegistry::new();
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xce));
+        let key = vec![0x42u8; 32];
+        let register = |issuer: Option<&str>| {
+            let cancel = CancellationToken::new();
+            let (terminal_tx, terminal_rx) = mpsc::channel::<WsMessage>(1);
+            let control = CommunityConnectionControl::new(cancel.clone());
+            control.set_proven_identity(key.clone(), issuer.map(str::to_owned));
+            control.set_terminal_frame_sender(terminal_tx);
+            let guard = registry.register(Uuid::new_v4(), community, control);
+            (cancel, terminal_rx, guard)
+        };
+        let (cancel_a, mut frames_a, _ga) = register(Some("https://issuer-a.example"));
+        let (cancel_b, mut frames_b, _gb) = register(Some("https://issuer-b.example"));
+        let (cancel_none, mut frames_none, _gn) = register(None);
+
+        assert_eq!(
+            registry.disconnect_nip_fi("https://issuer-a.example", &key),
+            1
+        );
+
+        assert!(cancel_a.is_cancelled(), "A audio session must be closed");
+        assert!(
+            frames_a.try_recv().is_ok(),
+            "A audio session must receive the denial frame"
+        );
+        assert!(
+            !cancel_b.is_cancelled(),
+            "B audio session must survive an A deny"
+        );
+        assert!(
+            frames_b.try_recv().is_err(),
+            "B audio session must not get a frame"
+        );
+        assert!(
+            !cancel_none.is_cancelled(),
+            "no-assertion audio session must survive"
+        );
+        assert!(
+            frames_none.try_recv().is_err(),
+            "no-assertion audio session must not get a frame"
+        );
+    }
+
+    #[test]
+    fn nip_fi_disconnect_closes_proven_audio_socket_and_sends_policy_close_reason() {
+        let registry = CommunityConnectionRegistry::new();
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xca));
+        let target_pubkey = vec![0x42u8; 32];
+
+        let cancel = CancellationToken::new();
+        let control = CommunityConnectionControl::new(cancel.clone());
+        let reason_rx = control.disconnect_reason();
+        control.set_proven_identity(target_pubkey.clone(), Some("test-issuer".to_owned()));
+        let _guard = registry.register(Uuid::new_v4(), community, control);
+
+        assert_eq!(registry.disconnect_nip_fi("test-issuer", &target_pubkey), 1);
+        assert!(cancel.is_cancelled(), "audio socket must be cancelled");
+        assert_eq!(
+            *reason_rx.borrow(),
+            Some(CommunityDisconnectReason::AuthorizationDenied),
+            "close reason must be AuthorizationDenied so send_loop sends 1008"
+        );
+    }
+
+    #[test]
+    fn nip_fi_disconnect_closes_target_audio_only_and_preserves_collocated_peer() {
+        // Two audio sockets in the same community: only the target's is closed.
+        let registry = CommunityConnectionRegistry::new();
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xcd));
+        let target_pubkey = vec![0x42u8; 32];
+        let peer_pubkey = vec![0x55u8; 32];
+
+        let target_cancel = CancellationToken::new();
+        let target_control = CommunityConnectionControl::new(target_cancel.clone());
+        target_control.set_proven_identity(target_pubkey.clone(), Some("test-issuer".to_owned()));
+        let _target_guard = registry.register(Uuid::new_v4(), community, target_control);
+
+        let peer_cancel = CancellationToken::new();
+        let peer_control = CommunityConnectionControl::new(peer_cancel.clone());
+        peer_control.set_proven_identity(peer_pubkey, Some("test-issuer".to_owned()));
+        let _peer_guard = registry.register(Uuid::new_v4(), community, peer_control);
+
+        assert_eq!(registry.disconnect_nip_fi("test-issuer", &target_pubkey), 1);
+        assert!(
+            target_cancel.is_cancelled(),
+            "target audio socket must be cancelled"
+        );
+        assert!(
+            !peer_cancel.is_cancelled(),
+            "collocated peer must remain connected"
+        );
+    }
+
+    #[test]
+    fn nip_fi_disconnect_does_not_close_different_pubkey_audio_socket() {
+        // A socket whose proven pubkey is different from the target must not
+        // be closed — the scan must be key-exact.
+        let registry = CommunityConnectionRegistry::new();
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xcc));
+        let target_pubkey = vec![0x42u8; 32];
+        let other_pubkey = vec![0x99u8; 32];
+
+        let cancel = CancellationToken::new();
+        let control = CommunityConnectionControl::new(cancel.clone());
+        control.set_proven_identity(other_pubkey, Some("test-issuer".to_owned()));
+        let _guard = registry.register(Uuid::new_v4(), community, control);
+
+        assert_eq!(registry.disconnect_nip_fi("test-issuer", &target_pubkey), 0);
+        assert!(
+            !cancel.is_cancelled(),
+            "different-key socket must not be touched"
+        );
+    }
+
+    #[test]
+    fn nip_fi_disconnect_does_not_close_unproven_audio_socket() {
+        // A socket that registered but has not yet completed NIP-42 auth (no
+        // proven pubkey) must not be touched by a targeted disconnect.
+        let registry = CommunityConnectionRegistry::new();
+        let community = CommunityId::from_uuid(Uuid::from_u128(0xcb));
+        let target_pubkey = vec![0x42u8; 32];
+
+        let cancel = CancellationToken::new();
+        let control = CommunityConnectionControl::new(cancel.clone());
+        // Intentionally skip set_proven_pubkey — simulates pre-auth state.
+        let _guard = registry.register(Uuid::new_v4(), community, control);
+
+        assert_eq!(registry.disconnect_nip_fi("test-issuer", &target_pubkey), 0);
+        assert!(
+            !cancel.is_cancelled(),
+            "pre-auth socket must not be touched"
+        );
+    }
+
+    #[test]
+    fn community_disconnect_then_nip_fi_keeps_community_deleted_reason() {
+        // CommunityDeleted fires first, AuthorizationDenied arrives second.
+        // The slot must retain CommunityDeleted.
+        let cancel = CancellationToken::new();
+        let control = CommunityConnectionControl::new(cancel.clone());
+        let reason_rx = control.disconnect_reason();
+
+        // First writer: CommunityDeleted (via disconnect_community).
+        control.disconnect_community();
+        // Second writer: AuthorizationDenied — must be ignored (via disconnect_nip_fi).
+        control.disconnect_nip_fi();
+
+        assert_eq!(
+            *reason_rx.borrow(),
+            Some(CommunityDisconnectReason::CommunityDeleted),
+            "CommunityDeleted (first writer) must not be clobbered by AuthorizationDenied"
+        );
+    }
+
+    #[test]
+    fn disconnect_community_wins_reason_losing_nip_fi_does_not_enqueue_frame() {
+        // disconnect_community fires first → wins reason → no payload (community-deleted
+        // path is intentionally payload-less).
+        // disconnect_nip_fi fires second → loses reason → must NOT enqueue a denial
+        // frame against the CommunityDeleted close.
+        let (terminal_tx, mut terminal_rx) = tokio::sync::mpsc::channel(1);
+
+        let cancel = CancellationToken::new();
+        let control = CommunityConnectionControl::new(cancel.clone());
+        control.set_terminal_frame_sender(terminal_tx);
+
+        // First writer: disconnect_community.
+        control.disconnect_community();
+        // Second writer: disconnect_nip_fi — loses reason slot.
+        control.disconnect_nip_fi();
+
+        // Reason slot retains CommunityDeleted.
+        assert_eq!(
+            *control.disconnect_reason().borrow(),
+            Some(CommunityDisconnectReason::CommunityDeleted),
+            "CommunityDeleted must be retained when community wins reason"
+        );
+
+        // No frame queued — losing deny must not send an authorization_denied payload
+        // against a community-deleted close.
+        assert!(
+            terminal_rx.try_recv().is_err(),
+            "losing disconnect_nip_fi must not enqueue a denial frame when community wins reason"
+        );
+    }
+
+    #[test]
+    fn manager_wins_reason_enqueues_frame_then_losing_delete_does_not() {
+        // manager_disconnect_nip_fi fires first → wins AuthorizationDenied.
+        // disconnect_community fires second → loses, queues nothing.
+        let (terminal_tx, mut terminal_rx) = tokio::sync::mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let control = CommunityConnectionControl::new(cancel.clone());
+
+        control.manager_disconnect_nip_fi(&terminal_tx);
+        // disconnect_community is a no-op on reason (slot already set).
+        // Cannot call it here because manager_disconnect_nip_fi already cancelled;
+        // test the frame delivery instead.
+        assert_eq!(
+            *control.disconnect_reason().borrow(),
+            Some(CommunityDisconnectReason::AuthorizationDenied),
+            "AuthorizationDenied must be retained when manager wins reason"
+        );
+        let frame = terminal_rx
+            .try_recv()
+            .expect("manager_disconnect_nip_fi must enqueue a denial frame when it wins");
+        let expected = crate::nip_fi_session::denial_frame(
+            crate::nip_fi_session::NipFiWsRoute::Root,
+            buzz_auth::DenialClass::AuthorizationDenied,
+        );
+        assert_eq!(
+            frame, expected,
+            "enqueued frame must be the Root denial frame"
+        );
+        assert!(
+            cancel.is_cancelled(),
+            "manager_disconnect_nip_fi must cancel the token"
+        );
     }
 
     /// A relay state whose Redis is deliberately unreachable, so admission
@@ -1969,6 +2606,7 @@ pub(crate) mod tests {
             nip_fi_assertion: None,
             session_deadline: None,
             nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
+            community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
         };
 
         let mgr = ConnectionManager::new();
@@ -1976,12 +2614,14 @@ pub(crate) mod tests {
             conn_id,
             tx,
             conn.ctrl_tx.clone(),
+            tokio::sync::mpsc::channel(1).0,
             None,
             cancel.clone(),
             buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
             Arc::clone(&bp),
             Arc::clone(&conn.subscriptions),
             3,
+            crate::state::CommunityConnectionControl::new(cancel.clone()),
         );
 
         // Fill the buffer via direct send.
@@ -2023,23 +2663,31 @@ pub(crate) mod tests {
             conn_a,
             tx_a,
             ctrl_tx_a,
+            tokio::sync::mpsc::channel(1).0,
             None,
             CancellationToken::new(),
             community_a,
             Arc::new(AtomicU8::new(0)),
             Arc::new(Mutex::new(HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
         );
         mgr.register(
             conn_b,
             tx_b,
             ctrl_tx_b,
+            tokio::sync::mpsc::channel(1).0,
             None,
             CancellationToken::new(),
             community_b,
             Arc::new(AtomicU8::new(0)),
             Arc::new(Mutex::new(HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(
+                tokio_util::sync::CancellationToken::new(),
+            ),
         );
 
         let pubkey = vec![7u8; 32];
@@ -2071,12 +2719,14 @@ pub(crate) mod tests {
             conn_id,
             tx,
             ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             None,
-            cancel,
+            cancel.clone(),
             buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
             bp,
             subscriptions,
             3,
+            crate::state::CommunityConnectionControl::new(cancel),
         );
 
         assert_eq!(mgr.pubkey_for_conn(conn_id), None);
@@ -2665,12 +3315,14 @@ pub(crate) mod tests {
                 conn_id,
                 tx,
                 ctrl_tx,
+                tokio::sync::mpsc::channel(1).0,
                 None,
                 cancel.clone(),
                 community,
                 Arc::new(AtomicU8::new(0)),
                 Arc::new(Mutex::new(HashMap::new())),
                 3,
+                crate::state::CommunityConnectionControl::new(cancel.clone()),
             );
             mgr.set_authenticated_pubkey(conn_id, pubkey.clone());
             cancel
@@ -2706,12 +3358,14 @@ pub(crate) mod tests {
             conn_id,
             tx,
             ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             Some(restart_tx),
             cancel.clone(),
             buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
             Arc::new(AtomicU8::new(0)),
             Arc::new(Mutex::new(HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(cancel.clone()),
         );
 
         let drain_mgr = Arc::clone(&mgr);
@@ -2750,12 +3404,14 @@ pub(crate) mod tests {
                 conn_id,
                 tx,
                 ctrl_tx,
+                tokio::sync::mpsc::channel(1).0,
                 Some(restart_tx),
                 cancel.clone(),
                 buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
                 Arc::new(AtomicU8::new(0)),
                 Arc::new(Mutex::new(HashMap::new())),
                 3,
+                crate::state::CommunityConnectionControl::new(cancel.clone()),
             );
 
             assert_eq!(mgr.drain_all_jittered(1).await, 1);
@@ -2781,12 +3437,14 @@ pub(crate) mod tests {
             conn_id,
             tx,
             ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             Some(restart_tx),
             cancel.clone(),
             buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
             Arc::new(AtomicU8::new(0)),
             Arc::new(Mutex::new(HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(cancel.clone()),
         );
 
         let drain_mgr = Arc::clone(&mgr);
@@ -2821,12 +3479,14 @@ pub(crate) mod tests {
                 conn_id,
                 tx,
                 ctrl_tx,
+                tokio::sync::mpsc::channel(1).0,
                 None,
                 cancel.clone(),
                 community,
                 Arc::new(AtomicU8::new(0)),
                 Arc::new(Mutex::new(HashMap::new())),
                 3,
+                crate::state::CommunityConnectionControl::new(cancel.clone()),
             );
             (ctrl_rx, cancel)
         };
@@ -2873,12 +3533,14 @@ pub(crate) mod tests {
             conn_id,
             tx,
             ctrl_tx.clone(),
+            tokio::sync::mpsc::channel(1).0,
             None,
             cancel.clone(),
             buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
             Arc::new(AtomicU8::new(0)),
             Arc::new(Mutex::new(HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(cancel.clone()),
         );
         // Wedge the 1-slot control channel.
         ctrl_tx
@@ -2921,12 +3583,14 @@ pub(crate) mod tests {
             conn_id,
             tx,
             ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             None,
             cancel.clone(),
             buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
             Arc::new(AtomicU8::new(0)),
             Arc::new(Mutex::new(HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(cancel.clone()),
         );
 
         assert!(
@@ -2959,12 +3623,14 @@ pub(crate) mod tests {
             conn_id,
             tx,
             ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             None,
             cancel.clone(),
             buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
             Arc::new(AtomicU8::new(0)),
             Arc::new(Mutex::new(HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(cancel.clone()),
         );
 
         let closed = mgr.drain_all();
@@ -2996,12 +3662,14 @@ pub(crate) mod tests {
             conn_id,
             tx,
             ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             None,
             cancel.clone(),
             buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
             Arc::new(AtomicU8::new(0)),
             Arc::new(Mutex::new(HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(cancel.clone()),
         );
 
         let jitter_ms = 20_000u64;
@@ -3034,12 +3702,14 @@ pub(crate) mod tests {
             late_id,
             late_tx,
             late_ctrl_tx,
+            tokio::sync::mpsc::channel(1).0,
             None,
             late_cancel.clone(),
             buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
             Arc::new(AtomicU8::new(0)),
             Arc::new(Mutex::new(HashMap::new())),
             3,
+            crate::state::CommunityConnectionControl::new(late_cancel.clone()),
         );
         assert!(
             late_cancel.is_cancelled(),

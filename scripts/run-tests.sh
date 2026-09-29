@@ -226,6 +226,9 @@ run_unit_tests() {
   run_test_step "buzz-relay NIP-FI upgrade tests" \
     cargo test -p buzz-relay --lib nip_fi_upgrade:: -- --nocapture
 
+  run_test_step "buzz-relay NIP-FI admin API tests" \
+    cargo test -p buzz-relay --lib api::nip_fi:: -- --nocapture
+
   run_test_step "buzz-relay auth metrics contract tests" \
     cargo test -p buzz-relay --lib metrics::contract_tests:: -- --nocapture
 
@@ -256,6 +259,17 @@ run_unit_tests() {
     handlers::req::tests::p1a_huddle_liveness_req_barrier_expiry_blocks_query_and_emission
     state::tests::f3_cancellation_during_check_terminates_socket_without_waiting_for_check
     state::tests::on_not_run_runs_once_on_each_deny_arm_and_never_on_admit
+    state::tests::conn_manager_disconnect_nip_fi_ignores_unproven_connection
+    state::tests::conn_manager_disconnect_nip_fi_is_issuer_scoped
+    state::tests::conn_manager_disconnect_nip_fi_sets_authorization_denied_reason
+    state::tests::nip_fi_disconnect_audio_is_issuer_scoped
+    state::tests::nip_fi_disconnect_closes_proven_audio_socket_and_sends_policy_close_reason
+    state::tests::nip_fi_disconnect_closes_target_audio_only_and_preserves_collocated_peer
+    state::tests::nip_fi_disconnect_does_not_close_different_pubkey_audio_socket
+    state::tests::nip_fi_disconnect_does_not_close_unproven_audio_socket
+    state::tests::community_disconnect_then_nip_fi_keeps_community_deleted_reason
+    state::tests::disconnect_community_wins_reason_losing_nip_fi_does_not_enqueue_frame
+    state::tests::manager_wins_reason_enqueues_frame_then_losing_delete_does_not
   )
   local name
   for name in "${nip_fi_exact_tests[@]}"; do

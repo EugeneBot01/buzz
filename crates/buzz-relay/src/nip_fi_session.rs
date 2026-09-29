@@ -298,6 +298,9 @@ mod tests {
             nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(
                 CancellationToken::new(),
             ),
+            community_control: crate::state::CommunityConnectionControl::new(
+                CancellationToken::new(),
+            ),
         });
 
         // Use a different key as the proven pubkey → forced mismatch.
