@@ -427,9 +427,15 @@ function CommunityApp({
   const isCommunitySwitch = hasSwitchedCommunityRef.current;
   const isContinuingOnboarding = continueOnboarding && !isCommunitySwitch;
 
+  const transaction = communityOnboarding.transaction;
+  const communityInitAttempt =
+    transaction && transaction.communityId === activeCommunity?.id
+      ? (transaction.initAttempt ?? 0)
+      : -1;
   const community = useCommunityInit(
     activeCommunity,
     communityKey,
+    communityInitAttempt,
     sharedIdentity,
     isFindingCommunityAfterLeave,
     communities,
@@ -534,7 +540,6 @@ function CommunityApp({
 
   const bootSplashPhase = useBootSplashHold();
 
-  const transaction = communityOnboarding.transaction;
   useEffect(() => {
     if (transaction?.stage !== "connecting") {
       connectingTransactionRef.current = null;
@@ -544,7 +549,8 @@ function CommunityApp({
   const targetIsReady =
     transaction?.communityId === activeCommunity?.id &&
     community.isReady &&
-    community.appliedKey === communityKey;
+    community.appliedKey === communityKey &&
+    community.initAttempt === communityInitAttempt;
   const enterpriseProfile = community.isReady
     ? community.enterpriseProfile
     : null;
@@ -552,6 +558,8 @@ function CommunityApp({
   useEffect(() => {
     if (
       transaction?.stage !== "connecting" ||
+      !("initAttempt" in community) ||
+      community.initAttempt !== communityInitAttempt ||
       !("appliedKey" in community) ||
       community.appliedKey !== communityKey ||
       !("error" in community) ||
@@ -563,7 +571,13 @@ function CommunityApp({
       { stage: "corporate-profile", error: community.error },
       transaction.id,
     );
-  }, [community, communityKey, communityOnboarding, transaction]);
+  }, [
+    community,
+    communityInitAttempt,
+    communityKey,
+    communityOnboarding,
+    transaction,
+  ]);
   useEffect(() => {
     if (transaction?.stage !== "connecting" || !targetIsReady) return;
     const transactionId = transaction.id;
