@@ -131,7 +131,12 @@ type CommunityInitResult =
         onContinue: () => void;
       };
     }
-  | { isReady: false; needsSetup: false; appliedKey: null; error: string };
+  | {
+      isReady: false;
+      needsSetup: false;
+      appliedKey: string | null;
+      error: string;
+    };
 
 /**
  * Applies the active community config to the Tauri backend and resets
@@ -401,7 +406,7 @@ export function useCommunityInit(
           setResult({
             isReady: false,
             needsSetup: false,
-            appliedKey: null,
+            appliedKey: communityKey,
             error: errorMessage,
           });
         }
