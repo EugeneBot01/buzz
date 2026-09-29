@@ -19,9 +19,9 @@
 //!
 //! ## Environment variables
 //!
-//! The command API is enabled when `BUZZ_NIP_FI_MODE=enforce` and the issuer
-//! JSON entries include the S4 fields.  S4 fields are read from the same
-//! `BUZZ_NIP_FI_ISSUERS` JSON array; each issuer entry optionally carries:
+//! The command API is enabled when `BUZZ_NIP_FI_MODE=enforce`.  S4 fields are
+//! read from the same `BUZZ_NIP_FI_ISSUERS` JSON array as the assertion
+//! policy; in enforce mode every issuer entry must carry them:
 //!
 //! ```json
 //! {
@@ -31,9 +31,10 @@
 //! }
 //! ```
 //!
-//! `maximum_command_age_seconds` and `authorized_principals` are required in
-//! enforce mode if any issuer is command-capable.  `deny_set_capacity` defaults
-//! to [`DEFAULT_DENY_SET_CAPACITY`] when absent.
+//! `maximum_command_age_seconds` (1–60) and a non-empty
+//! `authorized_principals` are required on every issuer; startup fails if any
+//! issuer lacks them.  `deny_set_capacity` is optional and defaults to
+//! [`DEFAULT_DENY_SET_CAPACITY`].
 
 use std::sync::Arc;
 
@@ -194,15 +195,18 @@ pub async fn disconnect(
 
 /// Per-issuer command configuration parsed from the `BUZZ_NIP_FI_ISSUERS` JSON.
 ///
-/// Added to each entry in S4.  All three fields are optional (absent =
-/// command API disabled for that issuer / default capacity used).
+/// In enforce mode `maximum_command_age_seconds` and `authorized_principals`
+/// are required on every issuer and startup validation rejects any entry
+/// without them.  The fields remain `Option` for the off and `deny_protected`
+/// modes, which do not require them.
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 pub struct CommandIssuerEnvConfig {
-    /// Positive seconds, ≤ 60.  Required for the command API to be enabled.
+    /// Maximum command JWT age in seconds, in `[1, 60]`.  Required in enforce mode.
     pub maximum_command_age_seconds: Option<u64>,
-    /// Non-empty list of authorized `sub` values.  Required if command age is set.
+    /// Non-empty list of authorized `sub` values, matched exactly
+    /// (case-sensitive).  Required in enforce mode.
     pub authorized_principals: Option<Vec<String>>,
-    /// Hard ceiling on live deny entries for this issuer.
+    /// Hard ceiling on live deny entries for this issuer; must be positive.
     /// Defaults to [`DEFAULT_DENY_SET_CAPACITY`] when absent.
     pub deny_set_capacity: Option<usize>,
 }
@@ -224,7 +228,8 @@ pub enum NipFiDisconnectApplyResult {
     /// Command API is not enabled on this pod (deny map absent); message ignored.
     Disabled,
     /// Message was rejected before reaching the map (invalid pubkey, unknown
-    /// issuer, unrepresentable timestamp, or ceiling exceeded).
+    /// issuer, or unrepresentable timestamp).  An `until` beyond this pod's
+    /// ceiling is not a rejection: it is clamped to the ceiling and applied.
     Rejected,
     /// Message was applied; carries the map's merge result.
     Applied(buzz_auth::CrossPodMergeResult),
@@ -253,6 +258,10 @@ pub fn nip_fi_disconnect_message(cmd: &buzz_auth::CommandResult) -> buzz_pubsub:
 /// the logic here allows tests to call the exact production path end-to-end
 /// without driving a live Redis subscriber.
 ///
+/// `until` is clamped to `now + skew_seconds + maximum_assertion_age_seconds`
+/// for the message's issuer, so clock drift between pods cannot drop a command
+/// the origin pod already accepted.
+///
 /// `now` is passed explicitly so tests can supply controlled timestamps.
 pub fn apply_nip_fi_disconnect(
     state: &crate::state::AppState,
@@ -277,48 +286,40 @@ pub fn apply_nip_fi_disconnect(
     };
 
     // Validate that the issuer is locally configured.
-    if state
+    let Some(policy) = state
         .config
         .nip_fi
         .registry
         .policy_for_issuer(&message.issuer)
-        .is_none()
-    {
+    else {
         tracing::warn!("nip-fi cross-pod: unknown issuer (not locally configured) — rejected");
         return NipFiDisconnectApplyResult::Rejected;
-    }
-
-    // Validate timestamp representability.
-    let until = match chrono::DateTime::from_timestamp(message.until_unix, message.until_unix_nanos)
-    {
-        Some(t) => t,
-        None => {
-            tracing::warn!(
-                until_unix = message.until_unix,
-                "nip-fi cross-pod: unrepresentable until timestamp — rejected"
-            );
-            return NipFiDisconnectApplyResult::Rejected;
-        }
     };
 
-    // Validate that `until` does not exceed the issuer's ceiling.
-    if let Some(policy) = state
-        .config
-        .nip_fi
-        .registry
-        .policy_for_issuer(&message.issuer)
-    {
-        let skew = chrono::Duration::seconds(policy.skew_seconds() as i64);
-        let max_age = chrono::Duration::seconds(policy.maximum_assertion_age_seconds() as i64);
-        if let Some(ceiling) = now
-            .checked_add_signed(skew)
-            .and_then(|t| t.checked_add_signed(max_age))
-        {
-            if until > ceiling {
-                tracing::warn!("nip-fi cross-pod: until exceeds issuer ceiling — rejected");
+    // Validate timestamp representability.
+    let mut until =
+        match chrono::DateTime::from_timestamp(message.until_unix, message.until_unix_nanos) {
+            Some(t) => t,
+            None => {
+                tracing::warn!(
+                    until_unix = message.until_unix,
+                    "nip-fi cross-pod: unrepresentable until timestamp — rejected"
+                );
                 return NipFiDisconnectApplyResult::Rejected;
             }
-        }
+        };
+
+    // Clamp `until` to this pod's ceiling rather than rejecting it.  The origin
+    // pod already verified `until` against its own clock and returned 200; a
+    // pod whose clock trails the origin would otherwise drop a legitimate
+    // at-ceiling command and leave the target's sessions open.
+    let skew = chrono::Duration::seconds(policy.skew_seconds() as i64);
+    let max_age = chrono::Duration::seconds(policy.maximum_assertion_age_seconds() as i64);
+    if let Some(ceiling) = now
+        .checked_add_signed(skew)
+        .and_then(|t| t.checked_add_signed(max_age))
+    {
+        until = until.min(ceiling);
     }
 
     // Merge the deny entry.
@@ -2248,6 +2249,117 @@ mod route_integration_tests {
         );
     }
 
+    // ── Cross-pod consumer: rejection and ceiling clamp ──────────────────────
+    //
+    // Only malformed messages are rejected.  An `until` beyond the receiving
+    // pod's ceiling is clamped, so clock drift between pods cannot drop a
+    // command the origin pod already accepted.
+
+    /// Fixed consumer clock: the tests below inject time, never sleep.
+    fn cross_pod_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_900_000_000, 0).expect("representable")
+    }
+
+    /// Delivers `message` for `key` with an issuer-A session live and asserts
+    /// the consumer rejects it without recording a deny or closing the session.
+    fn assert_cross_pod_rejected(
+        state: &crate::state::AppState,
+        key: &nostr::PublicKey,
+        message: &buzz_pubsub::NipFiDisconnect,
+    ) {
+        let sessions = IssuerSessions::register(state, TEST_ISS, key);
+        let now = cross_pod_now();
+
+        let result = apply_nip_fi_disconnect(state, message, now);
+
+        assert_eq!(result, NipFiDisconnectApplyResult::Rejected);
+        sessions.assert_open("rejected message");
+        let deny_map = state.nip_fi_deny_map.as_deref().expect("deny map present");
+        assert!(!deny_map.is_denied(TEST_ISS, key, now));
+    }
+
+    #[tokio::test]
+    async fn cross_pod_malformed_pubkey_bytes_rejected() {
+        let state = cross_pod_state(10).await;
+        let key = nostr::Keys::generate().public_key();
+        let message = buzz_pubsub::NipFiDisconnect {
+            pubkey_bytes: key.to_bytes()[..31].to_vec(),
+            ..cross_pod_message(&key)
+        };
+        assert_cross_pod_rejected(&state, &key, &message);
+    }
+
+    #[tokio::test]
+    async fn cross_pod_unknown_issuer_rejected() {
+        let state = cross_pod_state(10).await;
+        let key = nostr::Keys::generate().public_key();
+        let message = buzz_pubsub::NipFiDisconnect {
+            issuer: OTHER_ISS.to_owned(),
+            ..cross_pod_message(&key)
+        };
+        assert_cross_pod_rejected(&state, &key, &message);
+    }
+
+    #[tokio::test]
+    async fn cross_pod_unrepresentable_until_rejected() {
+        let state = cross_pod_state(10).await;
+        let key = nostr::Keys::generate().public_key();
+        let message = buzz_pubsub::NipFiDisconnect {
+            until_unix: i64::MAX,
+            ..cross_pod_message(&key)
+        };
+        assert_cross_pod_rejected(&state, &key, &message);
+    }
+
+    #[tokio::test]
+    async fn cross_pod_without_deny_map_is_disabled() {
+        let mut config = crate::config::Config::for_test();
+        config.nip_fi.registry.insert(test_issuer_policy());
+        let mut state = build_test_app_state(10, config).await;
+        state.nip_fi_deny_map = None;
+        let key = nostr::Keys::generate().public_key();
+        let sessions = IssuerSessions::register(&state, TEST_ISS, &key);
+
+        let result = apply_nip_fi_disconnect(&state, &cross_pod_message(&key), cross_pod_now());
+
+        assert_eq!(result, NipFiDisconnectApplyResult::Disabled);
+        sessions.assert_open("disabled consumer");
+    }
+
+    #[tokio::test]
+    async fn cross_pod_until_beyond_ceiling_is_clamped_and_applied() {
+        let state = cross_pod_state(10).await;
+        let key = nostr::Keys::generate().public_key();
+        let sessions = IssuerSessions::register(&state, TEST_ISS, &key);
+        let now = cross_pod_now();
+        let policy = test_issuer_policy();
+        let ceiling = now
+            + chrono::Duration::seconds(policy.skew_seconds() as i64)
+            + chrono::Duration::seconds(policy.maximum_assertion_age_seconds() as i64);
+        let message = buzz_pubsub::NipFiDisconnect {
+            until_unix: (ceiling + chrono::Duration::days(365)).timestamp(),
+            ..cross_pod_message(&key)
+        };
+
+        let result = apply_nip_fi_disconnect(&state, &message, now);
+
+        assert_eq!(
+            result,
+            NipFiDisconnectApplyResult::Applied(buzz_auth::CrossPodMergeResult::Merged)
+        );
+        sessions.assert_closed("clamped message");
+        let deny_map = state.nip_fi_deny_map.as_deref().expect("deny map present");
+        assert!(deny_map.is_denied(TEST_ISS, &key, now), "denied at now");
+        assert!(
+            deny_map.is_denied(TEST_ISS, &key, ceiling - chrono::Duration::nanoseconds(1)),
+            "denied up to the local ceiling"
+        );
+        assert!(
+            !deny_map.is_denied(TEST_ISS, &key, ceiling),
+            "admitted once the clamped ceiling is reached"
+        );
+    }
+
     // ── HTTP admission reads the shared deny map ─────────────────────────────
     //
     // Deny entries are written only through `POST /api/nip-fi/disconnect`; HTTP
@@ -2375,25 +2487,6 @@ mod route_integration_tests {
         assert!(
             http_admit(&state, OTHER_ISS, &key).is_ok(),
             "a deny for (iss-A, k) must not block (iss-B, k)"
-        );
-    }
-
-    #[tokio::test]
-    async fn http_admission_readmits_after_deny_until_passes() {
-        let state = http_enforce_state().await;
-        let key = nostr::Keys::generate().public_key();
-        // `until` is whole seconds from `now`: +3 leaves at least 2s of window.
-        deny_via_route(&state, &key, 3).await;
-        assert!(
-            http_admit(&state, TEST_ISS, &key).is_err(),
-            "(iss-A, k) is denied inside the window"
-        );
-
-        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-
-        assert!(
-            http_admit(&state, TEST_ISS, &key).is_ok(),
-            "(iss-A, k) must be admitted again once `until` has passed"
         );
     }
 

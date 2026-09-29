@@ -13,6 +13,15 @@
 //! | `BUZZ_NIP_FI_ISSUERS` | If enforce | JSON array of issuer configs (see [`IssuerEnvConfig`]). |
 //! | `BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS` | If enforce | Per-partition limit on session lifetime. |
 //!
+//! Each `BUZZ_NIP_FI_ISSUERS` entry also carries the S4 command-API fields.
+//! Enforce-mode startup fails if any issuer lacks the required ones:
+//!
+//! | Field | Required | Constraint |
+//! |---|---|---|
+//! | `maximum_command_age_seconds` | Every issuer, in enforce | Integer in `[1, 60]`. |
+//! | `authorized_principals` | Every issuer, in enforce | Non-empty array of `sub` values, each 1–2048 bytes; matched by exact, case-sensitive byte comparison. |
+//! | `deny_set_capacity` | No | Integer > 0; defaults to [`crate::api::nip_fi::DEFAULT_DENY_SET_CAPACITY`] (50000). |
+//!
 //! `maximum_assertion_age` is per-issuer only (field `maximum_assertion_age_seconds` in
 //! the issuer JSON array), not a relay-level env var. A relay-level duplicate that could
 //! disagree with the enforced per-issuer value was removed in this PR.
@@ -49,7 +58,9 @@ const MAX_CONNECTION_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 ///     "maximum_assertion_age_seconds": 3600,
 ///     "jwks_uri": "https://login.example.com/.well-known/jwks.json",
 ///     "jwks_refresh_interval_seconds": 300,
-///     "jwks_hard_deadline_seconds": 86400
+///     "jwks_hard_deadline_seconds": 86400,
+///     "maximum_command_age_seconds": 30,
+///     "authorized_principals": ["admin-svc@login.example.com"]
 ///   }
 /// ]
 /// ```
@@ -77,13 +88,13 @@ pub(super) struct IssuerEnvConfig {
     /// Hard deadline for accepting a JWKS snapshot in seconds.
     pub jwks_hard_deadline_seconds: u64,
 
-    // ── S4 command-API fields (all optional) ──────────────────────────────
-    /// Maximum command JWT age in seconds; `0 < x ≤ 60`.  Required to enable
-    /// the disconnect API for this issuer.
+    // ── S4 command-API fields (required in enforce mode) ──────────────────
+    /// Maximum command JWT age in seconds; `0 < x ≤ 60`.  Required on every
+    /// issuer in enforce mode.
     #[serde(default)]
     pub maximum_command_age_seconds: Option<u64>,
-    /// Non-empty list of authorized `sub` values.  Required when
-    /// `maximum_command_age_seconds` is set.
+    /// Non-empty list of authorized `sub` values.  Required on every issuer
+    /// in enforce mode.
     #[serde(default)]
     pub authorized_principals: Option<Vec<String>>,
     /// Hard ceiling on live deny entries for this issuer.  Defaults to
