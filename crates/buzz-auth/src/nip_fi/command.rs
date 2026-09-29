@@ -22,7 +22,9 @@ use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use nostr::PublicKey;
 use serde_json::{Map, Value};
 
-use super::config::{IssuerPolicy, IssuerRegistry, MAX_SUBJECT_BYTES, MAX_TOKEN_BYTES};
+use super::config::{
+    IssuerPolicy, IssuerRegistry, MAX_JTI_BYTES, MAX_SUBJECT_BYTES, MAX_TOKEN_BYTES,
+};
 use super::deny_map::{NipFiDenyMap, ReserveError};
 use super::verifier::{
     enforce_compact_structure, enforce_signature_shape, parse_header, parse_numeric_date,
@@ -397,8 +399,11 @@ impl<S: IssuerKeySource + Clone> CommandVerifier<S> {
             return Err(CommandError::UntilExceedsCeiling);
         }
 
-        // jti: must be present and non-empty.
+        // jti: must be present, non-empty, and within MAX_JTI_BYTES.
         let jti = claim_str(&claims, "jti").ok_or(CommandError::EvidenceRejected)?;
+        if jti.len() > MAX_JTI_BYTES {
+            return Err(CommandError::EvidenceRejected);
+        }
 
         // ── Step 4: principal authorization ───────────────────────────────────
         // AssertAuthorizedIssuerPrincipal(claims.iss, claims.sub).
@@ -1117,6 +1122,34 @@ mod tests {
             cv.verify_at(&token, METHOD, PATH, &target, now),
             Err(CommandError::AuthorizationDenied),
             "replayed jti must be AuthorizationDenied"
+        );
+    }
+
+    #[test]
+    fn jti_longer_than_max_jti_bytes_rejects() {
+        // Mutation anchor: removing the MAX_JTI_BYTES check admits the oversized
+        // jti into the deny shard's reservation map.
+        let cv = test_command_verifier();
+        let target = target_key();
+        let now = Utc::now();
+        let oversized = mint_cmd_jwt(
+            &target,
+            300,
+            serde_json::json!({"jti": "j".repeat(MAX_JTI_BYTES + 1)}),
+        );
+        assert_eq!(
+            cv.verify_at(&oversized, METHOD, PATH, &target, now),
+            Err(CommandError::EvidenceRejected),
+            "jti over MAX_JTI_BYTES must be EvidenceRejected"
+        );
+        let at_limit = mint_cmd_jwt(
+            &target,
+            300,
+            serde_json::json!({"jti": "j".repeat(MAX_JTI_BYTES)}),
+        );
+        assert!(
+            cv.verify_at(&at_limit, METHOD, PATH, &target, now).is_ok(),
+            "jti of exactly MAX_JTI_BYTES must be accepted"
         );
     }
 

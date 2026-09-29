@@ -27,8 +27,10 @@
 //!   in one lock scope (both or neither). [VerifyCommandJwt step 7]
 //! * **Issuer-global scope**: the deny applies across all communities served
 //!   under that issuer. [FI-TRACE-DENY-SET]
-//! * **Self-eviction**: expired entries are pruned lazily on each mutation and
-//!   on read (deny check), so the map does not grow without bound.
+//! * **Self-eviction**: expired entries and jtis are pruned on write, only when
+//!   the shard is at capacity, so the map stays bounded without putting an
+//!   O(n) sweep on every write.  Reads compare against `now`, so a lingering
+//!   expired entry or jti is never treated as active.
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -57,14 +59,15 @@ struct IssuerShard {
     /// Active deny entries: hex-encoded pubkey → until.
     entries: HashMap<String, DateTime<Utc>>,
     /// Reserved jtis: jti string → effective_expiry.  Expired jtis are evicted
-    /// lazily on each write so the map never grows to replay-corpus size.
+    /// when the jti budget is full so the map never grows to replay-corpus size.
     jtis: HashMap<String, DateTime<Utc>>,
-    /// Maximum number of live deny entries for this issuer.
+    /// Maximum number of deny entries for this issuer.
     capacity: usize,
-    /// Maximum number of live jti reservations for this issuer.
+    /// Maximum number of jti reservations for this issuer.
     /// Bounded separately so an issuer cannot exhaust memory by replaying
     /// distinct jtis faster than they expire, even for already-denied keys.
-    /// Set to `capacity * 2` at construction for O(capacity) memory with
+    /// Set to `capacity * 2` at construction; with each jti capped at
+    /// `MAX_JTI_BYTES` this keeps jti memory O(capacity × MAX_JTI_BYTES), with
     /// headroom for in-flight update commands on already-denied keys.
     max_jti_count: usize,
 }
@@ -83,10 +86,22 @@ impl IssuerShard {
         }
     }
 
-    /// Evict expired entries and jtis.  Called inside the lock on every write.
+    /// Evict expired entries and jtis.  O(n); called only from
+    /// [`Self::full_after_eviction`] so the common write path never stalls
+    /// `is_denied` readers behind a sweep.
     fn evict_expired(&mut self, now: DateTime<Utc>) {
         self.entries.retain(|_, until| *until > now);
         self.jtis.retain(|_, exp| *exp > now);
+    }
+
+    /// True if `full` holds even after evicting expired state.  The sweep runs
+    /// only when `full` already holds.
+    fn full_after_eviction(&mut self, now: DateTime<Utc>, full: impl Fn(&Self) -> bool) -> bool {
+        if !full(self) {
+            return false;
+        }
+        self.evict_expired(now);
+        full(self)
     }
 
     /// True if `(iss, pubkey_hex)` has an active deny entry (`now < until`).
@@ -99,12 +114,10 @@ impl IssuerShard {
 
     /// Attempt the atomic jti-reservation + deny-entry insertion.
     ///
-    /// **Atomicity**: both HashMap inserts are precomputed before any write.
-    /// Eviction is done first (pure mutation of existing map, always safe),
-    /// then all fallible pre-conditions are checked, then both inserts happen
-    /// under the same lock scope.  An unwind before the inserts leaves the
-    /// shard unchanged; an unwind mid-insert is not possible because HashMap
-    /// insert is infallible after capacity reservation.
+    /// **Atomicity**: every fallible check runs before the first insert.  The
+    /// deny-entry merge is the only fallible write and fails before mutating
+    /// anything; the jti insert after it is infallible.  Eviction may run
+    /// first, but it only drops already-expired state, which is always safe.
     fn atomic_reserve_and_insert(
         &mut self,
         jti: &str,
@@ -113,78 +126,62 @@ impl IssuerShard {
         until: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<(), ReserveError> {
-        self.evict_expired(now);
-
-        // Replay check: jti already in set → AuthorizationDenied.
-        if self.jtis.contains_key(jti) {
+        // Replay check: live jti already in set → AuthorizationDenied.  An
+        // expired, not-yet-evicted reservation is treated as absent.
+        if self.jtis.get(jti).is_some_and(|exp| *exp > now) {
             return Err(ReserveError::JtiAlreadyReserved);
         }
 
-        // JTI resource bound: cap live jti reservations at max_jti_count so an
+        // JTI resource bound: cap jti reservations at max_jti_count so an
         // issuer cannot exhaust memory by sending distinct jtis for already-denied
         // keys faster than they expire.  Uses CapacityExceeded so the caller
         // responds 503 and the command remains replayable (jti not burned).
-        if self.jtis.len() >= self.max_jti_count {
+        // Overwriting an expired reservation of the same jti does not grow the map.
+        if !self.jtis.contains_key(jti)
+            && self.full_after_eviction(now, |s| s.jtis.len() >= s.max_jti_count)
+        {
             return Err(ReserveError::CapacityExceeded);
         }
 
-        // Deny-entry capacity check: only count as new if no active entry exists.
-        // The merge rule never increases live entry count.
-        let is_update = self
-            .entries
-            .get(pubkey_hex)
-            .map(|existing| now < *existing)
-            .unwrap_or(false);
-        if !is_update && self.entries.len() >= self.capacity {
-            return Err(ReserveError::CapacityExceeded);
-        }
-
-        // Prebuild both values before writing anything.
-        let jti_key = jti.to_owned();
-        let entry_key = pubkey_hex.to_owned();
-        let effective_until = match self.entries.get(pubkey_hex) {
-            Some(&existing) => existing.max(until),
-            None => until,
-        };
-
-        // Both mutations are infallible HashMap inserts; executed together
-        // so no intermediate observable state exists.
-        self.jtis.insert(jti_key, jti_effective_expiry);
-        self.entries.insert(entry_key, effective_until);
-
+        self.merge_entry(pubkey_hex, until, now)?;
+        self.jtis.insert(jti.to_owned(), jti_effective_expiry);
         Ok(())
     }
 
-    /// Merge a remote deny entry without consuming a jti.
+    /// Insert or `max(existing_until, until)`-merge a deny entry.
     ///
-    /// Used for cross-pod propagation where replay idempotency is achieved by
-    /// the max(until) merge rule alone — no jti tracking needed.
-    /// Returns `Err(CapacityExceeded)` if the entry is new and the shard is full.
-    fn remote_merge(
+    /// Used directly for cross-pod propagation, where replay idempotency is
+    /// achieved by the merge rule alone — no jti tracking needed.
+    /// Returns `Err(CapacityExceeded)` without mutating the entry map if the
+    /// key is new and the shard is full even after eviction.
+    fn merge_entry(
         &mut self,
         pubkey_hex: &str,
         until: DateTime<Utc>,
         now: DateTime<Utc>,
-    ) -> Result<(), ReserveError> {
-        self.evict_expired(now);
-
-        // Capacity check: only count as new if there is no active entry.
-        let is_update = self
-            .entries
-            .get(pubkey_hex)
-            .map(|existing| now < *existing)
-            .unwrap_or(false);
-        if !is_update && self.entries.len() >= self.capacity {
-            return Err(ReserveError::CapacityExceeded);
+    ) -> Result<(), CapacityExceeded> {
+        // Overwriting an existing (active or expired) entry never grows the map.
+        if !self.entries.contains_key(pubkey_hex)
+            && self.full_after_eviction(now, |s| s.entries.len() >= s.capacity)
+        {
+            return Err(CapacityExceeded);
         }
 
-        // max(existing_until, until) merge.
         let effective_until = match self.entries.get(pubkey_hex) {
             Some(&existing) => existing.max(until),
             None => until,
         };
         self.entries.insert(pubkey_hex.to_owned(), effective_until);
         Ok(())
+    }
+}
+
+/// The shard has no room for a new deny entry, even after eviction.
+struct CapacityExceeded;
+
+impl From<CapacityExceeded> for ReserveError {
+    fn from(_: CapacityExceeded) -> Self {
+        Self::CapacityExceeded
     }
 }
 
@@ -342,19 +339,15 @@ impl NipFiDenyMap {
                     // fail-closed without any explicit write.
                     CrossPodMergeResult::ShardPoisoned
                 }
-                Ok(mut guard) => match guard.remote_merge(&pubkey_hex, until, now) {
+                Ok(mut guard) => match guard.merge_entry(&pubkey_hex, until, now) {
                     Ok(()) => CrossPodMergeResult::Merged,
-                    Err(ReserveError::CapacityExceeded) => {
+                    Err(CapacityExceeded) => {
                         // Cannot record the deny entry — return the outcome so
                         // the caller can close the delivered target's sessions
                         // and report/metric the capacity miss.  No issuer-wide
                         // denial is synthesized; active entries are preserved.
                         // [NIP-FI.md:306-336]
                         CrossPodMergeResult::CapacityExceeded
-                    }
-                    Err(ReserveError::JtiAlreadyReserved) => {
-                        // remote_merge never touches jtis; this arm is unreachable.
-                        unreachable!("remote_merge does not use jti tracking")
                     }
                 },
             },
@@ -748,7 +741,7 @@ mod tests {
 
     #[test]
     fn remote_merge_shorter_after_longer_does_not_shorten() {
-        // Map with iss() pre-registered so remote_merge can operate on it.
+        // Map with iss() pre-registered so merge_cross_pod_deny can operate on it.
         let m = NipFiDenyMap::new(
             100,
             vec![IssuerCapacity {
@@ -780,7 +773,7 @@ mod tests {
 
     #[test]
     fn remote_merge_replay_is_idempotent() {
-        // Map with iss() pre-registered so remote_merge can operate on it.
+        // Map with iss() pre-registered so merge_cross_pod_deny can operate on it.
         let m = NipFiDenyMap::new(
             100,
             vec![IssuerCapacity {
@@ -922,7 +915,7 @@ mod tests {
         let map_c = make_map(&k_a); // pre-filled with k_a active
         let result_c = map_c.merge_cross_pod_deny(iss(), &k_b, expired_until, now);
         // Expired remote entry is treated as a new (already-expired) entry; since
-        // the shard is at capacity the remote_merge returns CapacityExceeded.
+        // the shard is at capacity merge_cross_pod_deny returns CapacityExceeded.
         // The live k_a entry must remain; k_b and k_unrelated must not be denied.
         assert!(
             map_c.is_denied(iss(), &k_a, now),
@@ -1163,5 +1156,125 @@ mod tests {
             m.is_denied(iss(), &k, t_after_deny),
             "key must be denied at t0+15s after successful retry (deadline now t0+30s)"
         );
+    }
+
+    // ── Eviction only at capacity ─────────────────────────────────────────────
+
+    #[test]
+    fn insert_into_shard_full_of_expired_entries_succeeds() {
+        use chrono::TimeZone;
+
+        // Mutation anchor: dropping the evict-and-recheck on the entry-capacity
+        // path returns a false CapacityExceeded here.
+        let m = NipFiDenyMap::new(2, vec![]);
+        let t0 = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
+        let until = t0 + Duration::seconds(10);
+        let (k1, k2, k3) = (key(), key(), key());
+        m.atomic_reserve_and_insert(iss(), "jti-1", until, &k1, until, t0)
+            .expect("k1");
+        m.atomic_reserve_and_insert(iss(), "jti-2", until, &k2, until, t0)
+            .expect("k2");
+
+        let later = t0 + Duration::seconds(20);
+        let later_until = later + Duration::seconds(10);
+        m.atomic_reserve_and_insert(iss(), "jti-3", later_until, &k3, later_until, later)
+            .expect("expired entries must not hold capacity against a new insert");
+        assert!(m.is_denied(iss(), &k3, later), "k3 must be denied");
+        assert!(!m.is_denied(iss(), &k1, later), "expired k1 stays admitted");
+    }
+
+    #[test]
+    fn write_below_capacity_does_not_sweep_expired_state() {
+        use chrono::TimeZone;
+
+        // Mutation anchor: restoring an unconditional sweep on every write
+        // evicts k1's expired entry and jti here.
+        let m = map();
+        let t0 = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
+        let until = t0 + Duration::seconds(10);
+        let (k1, k2) = (key(), key());
+        m.atomic_reserve_and_insert(iss(), "jti-1", until, &k1, until, t0)
+            .expect("k1");
+
+        let later = t0 + Duration::seconds(20);
+        let later_until = later + Duration::seconds(10);
+        m.atomic_reserve_and_insert(iss(), "jti-2", later_until, &k2, later_until, later)
+            .expect("k2");
+
+        let shard = m.shards.get(iss()).unwrap();
+        let guard = shard.lock().unwrap();
+        assert_eq!(guard.entries.len(), 2, "below capacity: no entry sweep");
+        assert_eq!(guard.jtis.len(), 2, "below capacity: no jti sweep");
+    }
+
+    #[test]
+    fn expired_unevicted_jti_is_not_a_replay() {
+        use chrono::TimeZone;
+
+        // Mutation anchor: reverting the replay check to `contains_key` rejects
+        // the post-expiry reuse; not overwriting the stored expiry admits the
+        // final replay.
+        let m = map();
+        let t0 = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
+        let k = key();
+        let until = t0 + Duration::seconds(60);
+        m.atomic_reserve_and_insert(iss(), "jti-A", t0 + Duration::seconds(2), &k, until, t0)
+            .expect("first reservation");
+
+        // jti-A expired at t0+2 but lingers (shard is far below capacity).
+        let t1 = t0 + Duration::seconds(3);
+        m.atomic_reserve_and_insert(iss(), "jti-A", t0 + Duration::seconds(30), &k, until, t1)
+            .expect("expired reservation must not count as a replay");
+
+        // The re-reservation overwrote the expiry, so jti-A is live again.
+        assert_eq!(
+            m.atomic_reserve_and_insert(
+                iss(),
+                "jti-A",
+                t0 + Duration::seconds(30),
+                &k,
+                until,
+                t0 + Duration::seconds(5)
+            ),
+            Err(ReserveError::JtiAlreadyReserved),
+            "re-reserved jti must be live until its new expiry"
+        );
+    }
+
+    #[test]
+    fn cross_pod_merge_into_full_shard_evicts_only_expired_entries() {
+        use chrono::TimeZone;
+
+        // Mutation anchor: dropping the evict-and-recheck makes the second
+        // merge return CapacityExceeded; evicting live entries makes the first
+        // merge succeed.
+        let m = NipFiDenyMap::new(
+            1,
+            vec![IssuerCapacity {
+                issuer: iss().to_owned(),
+                capacity: 1,
+            }],
+        );
+        let t0 = Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap();
+        let until = t0 + Duration::seconds(10);
+        let (k_a, k_b) = (key(), key());
+        m.atomic_reserve_and_insert(iss(), "jti-a", until, &k_a, until, t0)
+            .expect("fill the single slot");
+
+        let t_live = t0 + Duration::seconds(5);
+        assert_eq!(
+            m.merge_cross_pod_deny(iss(), &k_b, t_live + Duration::seconds(60), t_live),
+            CrossPodMergeResult::CapacityExceeded,
+            "full shard with a live entry must still reject a new key"
+        );
+        assert!(m.is_denied(iss(), &k_a, t_live), "live k_a is preserved");
+
+        let t_expired = t0 + Duration::seconds(20);
+        assert_eq!(
+            m.merge_cross_pod_deny(iss(), &k_b, t_expired + Duration::seconds(60), t_expired),
+            CrossPodMergeResult::Merged,
+            "an expired entry must not hold the slot"
+        );
+        assert!(m.is_denied(iss(), &k_b, t_expired), "k_b must be denied");
     }
 }
