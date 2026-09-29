@@ -31,6 +31,7 @@ import {
   useCommunityOnboarding,
   markCommunityOnboardingComplete,
   resolveProfileCheckAction,
+  isTransactionCurrentStage,
   isTransactionStillConnecting,
 } from "@/features/onboarding/communityOnboarding";
 import { CommunityOnboardingFlow } from "@/features/onboarding/ui/CommunityOnboardingFlow";
@@ -609,7 +610,10 @@ function CommunityApp({
       })
         .then(() => {
           if (
-            !isTransactionStillConnecting(transactionRef.current, transactionId)
+            !isTransactionCurrentStage(transactionRef.current, transactionId, [
+              "connecting",
+              "corporate-profile",
+            ])
           )
             return;
           communityOnboarding.update(
@@ -619,7 +623,10 @@ function CommunityApp({
         })
         .catch((error) => {
           if (
-            !isTransactionStillConnecting(transactionRef.current, transactionId)
+            !isTransactionCurrentStage(transactionRef.current, transactionId, [
+              "connecting",
+              "corporate-profile",
+            ])
           )
             return;
           profileCheckTransactionRef.current = null;
