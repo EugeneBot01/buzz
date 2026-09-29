@@ -495,6 +495,9 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     // Spawn Redis pub/sub subscriber for NIP-FI cross-pod disconnect commands.
     // Remote pods publish to this global channel after accepting a disconnect
     // command; every pod merges the deny entry and closes matching sessions.
+    // Subscribe before the Redis subscriber starts so messages buffer (up to the
+    // channel capacity) instead of being dropped until the consumer below runs.
+    let mut nip_fi_disconnect_rx = pubsub.subscribe_nip_fi_disconnect();
     let pubsub_for_nip_fi = Arc::clone(&pubsub);
     tokio::spawn(async move { pubsub_for_nip_fi.run_nip_fi_disconnect_subscriber().await });
 
@@ -1209,10 +1212,9 @@ async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     // minimal and makes the exact production path testable end-to-end.
     {
         let state_for_nip_fi = Arc::clone(&state);
-        let mut rx = state_for_nip_fi.pubsub.subscribe_nip_fi_disconnect();
         tokio::spawn(async move {
             loop {
-                match rx.recv().await {
+                match nip_fi_disconnect_rx.recv().await {
                     Ok(msg) => {
                         let now = chrono::Utc::now();
                         buzz_relay::api::nip_fi::apply_nip_fi_disconnect(
