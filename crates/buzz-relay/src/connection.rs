@@ -382,16 +382,18 @@ pub async fn handle_connection(
         crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone())
     };
     let (pre_terminal_ctrl_tx, pre_terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+    let control = CommunityConnectionControl::new(cancel);
+    let drain_reason = control.disconnect_reason();
     let pre_expiry_task = pre_session_deadline.map(|deadline| {
         crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
             Arc::clone(&pre_gate),
+            control.clone(),
             pre_terminal_ctrl_tx.clone(),
             crate::nip_fi_session::NipFiWsRoute::Root,
         )
     });
 
-    let control = CommunityConnectionControl::new(cancel);
     let community_id = tenant.community();
     let registry = Arc::clone(&state.community_connections);
     let check_state = Arc::clone(&state);
@@ -466,6 +468,16 @@ pub async fn handle_connection(
                         )
                         .await;
                     }
+                }
+                // A published reason (e.g. an expiry denial) closes with its
+                // own frame, exactly as the writer would.
+                let close = drain_reason.borrow().map(|reason| reason.close_message());
+                if let Some(close) = close {
+                    let _ = tokio::time::timeout(
+                        WS_TERMINAL_FLUSH_TIMEOUT,
+                        futures_util::SinkExt::send(&mut ws_send, close),
+                    )
+                    .await;
                 }
                 // Close the socket so the client sees a clean close rather than
                 // an abrupt TCP reset.
@@ -693,6 +705,7 @@ async fn handle_active_connection(
             crate::nip_fi_session::spawn_nip_fi_expiry_task(
                 deadline,
                 Arc::clone(&nip_fi_gate),
+                conn.community_control.clone(),
                 conn.terminal_ctrl_tx.clone(),
                 crate::nip_fi_session::NipFiWsRoute::Root,
             )
@@ -2028,6 +2041,30 @@ pub(crate) mod tests {
         rx
     }
 
+    /// Every frame the production root `send_loop_inner` writes for a
+    /// cancelled `conn` whose terminal receiver is `terminal_rx`: the terminal
+    /// drain followed by the close chosen from the connection's disconnect
+    /// reason.  Shared with `handlers::auth`'s wire-equality tests.
+    pub(crate) async fn root_wire_frames(
+        conn: &ConnectionState,
+        terminal_rx: mpsc::Receiver<WsMessage>,
+    ) -> Vec<WsMessage> {
+        assert!(conn.cancel.is_cancelled(), "denial must cancel the socket");
+        let (sink, state) = MockSink::new(None);
+        send_loop_inner(
+            sink,
+            mpsc::channel(1).1,
+            mpsc::channel(1).1,
+            terminal_rx,
+            mpsc::channel(1).1,
+            conn.cancel.clone(),
+            conn.community_control.disconnect_reason(),
+        )
+        .await;
+        let mut recorded = state.lock().expect("mock sink poisoned");
+        std::mem::take(&mut recorded.messages)
+    }
+
     fn deleted_community_disconnect_reason() -> watch::Receiver<Option<CommunityDisconnectReason>> {
         let (tx, rx) = watch::channel(None);
         tx.send_replace(Some(CommunityDisconnectReason::CommunityDeleted));
@@ -2562,6 +2599,7 @@ pub(crate) mod tests {
         let expiry_task = crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
             gate,
+            crate::state::CommunityConnectionControl::new(cancel.clone()),
             terminal_ctrl_tx,
             crate::nip_fi_session::NipFiWsRoute::Root,
         );
@@ -2771,8 +2809,15 @@ pub(crate) mod tests {
         // cancel the token.
         let already_expired = Utc::now() - chrono::Duration::seconds(1);
         let gate = crate::nip_fi_gate::SessionAdmissionGate::new(already_expired, cancel.clone());
-        let expiry_handle =
-            spawn_nip_fi_expiry_task(already_expired, gate, terminal_ctrl_tx, NipFiWsRoute::Root);
+        let control = crate::state::CommunityConnectionControl::new(cancel.clone());
+        let disconnect_reason = control.disconnect_reason();
+        let expiry_handle = spawn_nip_fi_expiry_task(
+            already_expired,
+            gate,
+            control,
+            terminal_ctrl_tx,
+            NipFiWsRoute::Root,
+        );
         // Wait for the expiry task to fire before we run the send_loop.
         expiry_handle.await.expect("expiry task must complete");
 
@@ -2784,7 +2829,7 @@ pub(crate) mod tests {
             terminal_ctrl_rx,
             restart_rx,
             cancel,
-            ordinary_disconnect_reason(),
+            disconnect_reason,
         )
         .await;
 
@@ -2804,6 +2849,11 @@ pub(crate) mod tests {
         assert!(
             denial_pos < close_pos,
             "B3: expiry denial frame (pos {denial_pos}) must precede Close frame (pos {close_pos})"
+        );
+        // Expiry is `authorization_denied`: the same 1008 as every other row.
+        assert_eq!(
+            msgs[close_pos],
+            CommunityDisconnectReason::AuthorizationDenied.close_message()
         );
     }
 
@@ -2882,15 +2932,15 @@ pub(crate) mod tests {
                                     deadline,
                                     conn_cancel.clone(),
                                 );
+                                let control =
+                                    crate::state::CommunityConnectionControl::new(conn_cancel);
                                 let pre_expiry = crate::nip_fi_session::spawn_nip_fi_expiry_task(
                                     deadline,
                                     Arc::clone(&pre_gate),
+                                    control.clone(),
                                     pre_tx.clone(),
                                     crate::nip_fi_session::NipFiWsRoute::Root,
                                 );
-
-                                let control =
-                                    crate::state::CommunityConnectionControl::new(conn_cancel);
                                 handle_active_connection(
                                     socket,
                                     state_i,

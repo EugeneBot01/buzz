@@ -232,16 +232,18 @@ pub(crate) async fn handle_audio_connection(
     // the inner handler drains it via ws_send.
     let (pre_terminal_ctrl_tx, pre_terminal_ctrl_rx) =
         tokio::sync::mpsc::channel::<axum::extract::ws::Message>(1);
+    let control = CommunityConnectionControl::new(cancel);
+    let drain_reason = control.disconnect_reason();
     let pre_expiry_task = audio_session_deadline.map(|deadline| {
         crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
             Arc::clone(&pre_gate),
+            control.clone(),
             pre_terminal_ctrl_tx.clone(),
             crate::nip_fi_session::NipFiWsRoute::Audio,
         )
     });
 
-    let control = CommunityConnectionControl::new(cancel);
     let community_id = tenant.community();
     let registry = Arc::clone(&state.community_connections);
     let check_state = Arc::clone(&state);
@@ -308,6 +310,16 @@ pub(crate) async fn handle_audio_connection(
                         .await;
                     }
                 }
+                // A published reason (e.g. an expiry denial) closes with its
+                // own frame, exactly as the writer would.
+                let close = drain_reason.borrow().map(|reason| reason.close_message());
+                if let Some(close) = close {
+                    let _ = tokio::time::timeout(
+                        crate::connection::WS_TERMINAL_FLUSH_TIMEOUT,
+                        futures_util::SinkExt::send(&mut ws_send, close),
+                    )
+                    .await;
+                }
                 let _ = tokio::time::timeout(
                     crate::connection::WS_TERMINAL_FLUSH_TIMEOUT,
                     futures_util::SinkExt::close(&mut ws_send),
@@ -320,27 +332,28 @@ pub(crate) async fn handle_audio_connection(
 }
 
 /// Mid-admission cancellation fence for the audio route: if `$cancel` fired,
-/// run any exit cleanup, drain the terminal channel (which holds the denial
-/// frame queued by the expiry task) through the bounded exit writer while the
-/// handler still owns the socket, and return. Used at every async boundary in
-/// the admission sequence before `send_loop` takes the socket.
+/// run any exit cleanup, write the [`terminal_exit_frames`] (the denial frame
+/// queued by the expiry task or a denial writer, then the reason's close)
+/// through the bounded exit writer while the handler still owns the socket,
+/// and return. Used at every async boundary in the admission sequence before
+/// `send_loop` takes the socket.
 macro_rules! check_cancel {
-    ($cancel:ident, $terminal_rx:ident, $ws_send:ident) => {
-        check_cancel!($cancel, $terminal_rx, $ws_send, cleanup: ())
+    ($cancel:ident, $terminal_rx:ident, $reason:ident, $ws_send:ident) => {
+        check_cancel!($cancel, $terminal_rx, $reason, $ws_send, cleanup: ())
     };
-    ($cancel:ident, $terminal_rx:ident, $ws_send:ident, cleanup: $cleanup:expr) => {
+    ($cancel:ident, $terminal_rx:ident, $reason:ident, $ws_send:ident, cleanup: $cleanup:expr) => {
         if $cancel.is_cancelled() {
             $cleanup;
             crate::connection::send_exit_frames_bounded(
                 &mut $ws_send,
-                std::iter::from_fn(|| $terminal_rx.try_recv().ok()),
+                terminal_exit_frames(&mut $terminal_rx, &$reason),
             )
             .await;
             return;
         }
     };
-    ($cancel:ident, $terminal_rx:ident, $ws_send:ident, release_lease: $lease:expr) => {
-        check_cancel!($cancel, $terminal_rx, $ws_send, cleanup: {
+    ($cancel:ident, $terminal_rx:ident, $reason:ident, $ws_send:ident, release_lease: $lease:expr) => {
+        check_cancel!($cancel, $terminal_rx, $reason, $ws_send, cleanup: {
             // Release any acquired lease before returning. Pre-guard path:
             // staged_lease may hold a lease that must be released before we
             // return, since the guard hasn't been built yet.
@@ -361,6 +374,7 @@ async fn send_challenge_unless_cancelled<S>(
     ws_send: &mut S,
     cancel: &CancellationToken,
     terminal_rx: &mut mpsc::Receiver<WsMessage>,
+    disconnect_reason: &watch::Receiver<Option<crate::state::CommunityDisconnectReason>>,
     challenge: WsMessage,
 ) -> bool
 where
@@ -371,7 +385,7 @@ where
         _ = cancel.cancelled() => {
             crate::connection::send_exit_frames_bounded(
                 ws_send,
-                std::iter::from_fn(|| terminal_rx.try_recv().ok()),
+                terminal_exit_frames(terminal_rx, disconnect_reason),
             )
             .await;
             false
@@ -449,6 +463,7 @@ pub(crate) async fn handle_active_audio_connection(
                 crate::nip_fi_session::spawn_nip_fi_expiry_task(
                     deadline,
                     std::sync::Arc::clone(&gate),
+                    control.clone(),
                     tx.clone(),
                     crate::nip_fi_session::NipFiWsRoute::Audio,
                 )
@@ -461,24 +476,17 @@ pub(crate) async fn handle_active_audio_connection(
     control.set_terminal_frame_sender(terminal_ctrl_tx);
 
     // Already-expired fast path: catch a deadline already past at upgrade time
-    // before spending the AUTH_TIMEOUT window. Send the canonical denial frame
-    // directly (do not race against the spawned expiry task via try_recv —
-    // the task may not have run yet, leaving the channel empty). [FI-TRACE-DENIAL-ORACLE]
+    // before spending the AUTH_TIMEOUT window. Deny through the shared
+    // transition directly (do not wait on the spawned expiry task — it may not
+    // have run yet); whichever of the two wins queues the one frame.
+    // [FI-TRACE-DENIAL-ORACLE]
     if let Some(deadline) = audio_session_deadline {
         if chrono::Utc::now() >= deadline {
             warn!(
                 channel_id = %channel_id,
                 "NIP-FI session deadline already expired at audio upgrade — rejecting before auth"
             );
-            crate::connection::send_exit_frames_bounded(
-                &mut ws_send,
-                [crate::nip_fi_session::denial_frame(
-                    crate::nip_fi_session::NipFiWsRoute::Audio,
-                    buzz_auth::DenialClass::AuthorizationDenied,
-                )],
-            )
-            .await;
-            cancel.cancel();
+            deny_audio_authorization(&mut ws_send, &control, &mut terminal_ctrl_rx).await;
             return;
         }
     }
@@ -490,6 +498,7 @@ pub(crate) async fn handle_active_audio_connection(
         &mut ws_send,
         &cancel,
         &mut terminal_ctrl_rx,
+        &disconnect_reason,
         WsMessage::Text(challenge_msg.into()),
     )
     .await
@@ -503,7 +512,7 @@ pub(crate) async fn handle_active_audio_connection(
             // Gate or external cancel fired during auth. Drain denial frame.
             crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
-                std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
             )
             .await;
             return;
@@ -558,7 +567,7 @@ pub(crate) async fn handle_active_audio_connection(
             // terminal channel so the denial frame reaches the client.
             crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
-                std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
             )
             .await;
             return;
@@ -617,7 +626,8 @@ pub(crate) async fn handle_active_audio_connection(
         pubkey,
         crate::nip_fi_session::PairingDenialTarget::Audio {
             ws_send: &mut ws_send,
-            cancel: &cancel,
+            control: &control,
+            terminal_rx: &mut terminal_ctrl_rx,
             channel_id,
         },
     )
@@ -638,15 +648,7 @@ pub(crate) async fn handle_active_audio_connection(
                 pubkey = %pubkey_hex,
                 "NIP-FI session deadline already expired at pairing — rejecting audio admission"
             );
-            crate::connection::send_exit_frames_bounded(
-                &mut ws_send,
-                [crate::nip_fi_session::denial_frame(
-                    crate::nip_fi_session::NipFiWsRoute::Audio,
-                    buzz_auth::DenialClass::AuthorizationDenied,
-                )],
-            )
-            .await;
-            cancel.cancel();
+            deny_audio_authorization(&mut ws_send, &control, &mut terminal_ctrl_rx).await;
             return;
         }
     }
@@ -678,19 +680,7 @@ pub(crate) async fn handle_active_audio_connection(
                     pubkey = %pubkey_hex,
                     "NIP-FI deny-set hit at audio post-registration check — denying"
                 );
-                crate::connection::send_exit_frames_bounded(
-                    &mut ws_send,
-                    [
-                        crate::nip_fi_session::denial_frame(
-                            crate::nip_fi_session::NipFiWsRoute::Audio,
-                            buzz_auth::DenialClass::AuthorizationDenied,
-                        ),
-                        crate::state::CommunityDisconnectReason::AuthorizationDenied
-                            .close_message(),
-                    ],
-                )
-                .await;
-                cancel.cancel();
+                deny_audio_authorization(&mut ws_send, &control, &mut terminal_ctrl_rx).await;
                 return;
             }
         }
@@ -720,15 +710,18 @@ pub(crate) async fn handle_active_audio_connection(
     };
     if let Some(class) = relay_refusal {
         // Off mode keeps one legacy frame for both outcomes.
-        let deny_frame = authorization_exit_frame(
+        exit_authorization_refusal(
+            &mut ws_send,
+            &control,
+            &mut terminal_ctrl_rx,
             nip_fi_assertion.is_some(),
             class,
             serde_json::json!({"type": "error", "message": "restricted: not a relay member"}),
-        );
-        crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
+        )
+        .await;
         return;
     }
-    check_cancel!(cancel, terminal_ctrl_rx, ws_send);
+    check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send);
 
     // ── Step 3: membership check / auto-add ───────────────────────────────────
     let membership_admission = match check_membership_for_admission(
@@ -743,12 +736,15 @@ pub(crate) async fn handle_active_audio_connection(
         Ok(admission) => admission,
         Err(refusal) => {
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership denied: {refusal}");
-            let deny_frame = authorization_exit_frame(
+            exit_authorization_refusal(
+                &mut ws_send,
+                &control,
+                &mut terminal_ctrl_rx,
                 nip_fi_assertion.is_some(),
                 refusal.denial_class(),
                 serde_json::json!({"type": "error", "message": "not a member"}),
-            );
-            crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
+            )
+            .await;
             return;
         }
     };
@@ -760,7 +756,7 @@ pub(crate) async fn handle_active_audio_connection(
             parent_channel_id, ..
         } => *parent_channel_id,
     };
-    check_cancel!(cancel, terminal_ctrl_rx, ws_send);
+    check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send);
 
     // Huddle cross-pod routing (mesh) OR single-pod guardrail.
     //
@@ -815,7 +811,7 @@ pub(crate) async fn handle_active_audio_connection(
                         }
                         crate::connection::send_exit_frames_bounded(
                             &mut ws_send,
-                            std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                            terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
                         )
                         .await;
                         return;
@@ -863,7 +859,7 @@ pub(crate) async fn handle_active_audio_connection(
             }
             // I1 residual: staged_lease may now hold an acquired lease. Release
             // it (awaited, not detached) before returning on cancel.
-            check_cancel!(cancel, terminal_ctrl_rx, ws_send, release_lease: staged_lease);
+            check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send, release_lease: staged_lease);
         }
         None => {
             if !state.config.huddle_audio_available {
@@ -945,7 +941,7 @@ pub(crate) async fn handle_active_audio_connection(
     }
     // I1 residual: staged_lease may hold an acquired lease. Release it
     // (awaited, not detached) before returning on cancel.
-    check_cancel!(cancel, terminal_ctrl_rx, ws_send, release_lease: staged_lease);
+    check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send, release_lease: staged_lease);
 
     // Reject unsupported future versions up-front so we don't accidentally
     // pin a room to a version we can't speak. Versions 1..=CURRENT are OK.
@@ -1084,7 +1080,7 @@ pub(crate) async fn handle_active_audio_connection(
             let _ = guard.release_before_commit().await; // pre-add-peer; owner_generation not set
             crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
-                std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
             )
             .await;
             return;
@@ -1108,7 +1104,7 @@ pub(crate) async fn handle_active_audio_connection(
                 let _ = guard.release_before_commit().await; // pre-add-peer; owner_generation not set
                 crate::connection::send_exit_frames_bounded(
                     &mut ws_send,
-                    std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                    terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
                 )
                 .await;
                 return;
@@ -1273,7 +1269,7 @@ pub(crate) async fn handle_active_audio_connection(
         }
         crate::connection::send_exit_frames_bounded(
             &mut ws_send,
-            std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+            terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
         )
         .await;
         return;
@@ -1575,7 +1571,7 @@ pub(crate) async fn handle_active_audio_connection(
             // Drain the terminal denial frame (already queued by expiry task).
             crate::connection::send_exit_frames_bounded(
                 &mut ws_send,
-                std::iter::from_fn(|| terminal_ctrl_rx.try_recv().ok()),
+                terminal_exit_frames(&mut terminal_ctrl_rx, &disconnect_reason),
             )
             .await;
             return;
@@ -1625,12 +1621,15 @@ pub(crate) async fn handle_active_audio_connection(
                     mesh.owners.release(channel_id, generation);
                 }
             }
-            let deny_frame = authorization_exit_frame(
+            exit_authorization_refusal(
+                &mut ws_send,
+                &control,
+                &mut terminal_ctrl_rx,
                 nip_fi_assertion.is_some(),
                 buzz_auth::DenialClass::AuthorizationDenied,
                 serde_json::json!({"type": "error", "message": "error: not a member"}),
-            );
-            crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
+            )
+            .await;
             return;
         }
         Err(JoinCommitError::HuddleLinkGone) => {
@@ -1652,12 +1651,15 @@ pub(crate) async fn handle_active_audio_connection(
                 }
             }
             // The creator-signed link is the authority for the auto-add.
-            let deny_frame = authorization_exit_frame(
+            exit_authorization_refusal(
+                &mut ws_send,
+                &control,
+                &mut terminal_ctrl_rx,
                 nip_fi_assertion.is_some(),
                 buzz_auth::DenialClass::AuthorizationDenied,
                 serde_json::json!({"type":"error","message":"huddle has ended"}),
-            );
-            crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
+            )
+            .await;
             return;
         }
         Err(JoinCommitError::Db(e)) => {
@@ -1677,12 +1679,15 @@ pub(crate) async fn handle_active_audio_connection(
                     mesh.owners.release(channel_id, generation);
                 }
             }
-            let deny_frame = authorization_exit_frame(
+            exit_authorization_refusal(
+                &mut ws_send,
+                &control,
+                &mut terminal_ctrl_rx,
                 nip_fi_assertion.is_some(),
                 buzz_auth::DenialClass::AuthorizationUnavailable,
                 serde_json::json!({"type":"error","message":"error: join commit failed"}),
-            );
-            crate::connection::send_exit_frames_bounded(&mut ws_send, [deny_frame]).await;
+            )
+            .await;
             return;
         }
     }
@@ -2575,6 +2580,64 @@ fn authorization_exit_frame(
         crate::nip_fi_session::denial_frame(crate::nip_fi_session::NipFiWsRoute::Audio, class)
     } else {
         WsMessage::Text(off_mode.to_string().into())
+    }
+}
+
+/// Terminal `authorization_denied` exit for the audio admission path, before
+/// `send_loop` owns the socket: runs the control's first-writer-wins denial
+/// transition, then writes whatever the winner queued followed by the
+/// reason's close.  A concurrent registry scan therefore cannot add a second
+/// denial, and every audio `authorization_denied` is the same restricted frame
+/// plus 1008.  [FI-TRACE-DENIAL-ORACLE]
+pub(crate) async fn deny_audio_authorization<S>(
+    ws_send: &mut S,
+    control: &CommunityConnectionControl,
+    terminal_rx: &mut mpsc::Receiver<WsMessage>,
+) where
+    S: futures_util::Sink<WsMessage> + Unpin,
+{
+    control.disconnect_nip_fi();
+    crate::connection::send_exit_frames_bounded(
+        ws_send,
+        terminal_exit_frames(terminal_rx, &control.disconnect_reason()),
+    )
+    .await;
+}
+
+/// Exit frames for an audio socket leaving before `send_loop` owns it: every
+/// queued terminal frame, then the close for the published disconnect reason.
+/// Without a reason (plain cancellation) no close is appended, as before.
+fn terminal_exit_frames<'a>(
+    terminal_rx: &'a mut mpsc::Receiver<WsMessage>,
+    disconnect_reason: &watch::Receiver<Option<crate::state::CommunityDisconnectReason>>,
+) -> impl Iterator<Item = WsMessage> + 'a {
+    let close = disconnect_reason
+        .borrow()
+        .map(|reason| reason.close_message());
+    std::iter::from_fn(move || terminal_rx.try_recv().ok()).chain(close)
+}
+
+/// Writes an authorization refusal on the audio admission path: a NIP-FI
+/// `authorization_denied` takes [`deny_audio_authorization`]; any other
+/// refusal writes its single [`authorization_exit_frame`].
+async fn exit_authorization_refusal<S>(
+    ws_send: &mut S,
+    control: &CommunityConnectionControl,
+    terminal_rx: &mut mpsc::Receiver<WsMessage>,
+    nip_fi: bool,
+    class: buzz_auth::DenialClass,
+    off_mode: serde_json::Value,
+) where
+    S: futures_util::Sink<WsMessage> + Unpin,
+{
+    if nip_fi && class == buzz_auth::DenialClass::AuthorizationDenied {
+        deny_audio_authorization(ws_send, control, terminal_rx).await;
+    } else {
+        crate::connection::send_exit_frames_bounded(
+            ws_send,
+            [authorization_exit_frame(nip_fi, class, off_mode)],
+        )
+        .await;
     }
 }
 
@@ -3836,6 +3899,26 @@ mod tests {
         key: &nostr::Keys,
         sign_issued_challenge: bool,
     ) -> (Vec<String>, bool) {
+        let (frames, cancelled) =
+            run_audio_auth_wire(state, assertion, key, sign_issued_challenge).await;
+        let texts = frames
+            .into_iter()
+            .filter_map(|frame| match frame {
+                tokio_tungstenite::tungstenite::Message::Text(t) => Some(t.to_string()),
+                _ => None,
+            })
+            .collect();
+        (texts, cancelled)
+    }
+
+    /// [`run_audio_auth`], returning every Text and Close frame the client
+    /// received after the challenge, in wire order.
+    async fn run_audio_auth_wire(
+        state: std::sync::Arc<crate::state::AppState>,
+        assertion: Option<buzz_auth::VerifiedAssertion>,
+        key: &nostr::Keys,
+        sign_issued_challenge: bool,
+    ) -> (Vec<tokio_tungstenite::tungstenite::Message>, bool) {
         use std::sync::Arc;
         let tenant = buzz_core::tenant::TenantContext::resolved(
             buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::nil()),
@@ -3908,17 +3991,117 @@ mod tests {
                 .await
                 .expect("handler must close the connection within the read budget");
             match next {
-                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
-                    frames.push(t.to_string())
+                Some(Ok(frame @ tokio_tungstenite::tungstenite::Message::Text(_))) => {
+                    frames.push(frame)
                 }
-                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))
-                | Some(Err(_))
-                | None => break,
+                Some(Ok(frame @ tokio_tungstenite::tungstenite::Message::Close(_))) => {
+                    frames.push(frame);
+                    break;
+                }
+                Some(Err(_)) | None => break,
                 Some(Ok(_)) => {}
             }
         }
         server.abort();
         (frames, cancel_for_assert.is_cancelled())
+    }
+
+    /// FI-TRACE-DENIAL-ORACLE: an assertion–key mismatch and an active
+    /// deny-set entry are both `authorization_denied`, so the audio client
+    /// must see byte-identical frames: the restricted JSON, then 1008.
+    ///
+    /// Mutation: send the pairing denial frame directly (bypassing
+    /// `deny_audio_authorization`) → no Close(1008) and the sequences differ.
+    #[tokio::test]
+    async fn audio_key_mismatch_and_deny_set_emit_identical_frames() {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+        use tokio_tungstenite::tungstenite::Message;
+        let deadline = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let asserted = nostr::Keys::generate();
+        let assertion =
+            buzz_auth::VerifiedAssertion::for_test(Some(asserted.public_key()), vec![deadline]);
+        let (mismatch, mismatch_cancelled) = run_audio_auth_wire(
+            audio_deny_state(None).await,
+            Some(assertion),
+            &nostr::Keys::generate(),
+            true,
+        )
+        .await;
+
+        let denied = nostr::Keys::generate();
+        let assertion =
+            buzz_auth::VerifiedAssertion::for_test(Some(denied.public_key()), vec![deadline]);
+        let (deny_set, deny_set_cancelled) = run_audio_auth_wire(
+            audio_deny_state(Some(&denied.public_key())).await,
+            Some(assertion),
+            &denied,
+            true,
+        )
+        .await;
+
+        assert!(mismatch_cancelled && deny_set_cancelled);
+        assert_eq!(mismatch, deny_set);
+        assert_eq!(
+            mismatch,
+            [
+                Message::Text(audio_denial(buzz_auth::DenialClass::AuthorizationDenied).into()),
+                Message::Close(Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: "authorization denied".into(),
+                })),
+            ]
+        );
+    }
+
+    /// Records every frame the denial writer emits for a registered audio
+    /// control, then lets a registry scan race it in `scan_first` order.
+    async fn audio_denial_with_concurrent_scan(
+        scan_first: bool,
+    ) -> (Vec<WsMessage>, mpsc::Receiver<WsMessage>) {
+        let registry = crate::state::CommunityConnectionRegistry::new();
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let key = vec![0x42u8; 32];
+        let control = CommunityConnectionControl::new(CancellationToken::new());
+        let (terminal_tx, mut terminal_rx) = mpsc::channel::<WsMessage>(1);
+        control.set_terminal_frame_sender(terminal_tx);
+        audio_post_auth_register(&control, key.clone(), Some("test-issuer".to_owned()));
+        let _guard = registry.register(uuid::Uuid::new_v4(), community, control.clone());
+
+        let mut wire = Vec::new();
+        if scan_first {
+            assert_eq!(registry.disconnect_nip_fi("test-issuer", &key), 1);
+        }
+        deny_audio_authorization(&mut wire, &control, &mut terminal_rx).await;
+        if !scan_first {
+            registry.disconnect_nip_fi("test-issuer", &key);
+        }
+        (wire, terminal_rx)
+    }
+
+    /// Winner-only enqueue: whichever of the handler's own denial and a
+    /// registry `disconnect_nip_fi` scan runs second writes nothing, so the
+    /// socket sees exactly one restricted frame and one 1008.
+    ///
+    /// Mutation: have `deny_audio_authorization` write its frames without the
+    /// reason transition → the later scan wins and queues a second denial.
+    #[tokio::test]
+    async fn audio_denial_and_registry_scan_emit_one_frame_sequence() {
+        let expected = [
+            crate::nip_fi_session::denial_frame(
+                crate::nip_fi_session::NipFiWsRoute::Audio,
+                buzz_auth::DenialClass::AuthorizationDenied,
+            ),
+            crate::state::CommunityDisconnectReason::AuthorizationDenied.close_message(),
+        ];
+        for scan_first in [false, true] {
+            let (wire, mut terminal_rx) = audio_denial_with_concurrent_scan(scan_first).await;
+            assert_eq!(wire, expected, "scan_first = {scan_first}");
+            assert!(
+                terminal_rx.try_recv().is_err(),
+                "no second denial may be queued (scan_first = {scan_first})"
+            );
+        }
     }
 
     async fn run_audio_bad_nip42_proof(
@@ -4579,7 +4762,9 @@ mod tests {
     //   - Delete/change the audio enqueue in `spawn_nip_fi_expiry_task` →
     //     output lacks or mismatches frame 0.
     //   - Revert the audio send_loop cancellation drain → output begins with
-    //     Close(None) or lacks the restricted frame entirely.
+    //     a Close or lacks the restricted frame entirely.
+    //   - Enqueue the expiry frame without the reason transition → frame 1
+    //     is Close(None), not 1008.
     //   - Replace audio's production constructor call with a copied local task →
     //     structural requirement: exactly one `spawn_nip_fi_expiry_task`
     //     definition (in `nip_fi_session`) and two production invocations (root
@@ -4591,7 +4776,7 @@ mod tests {
         use std::pin::Pin;
         use std::sync::Arc;
         use std::task::{Context, Poll};
-        use tokio::sync::{mpsc, watch};
+        use tokio::sync::mpsc;
 
         // Recording sink that stores every message in order.
         struct RecordSink(Arc<tokio::sync::Mutex<Vec<WsMessage>>>);
@@ -4632,8 +4817,9 @@ mod tests {
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
         let (terminal_tx, terminal_rx) = mpsc::channel::<WsMessage>(1);
         let cancel = CancellationToken::new();
-        let (disconnect_tx, disconnect_rx) = watch::channel(None);
-        drop(disconnect_tx); // plain Close(None)
+        // The expiry publishes its reason on the socket's own control.
+        let control = crate::state::CommunityConnectionControl::new(cancel.clone());
+        let disconnect_rx = control.disconnect_reason();
 
         // Step 1: spawn audio send_loop and yield so it parks in its select.
         let send_cancel = cancel.clone();
@@ -4655,6 +4841,7 @@ mod tests {
         let expiry_handle = crate::nip_fi_session::spawn_nip_fi_expiry_task(
             already_expired,
             gate,
+            control,
             terminal_tx,
             crate::nip_fi_session::NipFiWsRoute::Audio,
         );
@@ -4690,11 +4877,11 @@ mod tests {
             other => panic!("frame 0 must be Text(restricted JSON); got {other:?}"),
         }
 
-        // Frame 1: Close(None).
-        assert!(
-            matches!(frames[1], WsMessage::Close(None)),
-            "frame 1 must be Close(None); got {:?}",
-            frames[1]
+        // Frame 1: the `authorization_denied` 1008 close.
+        assert_eq!(
+            frames[1],
+            crate::state::CommunityDisconnectReason::AuthorizationDenied.close_message(),
+            "frame 1 must be the 1008 authorization-denied close"
         );
     }
 
@@ -5256,14 +5443,19 @@ mod tests {
         );
 
         let conn_cancel = CancellationToken::new();
-        let (pre_terminal_tx, _pre_terminal_rx) =
+        let (pre_terminal_tx, pre_terminal_rx) =
             tokio::sync::mpsc::channel::<axum::extract::ws::Message>(1);
+        // One control and one terminal channel shared by the expiry task and
+        // the handler, as `handle_audio_connection` wires them.
+        let control = crate::state::CommunityConnectionControl::new(conn_cancel.clone());
+        let pre_terminal_rx = Arc::new(std::sync::Mutex::new(Some(pre_terminal_rx)));
         let pre_gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, conn_cancel.clone());
         // Fire the expiry task so the gate is expired and the token is
         // cancelled before the handler even inspects it.
         let pre_expiry = crate::nip_fi_session::spawn_nip_fi_expiry_task(
             deadline,
             Arc::clone(&pre_gate),
+            control.clone(),
             pre_terminal_tx.clone(),
             crate::nip_fi_session::NipFiWsRoute::Audio,
         );
@@ -5273,7 +5465,8 @@ mod tests {
         let tenant_c = tenant.clone();
         let assertion_c = assertion.clone();
         let pre_gate_c = Arc::clone(&pre_gate);
-        let conn_cancel_c = conn_cancel.clone();
+        let control_c = control.clone();
+        let pre_terminal_rx_c = Arc::clone(&pre_terminal_rx);
         let pre_terminal_tx_c = pre_terminal_tx.clone();
 
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -5289,14 +5482,16 @@ mod tests {
                     let tenant_i = tenant_c.clone();
                     let assertion_i = assertion_c.clone();
                     let gate_i = Arc::clone(&pre_gate_c);
-                    let cancel_i = conn_cancel_c.clone();
+                    let control_i = control_c.clone();
+                    let rx_i = Arc::clone(&pre_terminal_rx_c);
                     let tx_i = pre_terminal_tx_c.clone();
                     move |ws: WebSocketUpgrade| {
                         let state_i = Arc::clone(&state_i);
                         let tenant_i = tenant_i.clone();
                         let assertion_i = assertion_i.clone();
                         let gate_i = Arc::clone(&gate_i);
-                        let cancel_i = cancel_i.clone();
+                        let control_i = control_i.clone();
+                        let rx_i = Arc::clone(&rx_i);
                         let tx_i = tx_i.clone();
                         let conn_time = chrono::Utc::now();
                         async move {
@@ -5304,14 +5499,17 @@ mod tests {
                                 // Provide the pre-built terminal receive end.
                                 // The expiry task was spawned in the outer scope;
                                 // pass None for the JoinHandle (cannot move across).
-                                let (_, rx) =
-                                    tokio::sync::mpsc::channel::<axum::extract::ws::Message>(1);
+                                let rx = rx_i
+                                    .lock()
+                                    .expect("rx slot")
+                                    .take()
+                                    .expect("single connection");
                                 handle_active_audio_connection(
                                     socket,
                                     state_i,
                                     tenant_i,
                                     uuid::Uuid::new_v4(),
-                                    crate::state::CommunityConnectionControl::new(cancel_i),
+                                    control_i,
                                     Some(assertion_i),
                                     conn_time,
                                     Some((gate_i, tx_i, rx, None)),
@@ -5363,6 +5561,19 @@ mod tests {
             ),
             other => panic!("F3-audio: expected Text(restricted JSON); got {other:?}"),
         }
+        let close = tokio::time::timeout(std::time::Duration::from_millis(500), client.next())
+            .await
+            .expect("F3-audio: close must follow the denial");
+        assert!(
+            matches!(
+                &close,
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(Some(frame))))
+                    if frame.code
+                        == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
+                        && frame.reason.as_str() == "authorization denied"
+            ),
+            "F3-audio: expiry is `authorization_denied` and closes 1008; got {close:?}"
+        );
 
         // Drain pre_expiry to avoid leaking tasks.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), pre_expiry).await;
@@ -13017,9 +13228,10 @@ mod tests {
             .expect("queue terminal frame");
         let cancel = CancellationToken::new();
         cancel.cancel();
+        let disconnect_reason = tokio::sync::watch::channel(None).1;
 
         let fence = async {
-            check_cancel!(cancel, terminal_ctrl_rx, ws_send);
+            check_cancel!(cancel, terminal_ctrl_rx, disconnect_reason, ws_send);
             panic!("check_cancel! must return on a cancelled token");
         };
         tokio::time::timeout(
@@ -13066,6 +13278,7 @@ mod tests {
                 &mut ws_send,
                 &cancel,
                 &mut terminal_rx,
+                &tokio::sync::watch::channel(None).1,
                 WsMessage::Text("challenge".into()),
             ),
         )

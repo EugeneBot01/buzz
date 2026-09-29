@@ -134,16 +134,19 @@ impl CommunityConnectionControl {
         *slot = Some(tx);
     }
 
-    /// Terminal transition for the post-registration deny-set check in the
-    /// auth handler: under the transition lock, publishes `AuthorizationDenied`
-    /// first-writer-wins and enqueues the denial frame only if it won.  Does
-    /// not cancel; the caller cancels after this returns.  [FI-TRACE-DENY-SET]
-    pub(crate) fn auth_deny_terminal(
+    /// First-writer-wins `authorization_denied` transition shared by every
+    /// NIP-FI denial writer: under the transition lock, publishes
+    /// `AuthorizationDenied` only if no reason is set yet, and only the winner
+    /// enqueues `route`'s denial frame — on `frame_tx`, else on the sender
+    /// registered by `set_terminal_frame_sender`.  Every writer therefore
+    /// yields the same single frame plus the reason's 1008 close.
+    /// Does not cancel.  [FI-TRACE-DENIAL-ORACLE]
+    fn publish_authorization_denied(
         &self,
-        frame_tx: &mpsc::Sender<WsMessage>,
         route: crate::nip_fi_session::NipFiWsRoute,
+        frame_tx: Option<&mpsc::Sender<WsMessage>>,
     ) {
-        let _lock = self
+        let slot = self
             .terminal_frame_tx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -154,62 +157,45 @@ impl CommunityConnectionControl {
             }
             Some(_) => false,
         });
-        if won {
-            let _ = frame_tx.try_send(crate::nip_fi_session::denial_frame(
+        if !won {
+            return;
+        }
+        if let Some(tx) = frame_tx.or(slot.as_ref()) {
+            let _ = tx.try_send(crate::nip_fi_session::denial_frame(
                 route,
                 buzz_auth::DenialClass::AuthorizationDenied,
             ));
         }
     }
 
-    /// Denial transition for `ConnectionManager::disconnect_nip_fi`: same
-    /// winner-only enqueue as `auth_deny_terminal`, on the root connection's
-    /// `terminal_ctrl_tx` (drained first by `send_loop` on cancel), then cancels.
+    /// `authorization_denied` decided on the socket itself (key mismatch,
+    /// deny-set hit, ban/allowlist/membership refusal, lease expiry): the
+    /// shared first-writer-wins transition on `frame_tx`.  Does not cancel;
+    /// the caller cancels after this returns.  [FI-TRACE-DENY-SET]
+    pub(crate) fn deny_authorization(
+        &self,
+        frame_tx: &mpsc::Sender<WsMessage>,
+        route: crate::nip_fi_session::NipFiWsRoute,
+    ) {
+        self.publish_authorization_denied(route, Some(frame_tx));
+    }
+
+    /// Denial transition for `ConnectionManager::disconnect_nip_fi`: the shared
+    /// transition on the root connection's `terminal_ctrl_tx` (drained first
+    /// by `send_loop` on cancel), then cancels.
     pub(crate) fn manager_disconnect_nip_fi(&self, frame_tx: &mpsc::Sender<WsMessage>) {
-        let slot = self
-            .terminal_frame_tx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let won = self.reason_tx.send_if_modified(|current| match current {
-            None => {
-                *current = Some(CommunityDisconnectReason::AuthorizationDenied);
-                true
-            }
-            Some(_) => false,
-        });
-        if won {
-            let _ = frame_tx.try_send(crate::nip_fi_session::denial_frame(
-                crate::nip_fi_session::NipFiWsRoute::Root,
-                buzz_auth::DenialClass::AuthorizationDenied,
-            ));
-        }
-        drop(slot);
+        self.publish_authorization_denied(
+            crate::nip_fi_session::NipFiWsRoute::Root,
+            Some(frame_tx),
+        );
         self.cancel.cancel();
     }
 
-    /// Denial transition for registry sockets (audio): winner-only enqueue on
-    /// the sender registered by `set_terminal_frame_sender`, then cancel.
-    fn disconnect_nip_fi(&self) {
-        let slot = self
-            .terminal_frame_tx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let won = self.reason_tx.send_if_modified(|current| match current {
-            None => {
-                *current = Some(CommunityDisconnectReason::AuthorizationDenied);
-                true
-            }
-            Some(_) => false,
-        });
-        if won {
-            if let Some(ref tx) = *slot {
-                let _ = tx.try_send(crate::nip_fi_session::denial_frame(
-                    crate::nip_fi_session::NipFiWsRoute::Audio,
-                    buzz_auth::DenialClass::AuthorizationDenied,
-                ));
-            }
-        }
-        drop(slot);
+    /// Audio-route denial transition, used by the registry scan and the audio
+    /// handler's own denials: the shared transition on the sender registered
+    /// by `set_terminal_frame_sender`, then cancels.
+    pub(crate) fn disconnect_nip_fi(&self) {
+        self.publish_authorization_denied(crate::nip_fi_session::NipFiWsRoute::Audio, None);
         self.cancel.cancel();
     }
 

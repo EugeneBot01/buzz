@@ -85,14 +85,23 @@ pub(crate) fn nip42_denial_class(error: &buzz_auth::AuthError) -> buzz_auth::Den
 /// NIP-FI post-upgrade AUTH denial: queue the canonical Root NOTICE for
 /// `class` on the terminal channel, then close. Callers invoke this only when
 /// `conn.nip_fi_assertion` is present, so every FI denial is uniform in frame
-/// type, body, and close behaviour. [FI-TRACE-DENIAL-ORACLE]
+/// type, body, and close behaviour. `authorization_denied` goes through the
+/// shared first-writer-wins transition, so it closes with the same 1008 as a
+/// deny-set hit or admin disconnect. [FI-TRACE-DENIAL-ORACLE]
 fn deny_nip_fi_auth(conn: &ConnectionState, class: buzz_auth::DenialClass) {
-    let _ = conn
-        .terminal_ctrl_tx
-        .try_send(crate::nip_fi_session::denial_frame(
+    if class == buzz_auth::DenialClass::AuthorizationDenied {
+        conn.community_control.deny_authorization(
+            &conn.terminal_ctrl_tx,
             crate::nip_fi_session::NipFiWsRoute::Root,
-            class,
-        ));
+        );
+    } else {
+        let _ = conn
+            .terminal_ctrl_tx
+            .try_send(crate::nip_fi_session::denial_frame(
+                crate::nip_fi_session::NipFiWsRoute::Root,
+                class,
+            ));
+    }
     conn.cancel.cancel();
 }
 
@@ -501,14 +510,15 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                             "reason" => "deny_set_post_registration"
                         )
                         .increment(1);
-                        conn.community_control.auth_deny_terminal(
-                            &conn.terminal_ctrl_tx,
-                            crate::nip_fi_session::NipFiWsRoute::Root,
-                        );
-                        conn.cancel.cancel();
+                        deny_nip_fi_auth(&conn, buzz_auth::DenialClass::AuthorizationDenied);
                         return;
                     }
                 }
+            }
+            // A concurrent `disconnect_nip_fi` may have closed this session
+            // after the deny-set check; its denial is the terminal reply.
+            if conn.cancel.is_cancelled() {
+                return;
             }
             conn.send(RelayMessage::ok(&event_id_hex, true, ""));
             // _auth_permit drops here — expiry's write guard may proceed.
@@ -794,6 +804,12 @@ mod tests {
             }
             other => panic!("terminal frame must be Text(NOTICE); got {other:?}"),
         }
+        // Same public class as a deny-set hit, so the send loop closes 1008.
+        assert_eq!(
+            *conn.community_control.disconnect_reason().borrow(),
+            Some(crate::state::CommunityDisconnectReason::AuthorizationDenied),
+            "pairing mismatch must publish AuthorizationDenied"
+        );
     }
 
     // ── B2: Cancelled connection is never admitted to Authenticated state ──────
@@ -947,11 +963,23 @@ mod tests {
         }
 
         fn auth_event(&self) -> nostr::Event {
+            self.auth_event_signed_by(&self.key)
+        }
+
+        /// An AUTH over the issued challenge signed by `key`; a key other
+        /// than the asserted one is a pairing mismatch.
+        fn auth_event_signed_by(&self, key: &Keys) -> nostr::Event {
             EventBuilder::new(Kind::Authentication, "")
                 .tag(Tag::parse(["relay", "ws://test.local"]).unwrap())
                 .tag(Tag::parse(["challenge", &self.challenge]).unwrap())
-                .sign_with_keys(&self.key)
+                .sign_with_keys(key)
                 .unwrap()
+        }
+
+        /// The frames the production root send loop writes for this
+        /// (already denied) connection.
+        async fn wire_frames(self) -> Vec<WsMessage> {
+            crate::connection::tests::root_wire_frames(&self.conn, self.terminal_rx).await
         }
 
         async fn run(&self, event: nostr::Event, state: std::sync::Arc<crate::state::AppState>) {
@@ -983,6 +1011,14 @@ mod tests {
                 "FI denial must close the socket"
             );
             assert!(matches!(self.conn.auth_state_snapshot(), AuthState::Failed));
+            // `authorization_denied` closes 1008 like a deny-set hit; the
+            // other classes keep the bare close.
+            let expected_reason = (class == buzz_auth::DenialClass::AuthorizationDenied)
+                .then_some(crate::state::CommunityDisconnectReason::AuthorizationDenied);
+            assert_eq!(
+                *self.conn.community_control.disconnect_reason().borrow(),
+                expected_reason
+            );
         }
 
         fn assert_off_mode_ok(mut self, reason: &str) {
@@ -1094,6 +1130,86 @@ mod tests {
         let harness = AuthHarness::new(true);
         harness.run(harness.auth_event(), state).await;
         harness.assert_fi_terminal(buzz_auth::DenialClass::AuthorizationUnavailable);
+    }
+
+    /// Root wire frames for an FI session whose NIP-42 key is not the
+    /// asserted one, driven through the production `handle_auth`.
+    async fn root_key_mismatch_wire_frames(
+        state: std::sync::Arc<crate::state::AppState>,
+    ) -> Vec<WsMessage> {
+        let harness = AuthHarness::new(true);
+        harness
+            .run(harness.auth_event_signed_by(&Keys::generate()), state)
+            .await;
+        harness.wire_frames().await
+    }
+
+    /// FI-TRACE-DENIAL-ORACLE: an assertion–key mismatch, an admin disconnect
+    /// (deny-set entry), and a lease expiry are all `authorization_denied`, so
+    /// the root socket must see byte-identical frames: the NOTICE, then 1008.
+    /// (The handler's own deny-set hit is compared against the same mismatch
+    /// frames in the Postgres lane's `w_deny_pre_registration_denied_by_handler_check`.)
+    ///
+    /// Mutation: route the pairing or expiry denial around the shared
+    /// transition (bare terminal enqueue) → its close is `Close(None)` and the
+    /// sequences differ.
+    #[tokio::test]
+    async fn fi_root_authorization_denied_rows_emit_identical_frames() {
+        let state = auth_test_state().await;
+        let mismatch = root_key_mismatch_wire_frames(std::sync::Arc::clone(&state)).await;
+
+        let harness = AuthHarness::new(true);
+        let conn = &harness.conn;
+        state.conn_manager.register(
+            conn.conn_id,
+            conn.send_tx.clone(),
+            conn.ctrl_tx.clone(),
+            conn.terminal_ctrl_tx.clone(),
+            None,
+            conn.cancel.clone(),
+            conn.tenant.community(),
+            std::sync::Arc::clone(&conn.backpressure_count),
+            std::sync::Arc::clone(&conn.subscriptions),
+            conn.grace_limit,
+            conn.community_control.clone(),
+        );
+        let pubkey = harness.key.public_key().to_bytes().to_vec();
+        state.conn_manager.set_authenticated_identity(
+            conn.conn_id,
+            pubkey.clone(),
+            Some("test-issuer".to_owned()),
+        );
+        assert_eq!(
+            state.conn_manager.disconnect_nip_fi("test-issuer", &pubkey),
+            1
+        );
+        let admin_disconnect = harness.wire_frames().await;
+
+        let harness = AuthHarness::new(true);
+        let expired = chrono::Utc::now() - chrono::Duration::seconds(1);
+        crate::nip_fi_session::spawn_nip_fi_expiry_task(
+            expired,
+            crate::nip_fi_gate::SessionAdmissionGate::new(expired, harness.conn.cancel.clone()),
+            harness.conn.community_control.clone(),
+            harness.conn.terminal_ctrl_tx.clone(),
+            crate::nip_fi_session::NipFiWsRoute::Root,
+        )
+        .await
+        .expect("expiry task");
+        let expiry = harness.wire_frames().await;
+
+        assert_eq!(mismatch, admin_disconnect);
+        assert_eq!(mismatch, expiry);
+        assert_eq!(
+            mismatch,
+            [
+                crate::nip_fi_session::denial_frame(
+                    crate::nip_fi_session::NipFiWsRoute::Root,
+                    buzz_auth::DenialClass::AuthorizationDenied,
+                ),
+                crate::state::CommunityDisconnectReason::AuthorizationDenied.close_message(),
+            ]
+        );
     }
 
     // ── W1 (auth barrier): expiry fired mid-flight blocks AUTH commit ─────────
@@ -1341,7 +1457,7 @@ mod tests {
 
             // The denial frame must be on the terminal channel (authorization_denied).
             // Both the close-scan side (manager_disconnect_nip_fi) and the check side
-            // (auth_deny_terminal) enqueue on terminal_ctrl_tx, which has capacity-1
+            // (deny_authorization) enqueue on terminal_ctrl_tx, which has capacity-1
             // and first-writer-wins semantics — exactly one frame lands there.
             let terminal_frame = terminal_ctrl_rx
                 .try_recv()
@@ -1688,13 +1804,14 @@ mod tests {
                     cancel.is_cancelled(),
                     "handler check must cancel the session"
                 );
-                let expected = crate::protocol::RelayMessage::notice(
-                    buzz_auth::DenialClass::AuthorizationDenied.nostr_text(),
+                // The deny-set row is byte-identical on the wire to the
+                // assertion–key mismatch row.  [FI-TRACE-DENIAL-ORACLE]
+                let frames =
+                    crate::connection::tests::root_wire_frames(&conn, terminal_ctrl_rx).await;
+                assert_eq!(
+                    frames,
+                    super::root_key_mismatch_wire_frames(Arc::clone(&state)).await
                 );
-                match terminal_ctrl_rx.try_recv() {
-                    Ok(WsMessage::Text(t)) => assert_eq!(t.as_str(), expected.as_str()),
-                    other => panic!("expected authorization_denied NOTICE; got {other:?}"),
-                }
             } else {
                 assert!(ok_true, "clean key must receive OK(true)");
                 assert!(!cancel.is_cancelled(), "clean key must not be cancelled");

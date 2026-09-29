@@ -257,6 +257,7 @@ run_unit_tests() {
     connection::tests::f3_root_pre_built_expired_gate_terminates_connection
     handlers::auth::tests::b2_pre_cancelled_connection_never_becomes_authenticated
     handlers::auth::tests::fi_ban_check_error_emits_terminal_authorization_unavailable
+    handlers::auth::tests::fi_root_authorization_denied_rows_emit_identical_frames
     handlers::auth::tests::fi_invalid_nip42_proof_emits_terminal_evidence_rejected
     handlers::auth::tests::handle_auth_pairing_mismatch_runs_full_root_denial_path
     handlers::auth::tests::nip42_denial_class_separates_internal_failure_from_bad_evidence
