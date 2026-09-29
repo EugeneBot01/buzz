@@ -329,7 +329,7 @@ pub struct ArchiveCommunityRequest {
     owner_pubkey: String,
 }
 
-/// Authenticated owner intent mediated by a trusted deployment operator.
+/// Operator-attested owner intent mediated by a trusted deployment operator.
 #[derive(Debug, Deserialize)]
 pub struct DeleteCommunityRequest {
     host: String,
@@ -449,7 +449,7 @@ pub async fn unarchive_community(
     })))
 }
 
-/// Persist authenticated owner deletion intent without executing deletion work.
+/// Persist operator-attested owner deletion intent without executing deletion work.
 ///
 /// `POST /operator/communities/delete`, NIP-98 signed by a pubkey in
 /// `RELAY_OPERATOR_PUBKEYS`, body:
