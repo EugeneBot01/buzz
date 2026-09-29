@@ -3244,7 +3244,47 @@ async fn ingest_event_inner(
     };
 
     let workflow_deletion = crate::handlers::side_effects::is_workflow_deletion(&event);
-    let (stored_event, was_inserted) = if workflow_deletion {
+    let (stored_event, was_inserted) = if kind_u32 == KIND_NIP29_PUT_USER {
+        let channel = channel_id
+            .ok_or_else(|| IngestError::Rejected("invalid: PUT_USER missing channel".into()))?;
+        let target_pubkey = event
+            .tags
+            .iter()
+            .find_map(|tag| {
+                let parts = tag.as_slice();
+                (parts.len() >= 2 && parts[0] == "p")
+                    .then(|| hex::decode(&parts[1]).ok())
+                    .flatten()
+                    .filter(|pubkey| pubkey.len() == 32)
+            })
+            .ok_or_else(|| IngestError::Rejected("invalid: PUT_USER missing p tag".into()))?;
+        let requested_role = event.tags.iter().find_map(|tag| {
+            let parts = tag.as_slice();
+            (parts.len() >= 2 && parts[0] == "role").then(|| parts[1].as_str())
+        });
+        let requested_role = requested_role
+            .map(str::parse::<buzz_db::channel::MemberRole>)
+            .transpose()
+            .map_err(|_| IngestError::Rejected("invalid: PUT_USER role".into()))?;
+        let actor_pubkey = event.pubkey.to_bytes();
+        state
+            .db
+            .insert_put_user_event(
+                tenant.community(),
+                &event,
+                channel,
+                &target_pubkey,
+                requested_role,
+                actor_pubkey.as_slice(),
+            )
+            .await
+            .map_err(|error| match error {
+                buzz_db::DbError::AccessDenied(message) => {
+                    IngestError::Rejected(format!("invalid: {message}"))
+                }
+                other => IngestError::Internal(format!("error: database error: {other}")),
+            })?
+    } else if workflow_deletion {
         // A single commit owns public acceptance, domain mutation, and dispatch.
         // Failure rolls everything back; identical concurrent requests cannot
         // divide insertion and repair ownership between two relay workers.

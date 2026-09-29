@@ -10,8 +10,9 @@ use uuid::Uuid;
 use crate::channel::{row_to_channel_record, ChannelRecord};
 use crate::error::{DbError, Result};
 use crate::Db;
-use buzz_core::CommunityId;
+use buzz_core::{CommunityId, StoredEvent};
 use buzz_datastore_tracing::datastore_span;
+use nostr::Event;
 
 pub use buzz_core::channel::MemberRole;
 
@@ -399,101 +400,96 @@ pub async fn add_member(
     role: MemberRole,
     invited_by: Option<&[u8]>,
 ) -> Result<MemberRecord> {
-    if pubkey.len() != 32 {
-        return Err(DbError::InvalidData(format!(
-            "pubkey must be 32 bytes, got {}",
-            pubkey.len()
-        )));
-    }
-
+    validate_member_pubkey(pubkey)?;
     let connection = crate::observability::acquire_writer(
         pool,
         crate::observability::WriterOperation::EventWrite,
     )
     .await?;
     let mut tx = sqlx::Transaction::begin(connection, None).await?;
-
-    // First statement: serialize the whole role-check / owner-count / upsert
-    // sequence against concurrent membership writes on this channel.
     acquire_channel_membership_lock(&mut tx, community_id, channel_id).await?;
+    let record = add_member_tx(
+        &mut tx,
+        community_id,
+        channel_id,
+        pubkey,
+        Some(role),
+        invited_by,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(record)
+}
 
-    let channel = get_channel_tx(&mut tx, community_id, channel_id).await?;
+fn validate_member_pubkey(pubkey: &[u8]) -> Result<()> {
+    if pubkey.len() != 32 {
+        return Err(DbError::InvalidData(format!(
+            "pubkey must be 32 bytes, got {}",
+            pubkey.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Apply a membership add or role change in a transaction whose first statement
+/// acquired the channel-membership lock. `requested_role = None` preserves an
+/// active member's role and defaults a new membership to `Member`.
+async fn add_member_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    pubkey: &[u8],
+    requested_role: Option<MemberRole>,
+    invited_by: Option<&[u8]>,
+) -> Result<MemberRecord> {
+    let channel = get_channel_tx(tx, community_id, channel_id).await?;
+    let current_role = get_active_role_tx(tx, community_id, channel_id, pubkey).await?;
+    let role = match requested_role {
+        Some(role) => role,
+        None => current_role
+            .as_deref()
+            .and_then(|role| role.parse().ok())
+            .unwrap_or(MemberRole::Member),
+    };
 
     let effective_role = if channel.visibility == "private" {
         let inviter = invited_by.ok_or_else(|| {
             DbError::AccessDenied("private channel requires an invite".to_string())
         })?;
-
-        // Bootstrap: channel creator may add themselves as the first member.
         let is_creator_bootstrap = inviter == pubkey && inviter == channel.created_by.as_slice();
-
         if !is_creator_bootstrap {
-            let inviter_role_str = get_active_role_tx(&mut tx, community_id, channel_id, inviter)
+            let inviter_role_str = get_active_role_tx(tx, community_id, channel_id, inviter)
                 .await?
                 .ok_or_else(|| {
                     DbError::AccessDenied("inviter is not an active member".to_string())
                 })?;
-
             let inviter_role: MemberRole = inviter_role_str.parse().map_err(|_| {
                 DbError::InvalidData(format!("invalid role in database: {inviter_role_str}"))
             })?;
-
-            // Any active member may extend private-channel access with an
-            // ordinary role. Granting owner/admin remains reserved for an
-            // existing owner/admin.
             if role.is_elevated() && !inviter_role.is_elevated() {
                 return Err(DbError::AccessDenied(
                     "only owners/admins may grant elevated roles".to_string(),
                 ));
             }
         }
-
         role
-    } else {
-        // Open channel: anyone may join, but only existing owners/admins may grant
-        // elevated roles. Self-join always gets Member.
-        if role.is_elevated() {
-            let granter_role = match invited_by {
-                Some(inv) => get_active_role_tx(&mut tx, community_id, channel_id, inv).await?,
-                None => None,
-            };
-            match granter_role.as_deref() {
-                Some("owner") | Some("admin") => role,
-                _ => {
-                    return Err(DbError::AccessDenied(
-                        "only owners/admins may grant elevated roles".to_string(),
-                    ))
-                }
+    } else if role.is_elevated() {
+        let granter_role = match invited_by {
+            Some(inviter) => get_active_role_tx(tx, community_id, channel_id, inviter).await?,
+            None => None,
+        };
+        match granter_role.as_deref() {
+            Some("owner") | Some("admin") => role,
+            _ => {
+                return Err(DbError::AccessDenied(
+                    "only owners/admins may grant elevated roles".to_string(),
+                ))
             }
-        } else {
-            role
         }
+    } else {
+        role
     };
 
-    // Changing an *active* member's role is privileged in BOTH directions.
-    // Demotion is as consequential as promotion: only owners/admins may grant
-    // elevated roles, so a demoted owner cannot restore themselves. Guarding
-    // only `role.is_elevated()` above therefore left owner→member demotion
-    // unauthorized-by-anyone. Re-adding an active member with the role they
-    // already hold stays idempotent and unguarded — the huddle bot-add and
-    // kind:9021 join paths rely on that.
-    //
-    // Deliberately keyed on the *active* role. A soft-removed row's stored role
-    // is history, not live authority: `removed_at` says it is no longer in
-    // force. Reactivation therefore lands at whatever `effective_role` the
-    // checks above already authorized — `Member` for any unprivileged caller,
-    // elevated only when a currently-elevated granter asked for it. Inferring
-    // current authority from a removed row would make soft-deleted ownership a
-    // resurrection token: an owner removed by another owner could self-rejoin
-    // via kind:9021 (`Member, None`) and silently regain ownership.
-    let current_role = get_active_role_tx(&mut tx, community_id, channel_id, pubkey).await?;
-
-    // Admission policy applies only when this write would create or reactivate
-    // membership. Keep the read behind the membership lock and hold a share lock
-    // on the user row through the upsert, so a target removed after relay
-    // validation cannot be re-added under a stale "already active" decision.
-    // Existing active members have already been admitted; changing their role
-    // must not re-run this policy.
     if current_role.is_none() && invited_by.is_some_and(|inviter| inviter != pubkey) {
         let policy_row: Option<(String, Option<Vec<u8>>)> = sqlx::query_as(
             "SELECT channel_add_policy::text, agent_owner_pubkey FROM users \
@@ -501,9 +497,8 @@ pub async fn add_member(
         )
         .bind(community_id.as_uuid())
         .bind(pubkey)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
-
         if let Some((policy, owner)) = policy_row {
             match policy.as_str() {
                 "owner_only" if owner.as_deref() != invited_by => {
@@ -524,7 +519,7 @@ pub async fn add_member(
 
     if let Some(current_role) = current_role.filter(|r| r != effective_role.as_str()) {
         let actor_role = match invited_by {
-            Some(inviter) => get_active_role_tx(&mut tx, community_id, channel_id, inviter).await?,
+            Some(inviter) => get_active_role_tx(tx, community_id, channel_id, inviter).await?,
             None => None,
         };
         let actor_role: Option<MemberRole> = actor_role.and_then(|r| r.parse().ok());
@@ -533,10 +528,6 @@ pub async fn add_member(
                 "only owners/admins may change an active member's role".to_string(),
             ));
         }
-
-        // Defense-in-depth, mirroring `remove_member`: a demotion must not
-        // strip the channel of its last owner, which would leave nobody able
-        // to moderate, edit metadata, or re-grant ownership.
         if current_role == "owner" && effective_role != MemberRole::Owner {
             let row = sqlx::query(
                 "SELECT COUNT(*) as cnt FROM channel_members \
@@ -544,7 +535,7 @@ pub async fn add_member(
             )
             .bind(community_id.as_uuid())
             .bind(channel_id)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
             let owner_count: i64 = row.try_get("cnt")?;
             if owner_count <= 1 {
@@ -570,24 +561,60 @@ pub async fn add_member(
     .bind(pubkey)
     .bind(effective_role.as_str())
     .bind(invited_by)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
 
     let row = sqlx::query(
-        r#"
-        SELECT channel_id, pubkey, role::text AS role, joined_at, invited_by, removed_at
-        FROM channel_members WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3
-        "#,
+        "SELECT channel_id, pubkey, role::text AS role, joined_at, invited_by, removed_at \
+         FROM channel_members WHERE community_id = $1 AND channel_id = $2 AND pubkey = $3",
     )
     .bind(community_id.as_uuid())
     .bind(channel_id)
     .bind(pubkey)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
+    row_to_member_record(row)
+}
 
-    let record = row_to_member_record(row)?;
+/// Atomically persist a NIP-29 PUT_USER command and apply its membership mutation.
+/// A rejected mutation rolls back the command event, leaving the same signed
+/// event retryable. Duplicate commands never reapply the mutation.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_put_user_event(
+    pool: &PgPool,
+    community_id: CommunityId,
+    event: &Event,
+    channel_id: Uuid,
+    target_pubkey: &[u8],
+    requested_role: Option<MemberRole>,
+    invited_by: &[u8],
+) -> Result<(StoredEvent, bool)> {
+    validate_member_pubkey(target_pubkey)?;
+    let connection = crate::observability::acquire_writer(
+        pool,
+        crate::observability::WriterOperation::EventWrite,
+    )
+    .await?;
+    let mut tx = sqlx::Transaction::begin(connection, None).await?;
+    acquire_channel_membership_lock(&mut tx, community_id, channel_id).await?;
+    let (stored_event, was_inserted) =
+        crate::event::insert_event_in_transaction(&mut tx, community_id, event, Some(channel_id))
+            .await?;
+    if !was_inserted {
+        tx.rollback().await?;
+        return Ok((stored_event, false));
+    }
+    add_member_tx(
+        &mut tx,
+        community_id,
+        channel_id,
+        target_pubkey,
+        requested_role,
+        Some(invited_by),
+    )
+    .await?;
     tx.commit().await?;
-    Ok(record)
+    Ok((stored_event, true))
 }
 
 /// Remove a member from a channel (soft delete).
@@ -1538,6 +1565,30 @@ impl Db {
             channel_id,
             pubkey,
             role,
+            invited_by,
+        )
+        .await
+    }
+
+    /// Atomically stores a NIP-29 PUT_USER command and applies its membership mutation.
+    #[datastore_span(name = "insert_put_user_event", system = "postgresql")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_put_user_event(
+        &self,
+        community_id: CommunityId,
+        event: &Event,
+        channel_id: Uuid,
+        target_pubkey: &[u8],
+        requested_role: Option<MemberRole>,
+        invited_by: &[u8],
+    ) -> Result<(StoredEvent, bool)> {
+        insert_put_user_event(
+            &self.pool,
+            community_id,
+            event,
+            channel_id,
+            target_pubkey,
+            requested_role,
             invited_by,
         )
         .await
@@ -2715,6 +2766,125 @@ mod postgres_tests {
         .await
         .expect_err("removed agent must satisfy admission policy again");
         assert!(error.to_string().contains("policy:nobody"));
+    }
+
+    /// A rejected PUT_USER command must not consume its event ID. Once the
+    /// target permits admission, replaying the identical signed command applies
+    /// membership and stores the command in the same commit.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn rejected_put_user_event_is_not_stored_and_remains_retryable() {
+        use nostr::{EventBuilder, Kind, Tag};
+
+        let pool = setup_pool().await;
+        let community_id = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_id);
+        let owner_keys = Keys::generate();
+        let owner = owner_keys.public_key().to_bytes().to_vec();
+        let agent = random_pubkey();
+        for pubkey in [&owner, &agent] {
+            ensure_user(&pool, community, pubkey)
+                .await
+                .expect("ensure user");
+        }
+        let channel = create_test_channel(
+            &pool,
+            community_id,
+            "atomic-put-user-command",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &owner,
+            None,
+        )
+        .await
+        .expect("create channel");
+        set_channel_add_policy(&pool, community, &agent, "nobody")
+            .await
+            .expect("close admission policy");
+        let event = EventBuilder::new(Kind::Custom(9000), "")
+            .tags([
+                Tag::parse(["h", channel.id.to_string().as_str()]).expect("h tag"),
+                Tag::parse(["p", hex::encode(&agent).as_str()]).expect("p tag"),
+                Tag::parse(["role", "admin"]).expect("role tag"),
+            ])
+            .sign_with_keys(&owner_keys)
+            .expect("sign PUT_USER");
+
+        let error = insert_put_user_event(
+            &pool,
+            community,
+            &event,
+            channel.id,
+            &agent,
+            Some(MemberRole::Admin),
+            &owner,
+        )
+        .await
+        .expect_err("closed policy must reject the command");
+        assert!(error.to_string().contains("policy:nobody"));
+        let stored_after_rejection: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE community_id = $1 AND id = $2")
+                .bind(community_id)
+                .bind(event.id.as_bytes().as_slice())
+                .fetch_one(&pool)
+                .await
+                .expect("count rejected command");
+        assert_eq!(stored_after_rejection, 0, "rejected command must roll back");
+
+        set_channel_add_policy(&pool, community, &agent, "anyone")
+            .await
+            .expect("open admission policy");
+        let (_, inserted) = insert_put_user_event(
+            &pool,
+            community,
+            &event,
+            channel.id,
+            &agent,
+            Some(MemberRole::Admin),
+            &owner,
+        )
+        .await
+        .expect("identical command remains retryable");
+        assert!(inserted);
+        assert_eq!(
+            get_member_role(&pool, community, channel.id, &agent)
+                .await
+                .expect("agent role")
+                .as_deref(),
+            Some("admin")
+        );
+        let stored_after_retry: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE community_id = $1 AND id = $2")
+                .bind(community_id)
+                .bind(event.id.as_bytes().as_slice())
+                .fetch_one(&pool)
+                .await
+                .expect("count accepted command");
+        assert_eq!(stored_after_retry, 1);
+
+        remove_member(&pool, community, channel.id, &agent, &owner)
+            .await
+            .expect("remove admitted agent");
+        let (_, inserted_again) = insert_put_user_event(
+            &pool,
+            community,
+            &event,
+            channel.id,
+            &agent,
+            Some(MemberRole::Admin),
+            &owner,
+        )
+        .await
+        .expect("duplicate command is accepted as a duplicate");
+        assert!(!inserted_again);
+        assert_eq!(
+            get_member_role(&pool, community, channel.id, &agent)
+                .await
+                .expect("agent remains removed"),
+            None,
+            "a duplicate command must not reapply its membership mutation"
+        );
     }
 
     /// Isolates the actor-authorization guard from the last-owner guard.

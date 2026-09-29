@@ -14,7 +14,7 @@ use buzz_core::kind::{
     KIND_THREAD_SUMMARY,
 };
 use buzz_core::StoredEvent;
-use buzz_db::channel::{MemberRecord, MemberRole};
+use buzz_db::channel::MemberRecord;
 
 use super::channel_authz::{self, ChannelAuthzError, PutUserDecision, RemoveOtherDecision};
 use super::event::dispatch_persistent_event;
@@ -1430,35 +1430,9 @@ async fn handle_put_user(
     let channel_id =
         extract_h_tag_channel(event).ok_or_else(|| anyhow::anyhow!("missing h tag"))?;
     let target_pubkey = extract_p_tag(event).ok_or_else(|| anyhow::anyhow!("missing p tag"))?;
-    // No role tag = no role change: preserve an existing member's current role and
-    // fall back to Member only for a new member. Unconditionally defaulting to
-    // Member let a bare PUT_USER silently demote an existing owner/admin.
-    let role: MemberRole = match extract_tag_value(event, "role") {
-        Some(role_str) => role_str
-            .parse()
-            .map_err(|_| anyhow::anyhow!("invalid role: {role_str}"))?,
-        None => state
-            .db
-            .get_members_for_event_write(tenant.community(), channel_id)
-            .await?
-            .iter()
-            .find(|m| m.pubkey == target_pubkey)
-            .and_then(|m| m.role.parse().ok())
-            .unwrap_or(MemberRole::Member),
-    };
-
+    // The command event and membership mutation already committed atomically in
+    // ingest. Only cache invalidation and follow-up publications belong here.
     let actor_bytes = event.pubkey.to_bytes().to_vec();
-
-    state
-        .db
-        .add_member(
-            tenant.community(),
-            channel_id,
-            &target_pubkey,
-            role,
-            Some(&actor_bytes),
-        )
-        .await?;
     state.invalidate_membership(tenant, channel_id, &target_pubkey);
 
     let actor_hex = hex::encode(&actor_bytes);
