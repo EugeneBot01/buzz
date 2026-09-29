@@ -380,7 +380,6 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Records the NIP-42-proven pubkey and its admitting NIP-FI issuer on an audio
 /// control after successful auth so the issuer-scoped NIP-FI disconnect scan
 /// can reach audio sockets alongside relay peers.  Shared by the handler and
@@ -393,6 +392,7 @@ pub(crate) fn audio_post_auth_register(
     control.set_proven_identity(pubkey_bytes, nip_fi_issuer);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_active_audio_connection(
     socket: WebSocket,
     state: Arc<AppState>,
@@ -5541,50 +5541,77 @@ mod tests {
         Arc::new(state)
     }
 
-    // ── W_admin_disconnect: registry disconnect_nip_fi delivers payload-then-close ─
+    /// Consumes Ping/Pong until the socket terminates (Close, EOF or error)
+    /// within 5s; panics on any data frame or if termination never arrives.
+    async fn assert_terminates_without_data<S>(client: &mut S, tag: &str)
+    where
+        S: futures_util::Stream<
+                Item = Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            > + Unpin,
+    {
+        use tokio_tungstenite::tungstenite::Message;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match client.next().await {
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                    Some(Ok(other)) => {
+                        panic!(
+                            "{tag}: socket must terminate after the denial payload; got {other:?}"
+                        )
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{tag}: socket did not terminate within 5s"));
+    }
+
+    // ── W_admin_disconnect: registry disconnect_nip_fi delivers payload-then-terminate ─
     //
     // Witnesses that an active audio socket closed via the admin-disconnect path
     // (`CommunityConnectionRegistry::disconnect_nip_fi`) delivers the restricted
-    // JSON payload BEFORE the 1008 POLICY close — the payload-then-close contract.
-    //
-    // Before this fix, `CommunityConnectionControl::disconnect_nip_fi` only
-    // published `AuthorizationDenied` + cancelled; no frame was enqueued on the
-    // terminal channel.  The send loop (or pre-send-loop drain) then emitted only
-    // the close, with no preceding restricted JSON frame.
+    // JSON payload and then terminates with no further data frame.  On main's S3
+    // pre-writer exit the terminal channel is drained and the socket dropped; no
+    // specific close code is asserted.
     //
     // Setup:
     //   - Pre-create and register `CommunityConnectionControl` (so the registry
     //     scan can find this audio session by pubkey — same pattern as straddle).
     //   - Key absent from deny map.  Assertion carries a 1-hour deadline so the
     //     expiry task is armed but does NOT fire during the test.
-    //   - `before_first_audio_check_cancel` hook holds the handler AFTER
-    //     `set_terminal_frame_sender` registers the sender on the control (line
-    //     ~421) and BEFORE the first `check_cancel!()`.
+    //   - `after_deny_set_check_passed` hook holds the handler AFTER the terminal
+    //     sender is registered and the deny-set check has passed (so the direct
+    //     map-denial branch is not what produces the frame).
     //   - Test calls `registry.disconnect_nip_fi("test-issuer", &pubkey)` while the hook holds.
     //     `CommunityConnectionControl::disconnect_nip_fi` enqueues the denial frame
     //     on `terminal_frame_tx`, publishes `AuthorizationDenied`, then cancels.
-    //   - Hook is released; handler hits `check_cancel!()`, drains the denial
-    //     frame from `terminal_ctrl_rx`, sends `reason.close_message()`.
-    //   - Client asserts: Text(restricted JSON) → Close(1008 POLICY, "authorization denied").
+    //   - Hook is released; handler observes cancellation, drains the denial
+    //     frame from `terminal_ctrl_rx`, and drops the socket.
+    //   - Client asserts: Text(restricted JSON), then Close/EOF/error (control
+    //     frames skipped) with no further data frame.
     //
     // Mutation evidence (production seam, not copies):
     //   A) Remove the `set_terminal_frame_sender` call from `handle_active_audio_connection`
     //      → `terminal_frame_tx` slot is `None` → `disconnect_nip_fi` enqueues nothing
-    //      → client receives only `1008` with no preceding text frame → Text assertion
-    //      times out → panics.
+    //      → client sees termination with no preceding text frame → frame-0
+    //      assertion panics.
     //   B) Remove the `try_send` block from `CommunityConnectionControl::disconnect_nip_fi`
     //      → same outcome as (A): enqueue suppressed → only close observed → panics.
-    //   C) Delete the `while let Ok(msg) = terminal_ctrl_rx.try_recv()` drain from the
-    //      plain `check_cancel!()` arm → no text frame delivered → panics.
+    //   C) Delete the terminal-channel drain on the cancellation exit → no text
+    //      frame delivered → panics.
     //   D) Move `set_terminal_frame_sender` to AFTER `audio_post_auth_register`
-    //      (back to the pass-1 ordering) → when disconnect_nip_fi fires at the
-    //      `before_first_audio_check_cancel` hook (which itself is after the old
-    //      registration point), the sender IS registered → test still PASSES.
+    //      → when disconnect_nip_fi fires at the `after_deny_set_check_passed`
+    //      hook (after the registration point), the sender IS registered → test
+    //      still PASSES.
     //      Use W_admin_disconnect_at_deny_check (hook at before_deny_set_check,
     //      the old gap) to catch this regression instead — that witness is RED
     //      under the pass-1 ordering. (See W_addc above.)
     #[tokio::test]
-    async fn admin_disconnect_nip_fi_delivers_restricted_json_then_policy_close() {
+    async fn admin_disconnect_nip_fi_delivers_restricted_json_then_terminates() {
         use buzz_auth::VerifiedAssertion;
         use chrono::{Duration, Utc};
         use std::sync::Arc;
@@ -5675,8 +5702,7 @@ mod tests {
             .expect("W_admin_disconnect: connect client");
 
         // Arm the hook BEFORE sending auth — it fires after `set_terminal_frame_sender`
-        // registers the sender (now before audio_post_auth_register, line ~343) and
-        // before the first `check_cancel!()`.
+        // registers the sender and after the deny-set check has passed.
         let (hook_arrived_rx, hook_release) =
             crate::nip_fi_test_hooks::audio_after_deny_check_passed_hook::arm(community);
 
@@ -5711,14 +5737,12 @@ mod tests {
             .await
             .expect("W_admin_disconnect: send auth");
 
-        // Wait for the handler to reach before_first_audio_check_cancel.
+        // Wait for the handler to reach after_deny_set_check_passed.
         // At this point `set_terminal_frame_sender` has already been called and
         // the terminal sender is registered on the control.
         tokio::time::timeout(std::time::Duration::from_secs(5), hook_arrived_rx)
             .await
-            .expect(
-                "W_admin_disconnect: handler must reach before_first_audio_check_cancel within 5s",
-            )
+            .expect("W_admin_disconnect: handler must reach after_deny_set_check_passed within 5s")
             .expect("W_admin_disconnect: hook arrived channel closed");
 
         // Simulate admin-disconnect: call the real registry disconnect scan by pubkey.
@@ -5734,8 +5758,8 @@ mod tests {
              (proves audio_post_auth_register ran before the hook)"
         );
 
-        // Release hook — handler resumes, hits check_cancel!(), drains the
-        // enqueued denial frame, then sends reason.close_message().
+        // Release hook — handler resumes, observes cancellation, drains the
+        // enqueued denial frame, then drops the socket.
         hook_release.notify_one();
 
         // Frame 0: restricted JSON payload.
@@ -5764,17 +5788,7 @@ mod tests {
 
         // Pre-writer exit: main's S3 drains only the terminal channel, then
         // drops the socket. Nothing may follow the denial payload.
-        let frame1 = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
-            .await
-            .expect("W_admin_disconnect: frame 1 timeout");
-        assert!(
-            !matches!(
-                frame1,
-                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(_)))
-                    | Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(_)))
-            ),
-            "W_admin_disconnect: socket must terminate after the denial payload; got {frame1:?}"
-        );
+        assert_terminates_without_data(&mut client, "W_admin_disconnect").await;
 
         assert!(
             cancel_for_assert.is_cancelled(),
@@ -5789,12 +5803,10 @@ mod tests {
     //
     // Witnesses that a disconnect_nip_fi call that fires at the `before_deny_set_check`
     // hook window — AFTER audio_post_auth_register (pubkey scan-visible) but BEFORE
-    // the deny-set check — still delivers the restricted JSON payload before the 1008
-    // close.  This is the exact window Thufir identified as the pre-registration gap
-    // in pass 2: the old code registered the terminal sender AFTER this point, so
-    // `disconnect_nip_fi` found `terminal_frame_tx = None` and queued nothing.  The
-    // fix moves sender registration to BEFORE `audio_post_auth_register`, closing
-    // the window.
+    // the deny-set check — still delivers the restricted JSON payload before the
+    // socket terminates.  If the terminal sender were registered after this point,
+    // `disconnect_nip_fi` would find `terminal_frame_tx = None` and queue nothing;
+    // registering it before `audio_post_auth_register` closes that window.
     //
     // Setup:
     //   - Pre-create and register control (same pattern as straddle/admin_disconnect).
@@ -5802,19 +5814,19 @@ mod tests {
     //   - Arm `before_deny_set_check` hook.  This hook fires AFTER both
     //     `set_terminal_frame_sender` and `audio_post_auth_register`.
     //   - While handler is held at the hook, call `registry.disconnect_nip_fi`.
-    //   - Release; handler hits check_cancel!(), drains denial frame, emits 1008.
-    //   - Client asserts Text(restricted JSON) → Close(1008 POLICY, "authorization denied").
+    //   - Release; handler observes cancellation, drains the denial frame, drops the socket.
+    //   - Client asserts Text(restricted JSON), then Close/EOF/error with no further data.
     //
     // Mutation evidence:
     //   A) Move `set_terminal_frame_sender` to AFTER the hook window (into the B1
-    //      block, after the deny-set check, where it was in the original pass-1 code)
+    //      block, after the deny-set check)
     //      → when disconnect_nip_fi fires at the before_deny_set_check window, the
     //      slot is still `None` → nothing enqueued → check_cancel!() drains nothing
-    //      → client receives only 1008 with no preceding Text frame → frame-0 Text
+    //      → client sees termination with no preceding Text frame → frame-0
     //      assertion panics.
     //   B) Remove `set_terminal_frame_sender` entirely → same outcome as (A).
     #[tokio::test]
-    async fn w_admin_disconnect_at_deny_check_delivers_payload_then_close() {
+    async fn w_admin_disconnect_at_deny_check_delivers_payload_then_terminates() {
         use buzz_auth::VerifiedAssertion;
         use chrono::{Duration, Utc};
         use std::sync::Arc;
@@ -5955,8 +5967,8 @@ mod tests {
              (proves audio_post_auth_register ran before the hook)"
         );
 
-        // Release — handler resumes, hits check_cancel!(), drains the enqueued
-        // denial frame, sends reason.close_message().
+        // Release — handler resumes, observes cancellation, drains the enqueued
+        // denial frame, then drops the socket.
         hook_release.notify_one();
 
         // Frame 0: restricted JSON payload.
@@ -5986,17 +5998,7 @@ mod tests {
 
         // Pre-writer exit: main's S3 drains only the terminal channel, then
         // drops the socket. Nothing may follow the denial payload.
-        let frame1 = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
-            .await
-            .expect("W_addc: frame 1 timeout");
-        assert!(
-            !matches!(
-                frame1,
-                Some(Ok(tokio_tungstenite::tungstenite::Message::Text(_)))
-                    | Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(_)))
-            ),
-            "W_addc: socket must terminate after the denial payload; got {frame1:?}"
-        );
+        assert_terminates_without_data(&mut client, "W_addc").await;
 
         assert!(
             cancel_for_assert.is_cancelled(),

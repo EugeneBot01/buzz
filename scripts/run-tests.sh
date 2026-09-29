@@ -87,6 +87,11 @@ run_unit_tests() {
   run_test_step "buzz-auth unit tests" \
     cargo test -p buzz-auth --lib -- --nocapture
 
+  # S4 cross-pod NIP-FI disconnect payload tests (infra-free). Mirrors
+  # `just test-unit`.
+  run_test_step "buzz-pubsub conn_control NIP-FI tests" \
+    cargo test -p buzz-pubsub --lib conn_control::tests::nip_fi_disconnect_ -- --nocapture
+
   run_test_step "buzz-voice tests" \
     cargo test -p buzz-voice --lib -- --nocapture
 
@@ -269,7 +274,7 @@ run_unit_tests() {
     state::tests::nip_fi_disconnect_does_not_close_unproven_audio_socket
     state::tests::community_disconnect_then_nip_fi_keeps_community_deleted_reason
     state::tests::disconnect_community_wins_reason_losing_nip_fi_does_not_enqueue_frame
-    state::tests::manager_wins_reason_enqueues_frame_then_losing_delete_does_not
+    state::tests::manager_disconnect_sets_reason_enqueues_frame_then_cancels
   )
   local name
   for name in "${nip_fi_exact_tests[@]}"; do

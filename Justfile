@@ -366,6 +366,8 @@ test-unit:
     if command -v cargo-nextest &>/dev/null; then
         cargo nextest run -p buzz-core -p buzz-auth --lib
         cargo nextest run -p buzz-audit --lib
+        # S4 cross-pod NIP-FI disconnect payload tests (infra-free).
+        cargo nextest run -p buzz-pubsub --lib -E 'test(/^conn_control::tests::nip_fi_disconnect_/)'
         # buzz-auth NIP-FI verifier doctests. The sealed-authority
         # `compile_fail` doctests prove the default-feature public API alone
         # cannot forge the issuer→JWKS authority; nextest does not run
@@ -529,7 +531,7 @@ test-unit:
                 + test(=state::tests::nip_fi_disconnect_does_not_close_unproven_audio_socket)
                 + test(=state::tests::community_disconnect_then_nip_fi_keeps_community_deleted_reason)
                 + test(=state::tests::disconnect_community_wins_reason_losing_nip_fi_does_not_enqueue_frame)
-                + test(=state::tests::manager_wins_reason_enqueues_frame_then_losing_delete_does_not)
+                + test(=state::tests::manager_disconnect_sets_reason_enqueues_frame_then_cancels)
                 + test(/^api::nip_fi::/)'
         # ACP author-gate and queue tests protect the trust boundary between
         # relay events and agent prompts. They are infra-free; ignored lifecycle

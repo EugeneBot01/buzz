@@ -3392,30 +3392,34 @@ mod tests {
 
     #[tokio::test]
     async fn deny_map_admits_key_not_in_map() {
-        // A key NOT in the deny map passes the check. This proves the Off-path (no deny entry → pass through) and guards
-        // against an inverted condition.
+        // A key NOT in the deny map passes the check and gets exactly the
+        // downstream outcome of the same request with no deny map installed.
+        // What lies past the gate (host binding, extractor) depends on the
+        // local DB, so the no-map baseline is the known outcome; a 403 means
+        // the deny check fired for a non-denied key (inverted condition).
         let clean_key = nostr::Keys::generate().public_key();
         // Build state with a DIFFERENT denied key so clean_key is not in the map.
         let other_key = nostr::Keys::generate().public_key();
         let state = nip_fi_deny_state(&other_key).await;
+        let mut baseline = (*state).clone();
+        baseline.nip_fi_deny_map = None;
         let token = mint_deny_test_token(&clean_key.to_hex());
         let bearer = format!("Bearer {token}");
 
         let status =
             nip_fi_gate_status(state, "/", Some("Nostr-Federated-Identity"), Some(&bearer)).await;
+        let expected = nip_fi_gate_status(
+            Arc::new(baseline),
+            "/",
+            Some("Nostr-Federated-Identity"),
+            Some(&bearer),
+        )
+        .await;
 
-        // The key is not denied: the pre-101 gate admits it. What happens past
-        // the gate depends on host routing, so assert only that no NIP-FI
-        // refusal status came back. A 403 means the deny check fired for a
-        // non-denied key.
-        assert!(
-            !matches!(
-                status,
-                axum::http::StatusCode::UNAUTHORIZED
-                    | axum::http::StatusCode::FORBIDDEN
-                    | axum::http::StatusCode::SERVICE_UNAVAILABLE
-            ),
-            "WS admission for a key NOT in the deny map must pass the NIP-FI gate; got {status}"
+        assert_ne!(expected, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(
+            status, expected,
+            "WS admission for a key NOT in the deny map must reach the no-map downstream outcome"
         );
     }
 

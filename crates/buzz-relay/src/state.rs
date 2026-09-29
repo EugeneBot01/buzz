@@ -2291,21 +2291,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn manager_wins_reason_enqueues_frame_then_losing_delete_does_not() {
-        // manager_disconnect_nip_fi fires first → wins AuthorizationDenied.
-        // disconnect_community fires second → loses, queues nothing.
+    fn manager_disconnect_sets_reason_enqueues_frame_then_cancels() {
+        // manager_disconnect_nip_fi on a fresh control sets AuthorizationDenied,
+        // enqueues the Root denial frame, and cancels the token.
         let (terminal_tx, mut terminal_rx) = tokio::sync::mpsc::channel(1);
         let cancel = CancellationToken::new();
         let control = CommunityConnectionControl::new(cancel.clone());
 
         control.manager_disconnect_nip_fi(&terminal_tx);
-        // disconnect_community is a no-op on reason (slot already set).
-        // Cannot call it here because manager_disconnect_nip_fi already cancelled;
-        // test the frame delivery instead.
         assert_eq!(
             *control.disconnect_reason().borrow(),
             Some(CommunityDisconnectReason::AuthorizationDenied),
-            "AuthorizationDenied must be retained when manager wins reason"
+            "manager_disconnect_nip_fi must set AuthorizationDenied"
         );
         let frame = terminal_rx
             .try_recv()

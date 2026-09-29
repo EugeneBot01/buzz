@@ -1367,14 +1367,12 @@ mod tests {
             );
 
             // No OK(true) on the data channel.
-            while let Ok(frame) = send_rx.try_recv() {
-                if let WsMessage::Text(t) = &frame {
-                    assert!(
-                        !t.contains("\"true\"") && !t.contains(r#"[true"#),
-                        "W_deny_straddle: no OK(true) must be sent when deny-set catches \
+            while let Ok(WsMessage::Text(t)) = send_rx.try_recv() {
+                assert!(
+                    !is_ok_true(t.as_str()),
+                    "W_deny_straddle: no OK(true) must be sent when deny-set catches \
                      the entry inserted between registration and check; got: {t}"
-                    );
-                }
+                );
             }
         }
 
@@ -1536,9 +1534,179 @@ mod tests {
             );
             let mut ok_true = false;
             while let Ok(WsMessage::Text(t)) = send_rx.try_recv() {
-                ok_true |= t.contains("\"OK\"") && t.contains("true");
+                ok_true |= is_ok_true(t.as_str());
             }
             assert!(ok_true, "B session must receive OK(true)");
+        }
+
+        /// True iff `frame` is a NIP-01 `["OK", <id>, true, ...]` acceptance.
+        fn is_ok_true(frame: &str) -> bool {
+            serde_json::from_str::<serde_json::Value>(frame)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .is_some_and(|a| {
+                    a.first().and_then(|v| v.as_str()) == Some("OK")
+                        && a.get(2) == Some(&serde_json::Value::Bool(true))
+                })
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn w_deny_pre_registration_denied_by_handler_check() {
+            w_deny_pre_registration_body(true).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Postgres"]
+        async fn w_deny_pre_registration_clean_key_admitted() {
+            w_deny_pre_registration_body(false).await;
+        }
+
+        // ── W_deny_pre_registration: the deny entry exists BEFORE the connection
+        // proves its identity, so an issuer-scoped close scan run at that point
+        // misses the unproven connection (returns 0). Only the handler's own
+        // post-registration deny check can refuse it. With `deny_self == false`
+        // the entry targets a different key (positive control): the session must
+        // be admitted with OK(true).
+        //
+        // Mutation: bypass the `[FI-TRACE-DENY-SET]` check in `handle_auth` →
+        // the denied case sends OK(true), stays uncancelled, enqueues no frame.
+        async fn w_deny_pre_registration_body(deny_self: bool) {
+            use buzz_auth::{IssuerCapacity, NipFiDenyMap, VerifiedAssertion};
+            use chrono::{Duration, Utc};
+            use std::collections::HashMap;
+            use std::sync::Arc;
+            use tokio::sync::mpsc;
+            use tokio_util::sync::CancellationToken;
+            use uuid::Uuid;
+
+            let key = Keys::generate();
+            let deadline = Utc::now() + Duration::hours(1);
+            // `for_test` produces issuer = "test-issuer".
+            let assertion = VerifiedAssertion::for_test(Some(key.public_key()), vec![deadline]);
+
+            let challenge = "w-deny-pre-registration-challenge".to_string();
+            let (send_tx, mut send_rx) = mpsc::channel::<WsMessage>(8);
+            let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<WsMessage>(8);
+            let (terminal_ctrl_tx, mut terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
+            let cancel = CancellationToken::new();
+            let gate = crate::nip_fi_gate::SessionAdmissionGate::new(deadline, cancel.clone());
+            let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
+
+            let conn = Arc::new(crate::connection::ConnectionState {
+                conn_id: Uuid::new_v4(),
+                tenant: buzz_core::tenant::TenantContext::resolved(
+                    community,
+                    "test.local".to_string(),
+                ),
+                remote_addr: "127.0.0.1:1234".parse().unwrap(),
+                auth_state: std::sync::Mutex::new(AuthState::Pending {
+                    challenge: challenge.clone(),
+                    started_at: std::time::Instant::now(),
+                }),
+                subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                send_tx,
+                ctrl_tx,
+                terminal_ctrl_tx,
+                cancel: cancel.clone(),
+                backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                grace_limit: 3,
+                nip_fi_assertion: Some(assertion),
+                session_deadline: Some(deadline),
+                nip_fi_gate: gate,
+                community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
+            });
+
+            let mut state = Arc::try_unwrap(auth_test_state_real_db_expect().await)
+                .unwrap_or_else(|arc| (*arc).clone());
+            let deny_map = Arc::new(NipFiDenyMap::new(
+                16,
+                vec![IssuerCapacity {
+                    issuer: "test-issuer".to_owned(),
+                    capacity: 16,
+                }],
+            ));
+            let denied_key = if deny_self {
+                key.public_key()
+            } else {
+                Keys::generate().public_key()
+            };
+            let merge = deny_map.merge_cross_pod_deny(
+                "test-issuer",
+                &denied_key,
+                Utc::now() + Duration::hours(1),
+                Utc::now(),
+            );
+            assert!(matches!(merge, buzz_auth::CrossPodMergeResult::Merged));
+            state.nip_fi_deny_map = Some(deny_map);
+            let state = Arc::new(state);
+
+            state.conn_manager.register(
+                conn.conn_id,
+                conn.send_tx.clone(),
+                conn.ctrl_tx.clone(),
+                conn.terminal_ctrl_tx.clone(),
+                None,
+                cancel.clone(),
+                community,
+                Arc::clone(&conn.backpressure_count),
+                Arc::clone(&conn.subscriptions),
+                conn.grace_limit,
+                conn.community_control.clone(),
+            );
+
+            // The close scan runs while the connection is still unproven: it
+            // must miss it, leaving the handler's check as the only defence.
+            let closed = state
+                .conn_manager
+                .disconnect_nip_fi("test-issuer", &key.public_key().to_bytes());
+            assert_eq!(closed, 0, "close scan must miss the unproven connection");
+            assert!(!cancel.is_cancelled());
+
+            let relay_url = "ws://test.local";
+            let auth_event = nostr::EventBuilder::new(nostr::Kind::Authentication, "")
+                .tag(nostr::Tag::parse(["relay", relay_url]).unwrap())
+                .tag(nostr::Tag::parse(["challenge", &challenge]).unwrap())
+                .sign_with_keys(&key)
+                .unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                handle_auth(auth_event, Arc::clone(&conn), Arc::clone(&state)),
+            )
+            .await
+            .expect("handle_auth must return within 5s");
+
+            let mut ok_true = false;
+            while let Ok(WsMessage::Text(t)) = send_rx.try_recv() {
+                ok_true |= is_ok_true(t.as_str());
+            }
+            assert!(ctrl_rx.try_recv().is_err(), "ctrl channel must stay empty");
+
+            if deny_self {
+                assert!(!ok_true, "denied key must not receive OK(true)");
+                assert!(
+                    cancel.is_cancelled(),
+                    "handler check must cancel the session"
+                );
+                let expected = crate::protocol::RelayMessage::notice(
+                    buzz_auth::DenialClass::AuthorizationDenied.nostr_text(),
+                );
+                match terminal_ctrl_rx.try_recv() {
+                    Ok(WsMessage::Text(t)) => assert_eq!(t.as_str(), expected.as_str()),
+                    other => panic!("expected authorization_denied NOTICE; got {other:?}"),
+                }
+            } else {
+                assert!(ok_true, "clean key must receive OK(true)");
+                assert!(!cancel.is_cancelled(), "clean key must not be cancelled");
+                assert!(
+                    terminal_ctrl_rx.try_recv().is_err(),
+                    "clean key gets no frame"
+                );
+                assert!(matches!(
+                    *conn.auth_state.lock().unwrap(),
+                    AuthState::Authenticated(_)
+                ));
+            }
         }
 
         /// W1 (auth barrier): expiry fired mid-flight blocks AUTH commit.
