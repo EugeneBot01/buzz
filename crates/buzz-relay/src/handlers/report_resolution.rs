@@ -667,6 +667,20 @@ async fn drive_enforcement(
                 }
             }
         }
+        // A ban closes the target's open sessions clusterwide, matching the
+        // in-community kind-9040 ban. It runs before finalize so a crash in
+        // between leaves the action non-terminal and recovery re-runs it here;
+        // a repeated disconnect is a no-op. Timeout does not disconnect.
+        if action == "ban" {
+            if let Some(target) = target_pubkey.or(rec.enforcement_target_pubkey.as_deref()) {
+                state.disconnect_pubkey_clusterwide(
+                    tenant,
+                    target,
+                    &action_id.to_string(),
+                    "blocked: you are banned from this community",
+                );
+            }
+        }
         // Finalize: action → succeeded, report → resolved, outbox rows created.
         // Requires step_marker = 'mutation_committed' AND active_action_id = this action.
         let finalized = state

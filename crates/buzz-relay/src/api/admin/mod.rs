@@ -11975,4 +11975,158 @@ mod postgres_tests {
             (1, 1, 1, 1, 0)
         );
     }
+
+    /// Claim one stranded action the way the recovery worker's batch claim
+    /// does (non-terminal, lease free or expired), without leasing other
+    /// tests' rows as the global batch would.
+    async fn claim_stranded(
+        pool: &sqlx::PgPool,
+        action_id: Uuid,
+    ) -> buzz_db::relay_admin_actions::StrandedActionClaim {
+        let buzz_db::relay_admin_actions::LeaseResult::Acquired(lease_token) =
+            buzz_db::relay_admin_actions::acquire_action_lease(
+                pool,
+                action_id,
+                chrono::Utc::now() + chrono::Duration::seconds(120),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("action {action_id} is not stranded");
+        };
+        buzz_db::relay_admin_actions::StrandedActionClaim {
+            record: buzz_db::relay_admin_actions::get_action(pool, action_id)
+                .await
+                .unwrap()
+                .expect("stranded action"),
+            lease_token,
+        }
+    }
+
+    /// Register a live socket for `pubkey` in `community`; the returned token
+    /// is cancelled when the relay closes it.
+    fn live_socket(
+        state: &Arc<crate::state::AppState>,
+        community: buzz_core::CommunityId,
+        pubkey: &[u8],
+    ) -> tokio_util::sync::CancellationToken {
+        let conn_id = Uuid::new_v4();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let (ctrl_tx, _) = tokio::sync::mpsc::channel(1);
+        state.conn_manager.register(
+            conn_id,
+            tx,
+            ctrl_tx,
+            None,
+            cancel.clone(),
+            community,
+            Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            3,
+        );
+        state
+            .conn_manager
+            .set_authenticated_pubkey(conn_id, pubkey.to_vec());
+        cancel
+    }
+
+    /// A staff ban closes the target's open socket like a kind-9040 ban; a
+    /// staff timeout leaves the target connected.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn direct_ban_disconnects_target_and_timeout_does_not() {
+        let (_pool, community, host, state) = direct_fixture().await;
+        let (banned, timed_out) = ([0x41u8; 32], [0x42u8; 32]);
+        let banned_socket = live_socket(&state, community, &banned);
+        let timed_out_socket = live_socket(&state, community, &timed_out);
+
+        let (status, body) = direct_post(
+            &state,
+            &format!(
+                "/members/{}/timeout?communityHost={host}",
+                hex::encode(timed_out)
+            ),
+            serde_json::json!({ "requestId": Uuid::new_v4(), "expirationSecs": 600 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !timed_out_socket.is_cancelled(),
+            "timeout must not disconnect"
+        );
+
+        let (status, body) = direct_post(
+            &state,
+            &format!("/members/{}/ban?communityHost={host}", hex::encode(banned)),
+            serde_json::json!({ "requestId": Uuid::new_v4() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            banned_socket.is_cancelled(),
+            "ban must close the target's socket"
+        );
+        assert!(
+            !timed_out_socket.is_cancelled(),
+            "ban is scoped to its target"
+        );
+    }
+
+    /// A ban whose mutation committed before a crash still disconnects the
+    /// target when recovery resumes past the ban step.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn recovery_past_ban_step_still_disconnects_target() {
+        let (pool, community, _host, state) = direct_fixture().await;
+        let target = [0x43u8; 32];
+        let actor = test_operator_keys().public_key().to_bytes();
+        let input = direct_input(community, Uuid::new_v4(), &actor, &target, None);
+        let buzz_db::relay_admin_actions::DirectClaim::Claimed(rec) =
+            state.db.claim_direct_action(&input).await.unwrap()
+        else {
+            panic!("fresh request must be claimed");
+        };
+        assert!(state.db.begin_enforcing_action(rec.id).await.unwrap());
+        let buzz_db::relay_admin_actions::LeaseResult::Acquired(lease) = state
+            .db
+            .acquire_admin_action_lease(rec.id, chrono::Utc::now() + chrono::Duration::seconds(60))
+            .await
+            .unwrap()
+        else {
+            panic!("lease must be acquired");
+        };
+        assert!(state
+            .db
+            .execute_ban_with_marker(rec.id, lease, community, &target, &actor, None)
+            .await
+            .unwrap());
+        // The driver "crashes" here: marker committed, lease left to expire.
+        sqlx::query(
+            "UPDATE relay_admin_actions SET action_lease_expires_at = now() - interval '1 second' \
+             WHERE id = $1",
+        )
+        .bind(rec.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let socket = live_socket(&state, community, &target);
+
+        let claim = claim_stranded(&pool, rec.id).await;
+        assert_eq!(
+            claim.record.step_marker.as_deref(),
+            Some("mutation_committed")
+        );
+        crate::handlers::admin_action_worker::recover_one(&state, claim).await;
+
+        let done = buzz_db::relay_admin_actions::get_action(&pool, rec.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.state, "succeeded");
+        assert!(
+            socket.is_cancelled(),
+            "recovery must disconnect the banned target"
+        );
+    }
 }
