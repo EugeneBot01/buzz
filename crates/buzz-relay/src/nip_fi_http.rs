@@ -1271,4 +1271,176 @@ mod tests {
             "proven_pubkey must be the one returned by the closure"
         );
     }
+
+    // ── Characterization: assertion evaluation and key equality ──────────────
+    //
+    // These pin the HTTP admission half of the shared evaluator contract, so a
+    // refactor that moves evaluation or pairing elsewhere cannot change a
+    // status, a body, or which step runs first.
+
+    /// Verifier returning a fixed result and counting calls.
+    struct ScriptedVerifier {
+        result: Result<Option<PublicKey>, buzz_auth::VerifierError>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl ScriptedVerifier {
+        fn new(result: Result<Option<PublicKey>, buzz_auth::VerifierError>) -> Self {
+            Self {
+                result,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl VerifyAssertion for ScriptedVerifier {
+        fn verify_assertion(
+            &self,
+            _token: &str,
+        ) -> Result<buzz_auth::VerifiedAssertion, buzz_auth::VerifierError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.result.map(|key| {
+                buzz_auth::VerifiedAssertion::for_test(
+                    key,
+                    vec![Utc::now() + chrono::Duration::hours(1)],
+                )
+            })
+        }
+    }
+
+    fn bearer_headers(value: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CLIENT_ATTACHED_HEADER, HeaderValue::from_static(value));
+        headers
+    }
+
+    fn enforce_outcome(
+        headers: &HeaderMap,
+        proven: PublicKey,
+        verifier: Option<&dyn VerifyAssertion>,
+    ) -> Result<NipFiAdmission<()>, Response<Body>> {
+        admit_nip_fi_http(
+            headers,
+            || Ok(Nip98Proof::new(proven, ())),
+            verifier,
+            NipFiMode::Enforce,
+            &AlwaysAdmitStubDenyMap,
+        )
+    }
+
+    fn denial_parts(outcome: Result<NipFiAdmission<()>, Response<Body>>) -> (StatusCode, Vec<u8>) {
+        match outcome {
+            Err(resp) => (resp.status(), body_bytes(resp)),
+            Ok(_) => panic!("expected a denial"),
+        }
+    }
+
+    // Pins: verifier errors map through `VerifierError::denial_class` —
+    // dependency-unavailable → 503, everything else → 403 evidence rejected.
+    // Mutation: mapping every verifier error to EvidenceRejected fails the
+    // 503 row.
+    #[test]
+    fn characterize_http_verifier_error_classes() {
+        use buzz_auth::VerifierError;
+        let headers = bearer_headers("Bearer a.b.c");
+        let rows = [
+            (
+                VerifierError::KeySourceUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                &b"authorization unavailable\n"[..],
+            ),
+            (
+                VerifierError::StatusWitnessUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                &b"authorization unavailable\n"[..],
+            ),
+            (
+                VerifierError::InvalidSignatureOrClaims,
+                StatusCode::FORBIDDEN,
+                &b"evidence rejected\n"[..],
+            ),
+            (
+                VerifierError::Expired,
+                StatusCode::FORBIDDEN,
+                &b"evidence rejected\n"[..],
+            ),
+        ];
+        for (err, status, body) in rows {
+            let verifier = ScriptedVerifier::new(Err(err));
+            let (got_status, got_body) =
+                denial_parts(enforce_outcome(&headers, any_pubkey(), Some(&verifier)));
+            assert_eq!(got_status, status, "{err:?}");
+            assert_eq!(got_body, body, "{err:?}");
+        }
+    }
+
+    // Pins: transport extraction runs before the verifier-presence check, so a
+    // malformed header with no verifier is 403, not 503.
+    // Mutation: checking `verifier.is_none()` before `extract_bearer_token`
+    // turns this into 503.
+    #[test]
+    fn characterize_http_transport_precedes_verifier_presence() {
+        let (status, body) =
+            denial_parts(enforce_outcome(&bearer_headers("junk"), any_pubkey(), None));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, b"evidence rejected\n");
+    }
+
+    // Pins: a claimless assertion (no `nostr_pubkey`) is a pairing denial —
+    // 403 authorization denied, byte-identical to a key mismatch. [FI-INV-05]
+    // Mutation: treating `None` as a match admits instead.
+    #[test]
+    fn characterize_http_claimless_assertion_is_authorization_denied() {
+        let verifier = ScriptedVerifier::new(Ok(None));
+        let (status, body) = denial_parts(enforce_outcome(
+            &bearer_headers("Bearer a.b.c"),
+            any_pubkey(),
+            Some(&verifier),
+        ));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, b"authorization denied\n");
+    }
+
+    // Pins: a matching assertion is admitted, verified exactly once, and the
+    // admission carries the proven key and the verified assertion.
+    // Mutation: dropping the assertion from the admission, or verifying twice
+    // in the handler path, fails the assertions.
+    #[test]
+    fn characterize_http_matching_assertion_admits_after_one_verify() {
+        let proven = any_pubkey();
+        let verifier = ScriptedVerifier::new(Ok(Some(proven)));
+        let admission =
+            match enforce_outcome(&bearer_headers("Bearer a.b.c"), proven, Some(&verifier)) {
+                Ok(a) => a,
+                Err(resp) => panic!("matching assertion must admit, got {}", resp.status()),
+            };
+        assert_eq!(verifier.calls(), 1);
+        assert_eq!(*admission.proven_pubkey(), proven);
+        assert_eq!(
+            admission.assertion().and_then(|a| a.asserted_key()),
+            Some(proven)
+        );
+    }
+
+    // Pins: NIP-98 proof runs before assertion extraction. A failed NIP-98
+    // proof with a missing assertion header is 401 from the NIP-98 step and
+    // the verifier never runs.
+    // Mutation: moving assertion evaluation ahead of the NIP-98 closure makes
+    // the verifier run (call count 1) for a valid-looking header.
+    #[test]
+    fn characterize_http_nip98_precedes_assertion_evaluation() {
+        let verifier = ScriptedVerifier::new(Ok(Some(any_pubkey())));
+        let outcome = admit_nip_fi_http::<_, (), _>(
+            &bearer_headers("Bearer a.b.c"),
+            || Err(http_denial(DenialClass::MissingEvidence)),
+            Some(&verifier as &dyn VerifyAssertion),
+            NipFiMode::Enforce,
+            &AlwaysAdmitStubDenyMap,
+        );
+        let (status, body) = denial_parts(outcome);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, b"authentication required\n");
+        assert_eq!(verifier.calls(), 0, "verifier must not run before NIP-98");
+    }
 }

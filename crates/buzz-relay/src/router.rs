@@ -3551,4 +3551,131 @@ mod tests {
              [FI-TRACE-DENIAL-ORACLE]"
         );
     }
+
+    // ── Characterization: HTTP guard evaluation contract ─────────────────────
+
+    /// Verifier returning a fixed result and counting calls.
+    struct GuardScriptedVerifier {
+        result: Result<Option<nostr::PublicKey>, buzz_auth::VerifierError>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl buzz_auth::VerifyAssertion for GuardScriptedVerifier {
+        fn verify_assertion(
+            &self,
+            _token: &str,
+        ) -> Result<buzz_auth::VerifiedAssertion, buzz_auth::VerifierError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.result.map(|key| {
+                buzz_auth::VerifiedAssertion::for_test(
+                    key,
+                    vec![chrono::Utc::now() + chrono::Duration::hours(1)],
+                )
+            })
+        }
+    }
+
+    const GUARD_PROTECTED_PATH: &str = "/workflows/wf/runs";
+
+    async fn guard_state_with(
+        result: Result<Option<nostr::PublicKey>, buzz_auth::VerifierError>,
+    ) -> (Arc<AppState>, Arc<GuardScriptedVerifier>) {
+        let verifier = Arc::new(GuardScriptedVerifier {
+            result,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut state = (*nip_fi_enforce_state().await).clone();
+        state.nip_fi_verifier = Some(verifier.clone());
+        (Arc::new(state), verifier)
+    }
+
+    async fn status_and_body(resp: axum::response::Response) -> (axum::http::StatusCode, Vec<u8>) {
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body bytes");
+        (status, body.to_vec())
+    }
+
+    // Pins: the guard maps verifier errors through
+    // `VerifierError::denial_class` — 503 for an unavailable dependency, 403
+    // evidence rejected otherwise — before any handler runs.
+    // Mutation: mapping every verifier error to EvidenceRejected fails the 503
+    // row; deleting the guard's verify call lets the handler answer instead.
+    #[tokio::test]
+    async fn characterize_guard_verifier_error_classes() {
+        use buzz_auth::VerifierError;
+        let rows = [
+            (
+                VerifierError::KeySourceUnavailable,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                &b"authorization unavailable\n"[..],
+            ),
+            (
+                VerifierError::InvalidSignatureOrClaims,
+                axum::http::StatusCode::FORBIDDEN,
+                &b"evidence rejected\n"[..],
+            ),
+        ];
+        for (err, status, body) in rows {
+            let (state, verifier) = guard_state_with(Err(err)).await;
+            let resp = nip_fi_gate_response(
+                state,
+                GUARD_PROTECTED_PATH,
+                Some("Nostr-Federated-Identity"),
+                Some("Bearer a.b.c"),
+            )
+            .await;
+            assert_eq!(
+                status_and_body(resp).await,
+                (status, body.to_vec()),
+                "{err:?}"
+            );
+            assert_eq!(
+                verifier.calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "guard verifies exactly once and the handler never runs: {err:?}"
+            );
+        }
+    }
+
+    // Pins: transport extraction precedes the verifier-presence check in the
+    // guard (the enforce fixture has no verifier).
+    // Mutation: checking the verifier first turns this 403 into 503.
+    #[tokio::test]
+    async fn characterize_guard_transport_precedes_verifier_presence() {
+        let resp = nip_fi_gate_response(
+            nip_fi_enforce_state().await,
+            GUARD_PROTECTED_PATH,
+            Some("Nostr-Federated-Identity"),
+            Some("junk"),
+        )
+        .await;
+        assert_eq!(
+            status_and_body(resp).await,
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                b"evidence rejected\n".to_vec()
+            )
+        );
+    }
+
+    // Pins: the guard verifies but does not pair keys. A claimless assertion
+    // passes the guard (one verify) and reaches the handler, whose path
+    // extractor rejects the non-UUID workflow id with 400 before any NIP-98
+    // or handler-side assertion work.
+    // Mutation: adding key pairing to the guard turns this into 403
+    // authorization denied.
+    #[tokio::test]
+    async fn characterize_guard_does_not_pair_keys() {
+        let (state, verifier) = guard_state_with(Ok(None)).await;
+        let resp = nip_fi_gate_response(
+            state,
+            GUARD_PROTECTED_PATH,
+            Some("Nostr-Federated-Identity"),
+            Some("Bearer a.b.c"),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(verifier.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 }
