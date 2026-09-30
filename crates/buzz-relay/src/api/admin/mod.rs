@@ -11531,17 +11531,7 @@ mod postgres_tests {
             .await
             .unwrap();
 
-        let claim = buzz_db::relay_admin_actions::claim_stranded_action_batch(
-            &pool,
-            "direct-recovery",
-            chrono::Utc::now() + chrono::Duration::seconds(120),
-            1000,
-        )
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|c| c.record.id == rec.id)
-        .expect("accepted direct action is stranded");
+        let claim = claim_stranded(&pool, rec.id).await;
         crate::handlers::admin_action_worker::recover_one(&state, claim).await;
 
         let done = buzz_db::relay_admin_actions::get_action(&pool, rec.id)
@@ -12128,5 +12118,160 @@ mod postgres_tests {
             socket.is_cancelled(),
             "recovery must disconnect the banned target"
         );
+    }
+
+    /// A replay of a request whose enforcement already failed returns the
+    /// same `422 enforcement_failed` and changes nothing.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn direct_replay_of_failed_action_returns_422_without_effects() {
+        let (pool, community, host, state) = direct_fixture().await;
+        let target = [0x44u8; 32];
+        let actor = test_operator_keys().public_key().to_bytes();
+        let rid = Uuid::new_v4();
+        let input = direct_input(community, rid, &actor, &target, None);
+        let buzz_db::relay_admin_actions::DirectClaim::Claimed(rec) =
+            state.db.claim_direct_action(&input).await.unwrap()
+        else {
+            panic!("fresh request must be claimed");
+        };
+        sqlx::query(
+            "UPDATE relay_admin_actions SET state = 'failed', error_message = 'boom' WHERE id = $1",
+        )
+        .bind(rec.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let before = direct_effects(&pool, community).await;
+
+        let (status, err) = direct_post(
+            &state,
+            &format!("/members/{}/ban?communityHost={host}", hex::encode(target)),
+            serde_json::json!({ "requestId": rid }),
+        )
+        .await;
+        assert_eq!(
+            (status, err["error"]["code"].as_str()),
+            (StatusCode::UNPROCESSABLE_ENTITY, Some("enforcement_failed")),
+            "{err}"
+        );
+        let message = err["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(&rec.id.to_string()) && message.contains("boom"),
+            "{err}"
+        );
+        assert_no_effects(&pool, community, &before, "failed replay").await;
+    }
+
+    /// An accepted action another driver is still enforcing answers
+    /// `202 pending` with the action id, and replays once it converges.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn direct_action_under_contention_returns_202_pending() {
+        let (_pool, community, host, state) = direct_fixture().await;
+        let target = [0x45u8; 32];
+        let actor = test_operator_keys().public_key().to_bytes();
+        let rid = Uuid::new_v4();
+        let input = direct_input(community, rid, &actor, &target, None);
+        let buzz_db::relay_admin_actions::DirectClaim::Claimed(rec) =
+            state.db.claim_direct_action(&input).await.unwrap()
+        else {
+            panic!("fresh request must be claimed");
+        };
+        assert!(state.db.begin_enforcing_action(rec.id).await.unwrap());
+        let buzz_db::relay_admin_actions::LeaseResult::Acquired(lease) = state
+            .db
+            .acquire_admin_action_lease(rec.id, chrono::Utc::now() + chrono::Duration::seconds(60))
+            .await
+            .unwrap()
+        else {
+            panic!("lease must be acquired");
+        };
+        let path = format!("/members/{}/ban?communityHost={host}", hex::encode(target));
+        let body = serde_json::json!({ "requestId": rid });
+
+        let (status, pending) = direct_post(&state, &path, body.clone()).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{pending}");
+        assert_eq!(
+            (
+                &pending["actionId"],
+                &pending["state"],
+                &pending["replayed"]
+            ),
+            (&serde_json::json!(rec.id), &"pending".into(), &true.into())
+        );
+        assert!(state
+            .db
+            .get_community_ban(community, &target)
+            .await
+            .unwrap()
+            .is_none());
+
+        state
+            .db
+            .release_admin_action_lease(rec.id, lease)
+            .await
+            .unwrap();
+        let (status, done) = direct_post(&state, &path, body).await;
+        assert_eq!(
+            (status, &done["state"]),
+            (StatusCode::OK, &"succeeded".into()),
+            "{done}"
+        );
+    }
+
+    /// Recovery converges accepted direct timeouts and deletes, not just bans.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn recovery_completes_accepted_direct_timeout_and_delete() {
+        let (pool, community, _host, state) = direct_fixture().await;
+        let actor = test_operator_keys().public_key().to_bytes();
+        let target = [0x46u8; 32];
+        let until = chrono::Utc::now() + chrono::Duration::seconds(600);
+        let author = nostr::Keys::generate();
+        let event = hex::decode(seed_signed_event(&pool, community, &author).await).unwrap();
+        let author_pubkey = author.public_key().to_bytes();
+
+        let mut timeout = direct_input(community, Uuid::new_v4(), &actor, &target, None);
+        timeout.action = "timeout";
+        timeout.timeout_secs = Some(600);
+        timeout.timeout_until = Some(until);
+        let mut delete = direct_input(community, Uuid::new_v4(), &actor, &author_pubkey, None);
+        delete.action = "delete";
+        delete.target_event_id = Some(&event);
+
+        for input in [&timeout, &delete] {
+            let buzz_db::relay_admin_actions::DirectClaim::Claimed(rec) =
+                state.db.claim_direct_action(input).await.unwrap()
+            else {
+                panic!("fresh {} request must be claimed", input.action);
+            };
+            let claim = claim_stranded(&pool, rec.id).await;
+            crate::handlers::admin_action_worker::recover_one(&state, claim).await;
+            let done = buzz_db::relay_admin_actions::get_action(&pool, rec.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(done.state, "succeeded", "{}", input.action);
+        }
+
+        let muted_until: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT muted_until FROM community_bans WHERE community_id = $1 AND pubkey = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(target.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(muted_until.timestamp(), until.timestamp());
+        let deleted: bool = sqlx::query_scalar(
+            "SELECT deleted_at IS NOT NULL FROM events WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(event.as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(deleted, "recovered delete must remove the event");
     }
 }
