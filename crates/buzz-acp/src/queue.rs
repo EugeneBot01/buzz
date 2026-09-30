@@ -108,6 +108,21 @@ pub struct QueuedEvent {
     pub received_at: Instant,
     /// Tag identifying which rule (or mode) matched this event.
     pub prompt_tag: String,
+    /// Original-message routing for a kind:40003 edit, resolved once at
+    /// admission. `None` for ordinary events and for edits whose original
+    /// could not be fetched (routing then falls back to the edit target id).
+    pub edit: Option<ResolvedEdit>,
+}
+
+impl QueuedEvent {
+    fn into_batch_event(self) -> BatchEvent {
+        BatchEvent {
+            event: self.event,
+            prompt_tag: self.prompt_tag,
+            received_at: self.received_at,
+            edit: self.edit,
+        }
+    }
 }
 
 /// A single event inside a [`FlushBatch`].
@@ -116,6 +131,24 @@ pub struct BatchEvent {
     pub event: Event,
     pub prompt_tag: String,
     pub received_at: Instant,
+    /// See [`QueuedEvent::edit`].
+    pub edit: Option<ResolvedEdit>,
+}
+
+impl BatchEvent {
+    /// Event id that replies and reactions for this event should target: the
+    /// visible original message for an edit, otherwise the event itself.
+    pub fn routing_event_id(&self) -> String {
+        reaction_target_id(&self.event)
+    }
+
+    /// Thread tags that route replies for this event. For an edit these are
+    /// the original message's tags; the edit's own bare `e` tag is never a
+    /// thread link. An unresolved edit routes as a top-level reply to its
+    /// target (see [`routing_event_id`](Self::routing_event_id)).
+    pub fn routing_thread_tags(&self) -> ThreadTags {
+        routing_thread_tags(&self.event, self.edit.as_ref())
+    }
 }
 
 /// Why a batch's prior turn was cancelled — controls how `format_prompt`
@@ -448,22 +481,38 @@ impl EventQueue {
         };
         let channel_id = scope.channel_id();
 
-        // Drain up to MAX_BATCH_EVENTS; leave any remainder in the queue.
-        let queue = self.queues.entry(scope.clone()).or_default();
-        let drain_count = MAX_BATCH_EVENTS.min(queue.len());
-        let mut events: Vec<BatchEvent> = queue
-            .drain(..drain_count)
-            .map(|qe| BatchEvent {
-                event: qe.event,
-                prompt_tag: qe.prompt_tag,
-                received_at: qe.received_at,
-            })
-            .collect();
         // Relay replay delivers stored events newest-first (`ORDER BY
         // created_at DESC`), but batch consumers — `format_prompt` scope and
         // reply-anchor selection — require the LAST event to be the newest.
-        // Stable sort: same-second events keep delivery order.
-        events.sort_by_key(|be| be.event.created_at);
+        // Establish chronological order before locating an edit boundary:
+        // partitioning the raw replay deque would otherwise dispatch a newer
+        // ordinary event before an older edit. Stable sort: same-second
+        // events keep delivery order.
+        let queue = self.queues.entry(scope.clone()).or_default();
+        queue
+            .make_contiguous()
+            .sort_by_key(|event| event.event.created_at);
+
+        // Drain up to MAX_BATCH_EVENTS, but isolate edit events. Routing is
+        // derived from a batch's last event, so an edit sharing a batch with a
+        // later event would lose its original-message anchor.
+        let max_drain = MAX_BATCH_EVENTS.min(queue.len());
+        let drain_count = if queue
+            .front()
+            .is_some_and(|event| edit_target_id(&event.event).is_some())
+        {
+            1
+        } else {
+            queue
+                .iter()
+                .take(max_drain)
+                .position(|event| edit_target_id(&event.event).is_some())
+                .unwrap_or(max_drain)
+        };
+        let events: Vec<BatchEvent> = queue
+            .drain(..drain_count)
+            .map(QueuedEvent::into_batch_event)
+            .collect();
 
         // Remove the queue entry if now empty.
         if self.queues.get(&scope).is_some_and(|q| q.is_empty()) {
@@ -598,6 +647,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at, // preserve original timestamp (#46)
+                edit: be.edit,
             });
         }
         // Enforce per-scope cap: trim oldest (back) events if requeue pushed
@@ -662,6 +712,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at,
+                edit: be.edit,
             });
         }
         // Enforce per-scope cap: trim newest (back) events if over limit.
@@ -685,15 +736,54 @@ impl EventQueue {
     /// merged prompt is framed correctly. On a double-cancel, the most recent
     /// reason wins.
     ///
-    /// Unlike `requeue_preserve_timestamps`, events are NOT pushed back into
-    /// the generic queue — they are stored separately and merged by
+    /// Unlike `requeue_preserve_timestamps`, events are normally NOT pushed
+    /// back into the generic queue — they are stored separately and merged by
     /// `flush_next()`. No retry throttle, no backoff.
+    ///
+    /// Exception: if the interrupted work contains an edit, the complete
+    /// interrupted sequence returns to the front of the ordinary queue.
+    /// Routing is derived from a batch's last event, so an edit merged as
+    /// cancelled context ahead of a later event would lose its
+    /// original-message anchor. `flush_next`'s chronological sort and edit
+    /// boundary then preserve both ordering and edit routing.
     pub fn requeue_as_cancelled(&mut self, batch: FlushBatch, reason: CancelReason) {
         let scope = batch.scope.clone();
-        let entry = self.cancelled_batches.entry(scope.clone()).or_default();
+        let channel_id = batch.channel_id;
+        let mut cancelled = self.cancelled_batches.remove(&scope).unwrap_or_default();
         // Preserve any already-cancelled events from a prior cancel (double-cancel).
-        entry.extend(batch.cancelled_events);
-        entry.extend(batch.events);
+        cancelled.extend(batch.cancelled_events);
+        cancelled.extend(batch.events);
+
+        if cancelled
+            .iter()
+            .any(|event| edit_target_id(&event.event).is_some())
+        {
+            let queue = self.queues.entry(scope.clone()).or_default();
+            for be in cancelled.into_iter().rev() {
+                queue.push_front(QueuedEvent {
+                    channel_id,
+                    scope: scope.clone(),
+                    event: be.event,
+                    prompt_tag: be.prompt_tag,
+                    received_at: be.received_at,
+                    edit: be.edit,
+                });
+            }
+            while queue.len() > MAX_PENDING_PER_SCOPE {
+                queue.pop_back();
+                tracing::warn!(
+                    channel_id = %channel_id,
+                    scope = %scope.telemetry_label(),
+                    limit = MAX_PENDING_PER_SCOPE,
+                    "cancelled edit requeue overflow — dropped newest event to enforce cap"
+                );
+            }
+            self.cancel_reasons.remove(&scope);
+            self.enforce_channel_cap(channel_id);
+            return;
+        }
+
+        self.cancelled_batches.insert(scope.clone(), cancelled);
         self.cancel_reasons.insert(scope, reason);
     }
 
@@ -824,32 +914,47 @@ impl EventQueue {
     ///
     /// Also clears any `retry_after` throttle for the channel.
     ///
-    /// Returns the event IDs of dropped events so the caller can clean up
-    /// any reactions (👀) that were added at queue-push time.
+    /// Returns the visible event IDs that own lifecycle reactions for every
+    /// dropped event — queued, cancelled carryover, and withheld native
+    /// steers — so the caller can clean up any 👀 added at queue-push time.
+    /// Edits report their original message (see [`reaction_target_id`]).
     pub fn drain_channel(&mut self, channel_id: Uuid) -> Vec<String> {
         // Channel-wide cleanup must find and clear EVERY child thread scope for
         // this channel, not just the conversation scope.
-        let scopes: Vec<SessionScope> = self
-            .queues
-            .keys()
-            .filter(|s| s.channel_id() == channel_id)
-            .cloned()
-            .collect();
-        let mut ids = Vec::new();
-        for scope in &scopes {
-            if let Some(q) = self.queues.remove(scope) {
-                ids.extend(q.into_iter().map(|e| e.event.id.to_hex()));
+        let mut ids: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut collect = |event: &Event| {
+            let id = reaction_target_id(event);
+            if seen.insert(id.clone()) {
+                ids.push(id);
             }
-        }
+        };
+        self.queues.retain(|s, q| {
+            if s.channel_id() != channel_id {
+                return true;
+            }
+            q.iter().for_each(|e| collect(&e.event));
+            false
+        });
+        self.cancelled_batches.retain(|s, events| {
+            if s.channel_id() != channel_id {
+                return true;
+            }
+            events.iter().for_each(|e| collect(&e.event));
+            false
+        });
+        self.withheld_native_steer.retain(|s, events| {
+            if s.channel_id() != channel_id {
+                return true;
+            }
+            events.iter().for_each(|e| collect(&e.event));
+            false
+        });
         // Also purge side-tables for every scope of this channel.
         self.retry_after.retain(|s, _| s.channel_id() != channel_id);
         self.retry_counts
             .retain(|s, _| s.channel_id() != channel_id);
-        self.cancelled_batches
-            .retain(|s, _| s.channel_id() != channel_id);
         self.cancel_reasons
-            .retain(|s, _| s.channel_id() != channel_id);
-        self.withheld_native_steer
             .retain(|s, _| s.channel_id() != channel_id);
         // Preserve in_flight_scopes AND in_flight_deadlines: the in-flight
         // task will eventually complete (calling mark_complete) or the deadline
@@ -1059,7 +1164,7 @@ impl Default for EventQueue {
 }
 
 /// Parsed thread relationship from NIP-10 `e` tags.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ThreadTags {
     /// Root event ID (hex). Present for all thread replies.
     pub root_event_id: Option<String>,
@@ -1067,6 +1172,63 @@ pub struct ThreadTags {
     pub parent_event_id: Option<String>,
     /// Mentioned pubkeys from `p` tags (hex).
     pub mentioned_pubkeys: Vec<String>,
+}
+
+/// Original-message routing recovered for a kind:40003 edit event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEdit {
+    /// Id of the edited original message, taken from the edit's `e` tag and
+    /// verified against the fetched original's id and signature.
+    pub target_event_id: String,
+    /// NIP-10 thread tags parsed from the fetched original message. A
+    /// top-level original has no root; a threaded reply carries its root.
+    pub target_thread_tags: ThreadTags,
+}
+
+/// Return the original message id targeted by a kind:40003 edit event.
+///
+/// Edit events deliberately use a bare two-element `e` tag; this is not the
+/// deprecated positional NIP-10 thread format and must not be accepted by
+/// [`parse_thread_tags`] for other event kinds.
+pub fn edit_target_id(event: &Event) -> Option<String> {
+    if u32::from(event.kind.as_u16()) != buzz_core::kind::KIND_STREAM_MESSAGE_EDIT {
+        return None;
+    }
+    event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        if parts.first().map(String::as_str) != Some("e") {
+            return None;
+        }
+        parts
+            .get(1)
+            .and_then(|target| nostr::EventId::from_hex(target).ok())
+            .map(|target| target.to_hex())
+    })
+}
+
+/// Event ID that should own lifecycle reactions and reply anchors for an
+/// inbound event.
+///
+/// Kind:40003 edits are auxiliary events that do not render as timeline rows,
+/// so their seen/working reactions and replies belong on the visible original
+/// message. This holds even when fetching the original failed.
+pub(crate) fn reaction_target_id(event: &Event) -> String {
+    edit_target_id(event).unwrap_or_else(|| event.id.to_hex())
+}
+
+/// Thread tags that route replies for `event`. See
+/// [`BatchEvent::routing_thread_tags`].
+pub(crate) fn routing_thread_tags(event: &Event, edit: Option<&ResolvedEdit>) -> ThreadTags {
+    if edit_target_id(event).is_none() {
+        return parse_thread_tags(event);
+    }
+    match edit {
+        Some(edit) => edit.target_thread_tags.clone(),
+        None => ThreadTags {
+            mentioned_pubkeys: parse_thread_tags(event).mentioned_pubkeys,
+            ..ThreadTags::default()
+        },
+    }
 }
 
 /// Parse NIP-10 thread tags from a Nostr event.
@@ -1346,8 +1508,19 @@ pub(crate) fn format_event_block(
         block.push_str(&format!("\nTags: {tags_str}"));
     }
 
+    // An edit's structural fields describe its original message: the edit
+    // itself is an auxiliary event whose bare `e` tag names that original.
+    if let Some(target) = edit_target_id(&be.event) {
+        let note = if be.edit.is_some() {
+            "Content replaces the original; reply and react to the original, not this edit event."
+        } else {
+            "Content replaces the original (original could not be fetched); reply and react to the original, not this edit event."
+        };
+        block.push_str(&format!("\nEdit of: {target}. {note}"));
+    }
+
     // Parsed structural fields.
-    let thread = parse_thread_tags(&be.event);
+    let thread = be.routing_thread_tags();
     let mut parsed_parts = Vec::new();
     if let Some(ref p) = thread.parent_event_id {
         if thread.root_event_id.as_ref() != Some(p) {
@@ -1750,7 +1923,7 @@ fn conversation_context_covers_batch(
             let Some(expected_root) = batch
                 .events
                 .last()
-                .and_then(|event| parse_thread_tags(&event.event).root_event_id)
+                .and_then(|event| event.routing_thread_tags().root_event_id)
             else {
                 return false;
             };
@@ -1760,7 +1933,7 @@ fn conversation_context_covers_batch(
                 .iter()
                 .chain(&batch.events)
                 .all(|event| {
-                    parse_thread_tags(&event.event).root_event_id.as_deref()
+                    event.routing_thread_tags().root_event_id.as_deref()
                         == Some(expected_root.as_str())
                 })
         }
@@ -1768,7 +1941,7 @@ fn conversation_context_covers_batch(
             .cancelled_events
             .iter()
             .chain(&batch.events)
-            .all(|event| parse_thread_tags(&event.event).root_event_id.is_none()),
+            .all(|event| event.routing_thread_tags().root_event_id.is_none()),
         _ => false,
     }
 }
@@ -2001,7 +2174,10 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             return Vec::new();
         }
     };
-    let thread_tags = parse_thread_tags(&last_event.event);
+    // An edit routes through its original message: the edit's own bare `e`
+    // tag is not a thread link, and the edit event is not a visible row.
+    let thread_tags = last_event.routing_thread_tags();
+    let routing_event_id = last_event.routing_event_id();
     let is_dm = args
         .channel_info
         .map(|ci| ci.channel_type == "dm")
@@ -2040,12 +2216,12 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         thread_tags
             .root_event_id
             .is_some()
-            .then(|| last_event.event.id.to_hex())
+            .then(|| routing_event_id.clone())
     } else {
         resolve_reply_anchor(
             &sender_pubkey,
             &thread_tags,
-            &last_event.event.id.to_hex(),
+            &routing_event_id,
             args.profile_lookup,
         )
     };
@@ -2235,6 +2411,7 @@ mod tests {
     /// Build a QueuedEvent for the given channel (conversation scope).
     fn make_queued(channel_id: Uuid, content: &str) -> QueuedEvent {
         QueuedEvent {
+            edit: None,
             channel_id,
             scope: conv(channel_id),
             event: make_event(content),
@@ -2246,6 +2423,7 @@ mod tests {
     /// Build a QueuedEvent with a specific `received_at` offset from now.
     fn make_queued_at(channel_id: Uuid, content: &str, age: Duration) -> QueuedEvent {
         QueuedEvent {
+            edit: None,
             channel_id,
             scope: conv(channel_id),
             event: make_event(content),
@@ -2267,6 +2445,7 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
         QueuedEvent {
+            edit: None,
             channel_id,
             scope: conv(channel_id),
             event,
@@ -2294,6 +2473,7 @@ mod tests {
     /// Build a QueuedEvent for an explicit scope.
     fn make_scoped(scope: SessionScope, content: &str) -> QueuedEvent {
         QueuedEvent {
+            edit: None,
             channel_id: scope.channel_id(),
             scope,
             event: make_event(content),
@@ -2605,6 +2785,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -2636,11 +2817,13 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event: make_event("the new message"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
             }],
             cancelled_events: vec![BatchEvent {
+                edit: None,
                 event: make_event("the original task"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -2775,17 +2958,20 @@ mod tests {
             scope: conv(ch),
             events: vec![
                 BatchEvent {
+                    edit: None,
                     event: make_event("new one"),
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    edit: None,
                     event: make_event("new two"),
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
                 },
             ],
             cancelled_events: vec![BatchEvent {
+                edit: None,
                 event: make_event("original"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -2832,11 +3018,13 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event: steering,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
             }],
             cancelled_events: vec![BatchEvent {
+                edit: None,
                 event: original,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -3005,16 +3193,19 @@ mod tests {
             scope: conv(ch),
             events: vec![
                 BatchEvent {
+                    edit: None,
                     event: e1,
                     prompt_tag: "tag-a".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    edit: None,
                     event: e2,
                     prompt_tag: "tag-b".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    edit: None,
                     event: e3,
                     prompt_tag: "tag-c".into(),
                     received_at: Instant::now(),
@@ -3045,6 +3236,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -3069,6 +3261,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -3102,6 +3295,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -3133,6 +3327,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -3161,6 +3356,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -3186,6 +3382,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -3248,6 +3445,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event: make_event("hello"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -3302,6 +3500,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -3341,6 +3540,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -3569,6 +3769,7 @@ mod tests {
         let old_time = Instant::now() - Duration::from_secs(10);
 
         q.push(QueuedEvent {
+            edit: None,
             channel_id: ch,
             scope: conv(ch),
             event: make_event("old-msg"),
@@ -3601,11 +3802,13 @@ mod tests {
             channel_id: ch,
             scope: scope.clone(),
             events: vec![BatchEvent {
+                edit: None,
                 event: make_event("the follow-up"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
             }],
             cancelled_events: vec![BatchEvent {
+                edit: None,
                 event: make_event("the original request"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -3930,6 +4133,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -3964,6 +4168,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
@@ -4012,6 +4217,7 @@ mod tests {
                         channel_id,
                         scope: SessionScope::derive(policy, channel_id, is_dm, event),
                         events: vec![BatchEvent {
+                            edit: None,
                             event: event.clone(),
                             prompt_tag: "@mention".into(),
                             received_at: Instant::now(),
@@ -4094,6 +4300,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -4121,6 +4328,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -4231,6 +4439,7 @@ mod tests {
         let root_a = "a".repeat(64);
         let root_b = "b".repeat(64);
         let reply = |content: &str, root: &str| BatchEvent {
+            edit: None,
             event: make_event_with_tags(
                 content,
                 vec![vec!["e".into(), root.into(), "".into(), "reply".into()]],
@@ -4307,6 +4516,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
@@ -4364,6 +4574,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -4574,6 +4785,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
@@ -4645,6 +4857,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -4679,6 +4892,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event: make_event("follow up"),
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
@@ -4730,6 +4944,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
@@ -4773,6 +4988,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -4798,6 +5014,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -4822,6 +5039,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -4856,6 +5074,7 @@ mod tests {
             ch,
             None,
             &BatchEvent {
+                edit: None,
                 event: direct_event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -4883,6 +5102,7 @@ mod tests {
             ch,
             None,
             &BatchEvent {
+                edit: None,
                 event: nested_event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -5250,6 +5470,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -5293,6 +5514,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -5330,6 +5552,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -5360,6 +5583,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -5405,6 +5629,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -5442,6 +5667,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
@@ -5479,11 +5705,13 @@ mod tests {
             scope: conv(ch),
             events: vec![
                 BatchEvent {
+                    edit: None,
                     event: plain,
                     prompt_tag: "test".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    edit: None,
                     event: threaded,
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
@@ -5517,11 +5745,13 @@ mod tests {
             scope: conv(ch),
             events: vec![
                 BatchEvent {
+                    edit: None,
                     event: threaded,
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
                 },
                 BatchEvent {
+                    edit: None,
                     event: plain,
                     prompt_tag: "test".into(),
                     received_at: Instant::now(),
@@ -5551,6 +5781,7 @@ mod tests {
             channel_id,
             scope: conv(channel_id),
             events: vec![BatchEvent {
+                edit: None,
                 event: make_event(content),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -5628,6 +5859,7 @@ mod tests {
         // Multi-event batch → no pass-through.
         let mut multi = make_single_batch("@Eva /init");
         multi.events.push(BatchEvent {
+            edit: None,
             event: make_event("another message"),
             prompt_tag: "test".into(),
             received_at: Instant::now(),
@@ -5637,6 +5869,7 @@ mod tests {
         // Cancelled carryover → no pass-through.
         let mut cancelled = make_single_batch("@Eva /init");
         cancelled.cancelled_events.push(BatchEvent {
+            edit: None,
             event: make_event("interrupted"),
             prompt_tag: "test".into(),
             received_at: Instant::now(),
@@ -5852,6 +6085,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -5882,6 +6116,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -5911,6 +6146,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
@@ -6128,6 +6364,207 @@ mod tests {
             q.in_flight_scopes.contains(&conv(ch)),
             "ch must still be in-flight after has_flushable_work finds ch2 work"
         );
+    }
+
+    // ── kind:40003 edit routing ─────────────────────────────────────────
+
+    fn edit_event(target: &str) -> Event {
+        EventBuilder::new(Kind::Custom(40003), "edited mention")
+            .tags([nostr::Tag::parse(["e", target]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap()
+    }
+
+    fn queued_edit(channel_id: Uuid, target: &str, edit: Option<ResolvedEdit>) -> QueuedEvent {
+        QueuedEvent {
+            edit,
+            channel_id,
+            scope: conv(channel_id),
+            event: edit_event(target),
+            received_at: Instant::now(),
+            prompt_tag: "@mention".into(),
+        }
+    }
+
+    fn one_event_batch(event: Event, edit: Option<ResolvedEdit>) -> FlushBatch {
+        let channel_id = Uuid::new_v4();
+        FlushBatch {
+            channel_id,
+            scope: conv(channel_id),
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+                edit,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        }
+    }
+
+    #[test]
+    fn edit_target_skips_malformed_e_tags_and_selects_first_valid_id() {
+        let valid_target = "ab".repeat(32);
+        let event = EventBuilder::new(Kind::Custom(40003), "edited mention")
+            .tags([
+                nostr::Tag::parse(["e", "not-an-event-id"]).unwrap(),
+                nostr::Tag::parse(["e", &valid_target]).unwrap(),
+            ])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert_eq!(edit_target_id(&event), Some(valid_target));
+    }
+
+    #[test]
+    fn bare_e_tag_on_ordinary_message_is_not_an_edit_target() {
+        let event = EventBuilder::new(Kind::Custom(9), "message")
+            .tags([nostr::Tag::parse(["e", &"ab".repeat(32)]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert_eq!(edit_target_id(&event), None);
+        assert_eq!(reaction_target_id(&event), event.id.to_hex());
+    }
+
+    #[test]
+    fn edit_reactions_target_visible_original_message() {
+        let original_id = "66".repeat(32);
+        assert_eq!(reaction_target_id(&edit_event(&original_id)), original_id);
+    }
+
+    #[test]
+    fn edit_of_top_level_anchors_original_message_in_rendered_prompt() {
+        let original_id = "11".repeat(32);
+        let edit = edit_event(&original_id);
+        let edit_id = edit.id.to_hex();
+        let batch = one_event_batch(
+            edit,
+            Some(ResolvedEdit {
+                target_event_id: original_id.clone(),
+                target_thread_tags: ThreadTags::default(),
+            }),
+        );
+        let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n");
+        assert!(
+            prompt.contains(&format!("--reply-to {original_id}")),
+            "{prompt}"
+        );
+        assert!(!prompt.contains(&format!("--reply-to {edit_id}")));
+    }
+
+    #[test]
+    fn edit_of_threaded_reply_anchors_original_thread_root_in_rendered_prompt() {
+        let original_id = "22".repeat(32);
+        let root_id = "33".repeat(32);
+        let batch = one_event_batch(
+            edit_event(&original_id),
+            Some(ResolvedEdit {
+                target_event_id: original_id,
+                target_thread_tags: ThreadTags {
+                    root_event_id: Some(root_id.clone()),
+                    parent_event_id: Some("44".repeat(32)),
+                    mentioned_pubkeys: vec![],
+                },
+            }),
+        );
+        let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n");
+        assert!(
+            prompt.contains(&format!("--reply-to {root_id}")),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn edit_fetch_failure_anchors_target_never_auxiliary_edit_event() {
+        let original_id = "55".repeat(32);
+        let edit = edit_event(&original_id);
+        let edit_id = edit.id.to_hex();
+        let prompt =
+            format_prompt(&one_event_batch(edit, None), &FormatPromptArgs::default()).join("\n");
+        assert!(
+            prompt.contains(&format!("--reply-to {original_id}")),
+            "{prompt}"
+        );
+        assert!(!prompt.contains(&format!("--reply-to {edit_id}")));
+    }
+
+    #[test]
+    fn edit_dispatches_in_its_own_batch() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let before = make_queued(ch, "before");
+        let before_id = before.event.id;
+        q.push(before);
+        let target = "ab".repeat(32);
+        q.push(queued_edit(ch, &target, None));
+        let after = make_queued(ch, "after");
+        let after_id = after.event.id;
+        q.push(after);
+
+        let first = q.flush_next().expect("ordinary prefix");
+        assert_eq!(
+            first.events.iter().map(|e| e.event.id).collect::<Vec<_>>(),
+            vec![before_id]
+        );
+        q.mark_complete(ch);
+        let edit = q.flush_next().expect("edit alone");
+        assert_eq!(edit.events.len(), 1);
+        assert_eq!(edit_target_id(&edit.events[0].event), Some(target));
+        q.mark_complete(ch);
+        let last = q.flush_next().expect("later event");
+        assert_eq!(
+            last.events.iter().map(|e| e.event.id).collect::<Vec<_>>(),
+            vec![after_id]
+        );
+    }
+
+    #[test]
+    fn cancelled_edit_returns_to_queue_and_keeps_routing_boundary() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let target_id = "ab".repeat(32);
+        let resolved = ResolvedEdit {
+            target_event_id: target_id.clone(),
+            target_thread_tags: ThreadTags {
+                root_event_id: Some("cd".repeat(32)),
+                parent_event_id: Some("cd".repeat(32)),
+                mentioned_pubkeys: vec![],
+            },
+        };
+        q.push(queued_edit(ch, &target_id, Some(resolved.clone())));
+        let interrupted = q.flush_next().expect("edit should dispatch alone");
+        let edit_id = interrupted.events[0].event.id;
+
+        let later = make_queued(ch, "later request");
+        let later_id = later.event.id;
+        q.push(later);
+        q.requeue_as_cancelled(interrupted, CancelReason::Steer);
+        q.mark_complete(ch);
+
+        let restored = q.flush_next().expect("cancelled edit should be restored");
+        assert_eq!(restored.events.len(), 1);
+        assert_eq!(restored.events[0].event.id, edit_id);
+        assert_eq!(restored.events[0].edit, Some(resolved));
+        assert!(restored.cancelled_events.is_empty());
+
+        q.mark_complete(ch);
+        let later_batch = q.flush_next().expect("later request should remain queued");
+        assert_eq!(later_batch.events.len(), 1);
+        assert_eq!(later_batch.events[0].event.id, later_id);
+    }
+
+    #[test]
+    fn test_drain_channel_returns_visible_edit_targets_including_withheld() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let queued_target = "77".repeat(32);
+        let withheld_target = "88".repeat(32);
+        q.push(queued_edit(ch, &queued_target, None));
+        q.withheld_native_steer
+            .insert(conv(ch), vec![queued_edit(ch, &withheld_target, None)]);
+
+        let drained: HashSet<String> = q.drain_channel(ch).into_iter().collect();
+        assert_eq!(drained, HashSet::from([queued_target, withheld_target]));
+        assert!(q.withheld_native_steer.is_empty());
     }
 
     // ── F2 case 2.5: steer renewal is monotonic across repeated steers ───────
@@ -6373,6 +6810,7 @@ mod tests {
             channel_id: ch,
             scope: conv(ch),
             events: vec![BatchEvent {
+                edit: None,
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
