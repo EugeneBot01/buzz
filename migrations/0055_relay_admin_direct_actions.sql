@@ -27,3 +27,12 @@ ALTER TABLE relay_admin_actions
 CREATE UNIQUE INDEX idx_relay_admin_actions_direct_request
     ON relay_admin_actions (report_community_id, request_id)
     WHERE report_id IS NULL;
+
+-- Direct rows have no report FK, so the tenant is carried only by
+-- report_community_id. Community deletion purges both tables explicitly.
+UPDATE _operator_global_tables
+   SET reason = 'deployment-global enforcement state machine; community deletion purges rows by report_community_id'
+ WHERE table_name = 'relay_admin_actions';
+UPDATE _operator_global_tables
+   SET reason = 'deployment-global enforcement artifact delivery queue; community deletion purges rows with their action'
+ WHERE table_name = 'relay_admin_outbox';

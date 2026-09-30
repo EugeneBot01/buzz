@@ -2230,6 +2230,35 @@ impl DeletionStore {
         }
 
         let mut deleted = BTreeMap::new();
+        // Staff enforcement rows are operator-global and keyed by
+        // report_community_id, so the scoped loop never sees them. Delete them
+        // first: outbox → actions → moderation_reports is the only FK-safe order.
+        for (table, sql) in [
+            (
+                "relay_admin_outbox",
+                "DELETE FROM relay_admin_outbox o USING relay_admin_actions a \
+                 WHERE o.action_id = a.id AND a.report_community_id = $1",
+            ),
+            (
+                "relay_admin_actions",
+                "DELETE FROM relay_admin_actions WHERE report_community_id = $1",
+            ),
+        ] {
+            let affected = sqlx::query(sql)
+                .bind(token.community_id.as_uuid())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            deleted.insert(table.to_owned(), affected);
+            checkpoint_completed_tx(
+                &mut tx,
+                token,
+                DeletionStage::BindingsRemoved,
+                &format!("purge:{table}"),
+                serde_json::json!({"rows": affected}),
+            )
+            .await?;
+        }
         // The order is child-before-parent/FK-safe, not alphabetical. Cascades
         // can make later units observe zero rows; each scoped WHERE stays idempotent.
         for table in PURGE_SCOPED_TABLES {
@@ -7350,6 +7379,113 @@ mod postgres_tests {
         .execute(&admin)
         .await
         .expect("drop probe database");
+    }
+
+    /// Seed one report-backed and one direct staff action, each with an outbox
+    /// row, in `community`. Returns the action ids.
+    async fn seed_relay_admin_rows(db: &Db, community: Uuid) -> [Uuid; 2] {
+        let report_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO moderation_reports \
+             (community_id, report_event_id, reporter_pubkey, target_kind, target_pubkey, report_type) \
+             VALUES ($1, $2, $3, 'pubkey', $4, 'spam') RETURNING id",
+        )
+        .bind(community)
+        .bind(Uuid::new_v4().as_bytes().repeat(2))
+        .bind([2u8; 32].as_slice())
+        .bind([3u8; 32].as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .expect("seed report");
+        let mut ids = [Uuid::nil(); 2];
+        for (slot, report) in ids.iter_mut().zip([Some(report_id), None]) {
+            let action_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO relay_admin_actions \
+                 (report_id, report_community_id, request_id, actor_pubkey, actor_role, \
+                  action, state, enforcement_target_pubkey) \
+                 VALUES ($1, $2, $3, $4, 'operator', 'ban', 'succeeded', $5) RETURNING id",
+            )
+            .bind(report)
+            .bind(community)
+            .bind(Uuid::new_v4())
+            .bind([4u8; 32].as_slice())
+            .bind([3u8; 32].as_slice())
+            .fetch_one(&db.pool)
+            .await
+            .expect("seed relay admin action");
+            sqlx::query(
+                "INSERT INTO relay_admin_outbox (action_id, task_type, state) \
+                 VALUES ($1, 'reporter_notice', 'delivered')",
+            )
+            .bind(action_id)
+            .execute(&db.pool)
+            .await
+            .expect("seed relay admin outbox");
+            *slot = action_id;
+        }
+        ids
+    }
+
+    async fn relay_admin_row_counts(db: &Db, community: Uuid) -> (i64, i64) {
+        sqlx::query_as(
+            "SELECT (SELECT count(*) FROM relay_admin_actions WHERE report_community_id = $1), \
+                    (SELECT count(*) FROM relay_admin_outbox o JOIN relay_admin_actions a \
+                       ON a.id = o.action_id WHERE a.report_community_id = $1)",
+        )
+        .bind(community)
+        .fetch_one(&db.pool)
+        .await
+        .expect("count relay admin rows")
+    }
+
+    /// Report-backed staff actions FK `moderation_reports`, and outbox rows FK
+    /// their action. Purge must delete the community's report-backed and direct
+    /// rows in FK order and leave other communities' rows alone.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn purge_postgres_succeeds_with_relay_admin_action_rows() {
+        let (db, store) = store().await;
+        let (request, inventory) = inventoried_request(&db, &store).await;
+        let community = *request.community_id.as_uuid();
+        seed_relay_admin_rows(&db, community).await;
+        let bystander = db
+            .ensure_configured_community(&format!("bystander-{}.example", Uuid::new_v4().simple()))
+            .await
+            .expect("create bystander community")
+            .id
+            .as_uuid()
+            .to_owned();
+        seed_relay_admin_rows(&db, bystander).await;
+
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(request.id, "executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim")
+            .expect("won claim");
+        store.begin_quiescing(&claim.lease).await.expect("quiesce");
+        let generation = store.fence(&claim.lease).await.expect("fence");
+        let token = LeaseToken {
+            fence_generation: Some(generation),
+            ..claim.lease
+        };
+        store
+            .freeze_destructive_storage_manifest(&token, &inventory.storage)
+            .await
+            .expect("freeze destructive storage");
+        store.mark_drained(&token).await.expect("drain");
+        store
+            .mark_bindings_removed(&token, serde_json::json!({"keys": 0}))
+            .await
+            .expect("bindings");
+        let deleted = store.purge_postgres(&token).await.expect("purge postgres");
+
+        assert_eq!(deleted.get("relay_admin_outbox"), Some(&2));
+        assert_eq!(deleted.get("relay_admin_actions"), Some(&2));
+        assert_eq!(relay_admin_row_counts(&db, community).await, (0, 0));
+        assert_eq!(relay_admin_row_counts(&db, bystander).await, (2, 2));
     }
 
     /// A database bootstrapped from `schema/schema.sql` (the pgschema

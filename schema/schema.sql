@@ -1900,7 +1900,7 @@ CREATE INDEX idx_relay_admin_actions_lease
     WHERE state IN ('pending', 'enforcing');
 
 INSERT INTO _operator_global_tables (table_name, reason) VALUES
-    ('relay_admin_actions', 'deployment-global enforcement state machine; community_id is embedded in report FK');
+    ('relay_admin_actions', 'deployment-global enforcement state machine; community deletion purges rows by report_community_id');
 
 -- ── Relay admin outbox (durable enforcement delivery) ────────────────────────
 -- Transactional outbox for durable artifact/notice delivery.
@@ -1940,7 +1940,7 @@ CREATE INDEX idx_relay_admin_outbox_pending
     WHERE state = 'pending';
 
 INSERT INTO _operator_global_tables (table_name, reason) VALUES
-    ('relay_admin_outbox', 'deployment-global enforcement artifact delivery queue');
+    ('relay_admin_outbox', 'deployment-global enforcement artifact delivery queue; community deletion purges rows with their action');
 
 -- ── Operator-listener mention delivery ──────────────────────────────────────
 -- Listener registrations are deployment-global. The outbox records community
