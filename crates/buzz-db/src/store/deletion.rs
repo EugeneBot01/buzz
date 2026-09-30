@@ -865,27 +865,12 @@ impl DeletionStore {
     /// upstream. This layer records that provenance and checks that
     /// `owner_pubkey` is the community's sole current owner; it never verifies an
     /// owner-signed attestation.
+    ///
+    /// `expected_community_id`, when present, must name the host's community.
+    /// It is checked only after sole-owner authority is proven (so non-owners
+    /// see the same not-found as an unknown host) and, on replay, only against
+    /// a stored request for the same host.
     pub async fn admit_owner_request(
-        &self,
-        normalized_community_host: &str,
-        owner_pubkey: &str,
-        mediating_operator_pubkey: &str,
-        acknowledgement_version: i32,
-        request_id: Uuid,
-    ) -> Result<OwnerDeletionAdmission> {
-        self.admit_owner_request_with_community_id(
-            normalized_community_host,
-            owner_pubkey,
-            mediating_operator_pubkey,
-            acknowledgement_version,
-            request_id,
-            None,
-        )
-        .await
-    }
-
-    /// Admit owner intent, rejecting an optional community UUID that does not belong to the host.
-    pub async fn admit_owner_request_with_community_id(
         &self,
         normalized_community_host: &str,
         owner_pubkey: &str,
@@ -914,7 +899,9 @@ impl DeletionStore {
             .await?
         {
             let existing = row_to_request(row)?;
-            if expected_community_id.is_some_and(|id| id != *existing.community_id.as_uuid()) {
+            if existing.community_host == normalized_community_host
+                && expected_community_id.is_some_and(|id| id != *existing.community_id.as_uuid())
+            {
                 tx.rollback().await?;
                 return Ok(OwnerDeletionAdmission::CommunityIdMismatch);
             }
@@ -942,10 +929,6 @@ impl DeletionStore {
             return Ok(OwnerDeletionAdmission::NotFoundOrNotOwner);
         };
         let community_id: Uuid = target.try_get("id")?;
-        if expected_community_id.is_some_and(|id| id != community_id) {
-            tx.rollback().await?;
-            return Ok(OwnerDeletionAdmission::CommunityIdMismatch);
-        }
         let canonical_host: String = target.try_get("host")?;
         let deletion_state: String = target.try_get("deletion_state")?;
         let deleted_at: Option<DateTime<Utc>> = target.try_get("deleted_at")?;
@@ -964,6 +947,12 @@ impl DeletionStore {
         if current_owners.len() != 1 || current_owners.first() != Some(&owner_pubkey) {
             tx.rollback().await?;
             return Ok(OwnerDeletionAdmission::NotFoundOrNotOwner);
+        }
+        // Only after sole-owner authority is proven, so non-owners still see the
+        // same 404 as an unknown host whatever `community_id` they assert.
+        if expected_community_id.is_some_and(|id| id != community_id) {
+            tx.rollback().await?;
+            return Ok(OwnerDeletionAdmission::CommunityIdMismatch);
         }
         if target
             .try_get::<Option<DateTime<Utc>>, _>("archived_at")?
@@ -4679,7 +4668,7 @@ mod postgres_tests {
         let request_id = Uuid::new_v4();
 
         let admitted = store
-            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .admit_owner_request(&host, &owner, operator, 1, request_id, None)
             .await
             .expect("admit archived owner request");
         let OwnerDeletionAdmission::Accepted(request) = admitted else {
@@ -4723,7 +4712,7 @@ mod postgres_tests {
 
         assert_eq!(
             store
-                .admit_owner_request(&host, &owner, operator, 1, Uuid::new_v4())
+                .admit_owner_request(&host, &owner, operator, 1, Uuid::new_v4(), None)
                 .await
                 .expect("non-archived admission result"),
             OwnerDeletionAdmission::NotArchived
@@ -4734,7 +4723,7 @@ mod postgres_tests {
             .expect("owned community");
         assert_eq!(
             store
-                .admit_owner_request(&host, &outsider, operator, 1, Uuid::new_v4())
+                .admit_owner_request(&host, &outsider, operator, 1, Uuid::new_v4(), None)
                 .await
                 .expect("non-owner admission result"),
             OwnerDeletionAdmission::NotFoundOrNotOwner
@@ -4747,7 +4736,7 @@ mod postgres_tests {
         );
         assert!(matches!(
             store
-                .admit_owner_request(&host, &owner, operator, 1, Uuid::new_v4())
+                .admit_owner_request(&host, &owner, operator, 1, Uuid::new_v4(), None)
                 .await
                 .expect("current-owner admission result"),
             OwnerDeletionAdmission::Accepted(_)
@@ -4781,6 +4770,7 @@ mod postgres_tests {
                     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     1,
                     Uuid::new_v4(),
+                    None,
                 )
                 .await
                 .expect("legacy co-owner admission result"),
@@ -4811,7 +4801,7 @@ mod postgres_tests {
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         assert!(matches!(
             store
-                .admit_owner_request(&host, &owner, operator, 1, Uuid::new_v4())
+                .admit_owner_request(&host, &owner, operator, 1, Uuid::new_v4(), None)
                 .await
                 .expect("admit owner request"),
             OwnerDeletionAdmission::Accepted(_)
@@ -4840,6 +4830,7 @@ mod postgres_tests {
                     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     1,
                     Uuid::new_v4(),
+                    None,
                 )
                 .await
                 .expect("admit owner deletion")
@@ -4942,6 +4933,7 @@ mod postgres_tests {
                         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                         1,
                         request_id,
+                        None,
                     )
                     .await
             }
@@ -4994,6 +4986,7 @@ mod postgres_tests {
                         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                         1,
                         request_id,
+                        None,
                     )
                     .await
             }
@@ -5043,6 +5036,7 @@ mod postgres_tests {
                         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                         1,
                         request_id,
+                        None,
                     )
                     .await
             }
@@ -5082,7 +5076,7 @@ mod postgres_tests {
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let request_id = Uuid::new_v4();
         let OwnerDeletionAdmission::Accepted(first) = store
-            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .admit_owner_request(&host, &owner, operator, 1, request_id, None)
             .await
             .expect("first admission")
         else {
@@ -5101,7 +5095,7 @@ mod postgres_tests {
             .expect("advance request");
 
         let OwnerDeletionAdmission::Accepted(replayed) = store
-            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .admit_owner_request(&host, &owner, operator, 1, request_id, None)
             .await
             .expect("replay admission")
         else {
@@ -5111,7 +5105,7 @@ mod postgres_tests {
         assert_eq!(replayed.stage, DeletionStage::Inventoried);
         assert_eq!(
             store
-                .admit_owner_request(&other_host, &other_owner, operator, 1, request_id)
+                .admit_owner_request(&other_host, &other_owner, operator, 1, request_id, None)
                 .await
                 .expect("retargeting result"),
             OwnerDeletionAdmission::RequestConflict
@@ -5126,8 +5120,8 @@ mod postgres_tests {
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let request_id = Uuid::new_v4();
         let (first, second) = tokio::join!(
-            store.admit_owner_request(&host, &owner, operator, 1, request_id),
-            store.admit_owner_request(&host, &owner, operator, 1, request_id),
+            store.admit_owner_request(&host, &owner, operator, 1, request_id, None),
+            store.admit_owner_request(&host, &owner, operator, 1, request_id, None),
         );
         let accepted_id = |result: Result<OwnerDeletionAdmission>| {
             let OwnerDeletionAdmission::Accepted(request) = result.expect("admission") else {
@@ -5157,7 +5151,7 @@ mod postgres_tests {
         let new_owner = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let OwnerDeletionAdmission::Accepted(_) = store
-            .admit_owner_request(&host, &owner, operator, 1, Uuid::new_v4())
+            .admit_owner_request(&host, &owner, operator, 1, Uuid::new_v4(), None)
             .await
             .expect("admit owner request")
         else {
@@ -5213,7 +5207,7 @@ mod postgres_tests {
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let request_id = Uuid::new_v4();
         let OwnerDeletionAdmission::Accepted(request) = store
-            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .admit_owner_request(&host, &owner, operator, 1, request_id, None)
             .await
             .expect("admit owner request")
         else {
@@ -5294,7 +5288,7 @@ mod postgres_tests {
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let request_id = Uuid::new_v4();
         store
-            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .admit_owner_request(&host, &owner, operator, 1, request_id, None)
             .await
             .expect("admit owner request");
         let claim = store
@@ -5410,7 +5404,7 @@ mod postgres_tests {
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let request_id = Uuid::new_v4();
         let OwnerDeletionAdmission::Accepted(owner_request) = store
-            .admit_owner_request(&owner_host, &owner, operator, 1, request_id)
+            .admit_owner_request(&owner_host, &owner, operator, 1, request_id, None)
             .await
             .expect("admit owner request")
         else {
@@ -5485,7 +5479,7 @@ mod postgres_tests {
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let request_id = Uuid::new_v4();
         store
-            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .admit_owner_request(&host, &owner, operator, 1, request_id, None)
             .await
             .expect("admit owner request");
         sqlx::query(
@@ -5521,7 +5515,7 @@ mod postgres_tests {
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let request_id = Uuid::new_v4();
         store
-            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .admit_owner_request(&host, &owner, operator, 1, request_id, None)
             .await
             .expect("admit owner request");
         let claim = store
@@ -5588,7 +5582,7 @@ mod postgres_tests {
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let request_id = Uuid::new_v4();
         store
-            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .admit_owner_request(&host, &owner, operator, 1, request_id, None)
             .await
             .expect("admit owner request");
         let pending_quota = db
@@ -5752,7 +5746,7 @@ mod postgres_tests {
             let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
             let request_id = Uuid::new_v4();
             store
-                .admit_owner_request(&host, &owner, operator, 1, request_id)
+                .admit_owner_request(&host, &owner, operator, 1, request_id, None)
                 .await
                 .expect("admit owner request");
             let claim = store
@@ -5835,7 +5829,7 @@ mod postgres_tests {
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let request_id = Uuid::new_v4();
         store
-            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .admit_owner_request(&host, &owner, operator, 1, request_id, None)
             .await
             .expect("admit sole owner's intent");
         let claim = store
@@ -6037,7 +6031,7 @@ mod postgres_tests {
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let request_id = Uuid::new_v4();
         store
-            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .admit_owner_request(&host, &owner, operator, 1, request_id, None)
             .await
             .expect("admit owner request");
         let stale = store
@@ -6089,7 +6083,7 @@ mod postgres_tests {
         let operator = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let request_id = Uuid::new_v4();
         store
-            .admit_owner_request(&host, &owner, operator, 1, request_id)
+            .admit_owner_request(&host, &owner, operator, 1, request_id, None)
             .await
             .expect("admit owner request");
         let claim = store
@@ -6156,7 +6150,7 @@ mod postgres_tests {
         .is_some());
         assert!(matches!(
             store
-                .admit_owner_request(&host, &owner, operator, 1, Uuid::new_v4())
+                .admit_owner_request(&host, &owner, operator, 1, Uuid::new_v4(), None)
                 .await
                 .expect("fresh owner request after recovery abort"),
             OwnerDeletionAdmission::Accepted(_)

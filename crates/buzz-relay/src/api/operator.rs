@@ -530,7 +530,7 @@ pub async fn delete_community(
     let admission = state
         .db
         .deletion_store()
-        .admit_owner_request_with_community_id(
+        .admit_owner_request(
             &normalized_host,
             &owner,
             &operator,
@@ -1238,6 +1238,30 @@ mod postgres_tests {
             })
             .to_string()
         };
+        // A non-owner must see the same 404 as an unknown host, even with a wrong id.
+        let stranger_mismatch = signed_operator_request(
+            Arc::clone(&state),
+            &operator,
+            "POST",
+            "/operator/communities/delete",
+            Some(
+                serde_json::json!({
+                    "host": host,
+                    "community_id": Uuid::new_v4(),
+                    "owner_pubkey": Keys::generate().public_key().to_hex(),
+                    "request_id": request_id,
+                    "acknowledgement_version": 1,
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(stranger_mismatch.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            read_json(stranger_mismatch).await["code"],
+            "community_not_found"
+        );
+        assert_no_persisted_request(&state, request_id, "non-owner mismatched id").await;
         let mismatch = signed_operator_request(
             Arc::clone(&state),
             &operator,
@@ -1333,15 +1357,79 @@ mod postgres_tests {
                 .expect("unchanged request"),
             admitted
         );
+        let matched_replay = signed_operator_request(
+            Arc::clone(&state),
+            &operator,
+            "POST",
+            "/operator/communities/delete",
+            Some(body(serde_json::json!(community_id))),
+        )
+        .await;
+        assert_eq!(matched_replay.status(), StatusCode::ACCEPTED);
+        let matched_replay = read_json(matched_replay).await;
+        assert_eq!(matched_replay["request_id"], request_id.to_string());
+        assert_eq!(matched_replay["community_id"], community_id.to_string());
+        assert_eq!(
+            state
+                .db
+                .deletion_store()
+                .get(request_id)
+                .await
+                .expect("replayed request"),
+            admitted
+        );
 
         let other_host = format!("community-{}.example", Uuid::new_v4().simple());
-        assert_eq!(
-            provision_community(Arc::clone(&state), &operator, &other_host, &owner)
-                .await
-                .status(),
-            StatusCode::OK
-        );
+        let other_created =
+            provision_community(Arc::clone(&state), &operator, &other_host, &owner).await;
+        assert_eq!(other_created.status(), StatusCode::OK);
+        let other_id: Uuid = read_json(other_created).await["community_id"]
+            .as_str()
+            .expect("other community id")
+            .parse()
+            .expect("valid other community id");
         archive_for_owner_deletion(&state, &other_host, &owner).await;
+        // A known request id reused for a different host is a request conflict,
+        // even when `community_id` correctly names that other host.
+        let collision = signed_operator_request(
+            Arc::clone(&state),
+            &operator,
+            "POST",
+            "/operator/communities/delete",
+            Some(
+                serde_json::json!({
+                    "host": other_host,
+                    "community_id": other_id,
+                    "owner_pubkey": owner.public_key().to_hex(),
+                    "request_id": request_id,
+                    "acknowledgement_version": 1,
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(collision.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            read_json(collision).await["code"],
+            "deletion_request_conflict"
+        );
+        assert_eq!(
+            state
+                .db
+                .deletion_store()
+                .get(request_id)
+                .await
+                .expect("request unchanged by collision"),
+            admitted
+        );
+        let other_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM community_deletion_requests WHERE community_id = $1",
+        )
+        .bind(other_id)
+        .fetch_one(pool)
+        .await
+        .expect("count other-host requests");
+        assert_eq!(other_count, 0);
         let absent_id = Uuid::new_v4();
         let absent = signed_operator_request(
             Arc::clone(&state),
