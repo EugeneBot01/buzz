@@ -51,6 +51,25 @@ pub const CONTROL_PLANE_TABLES: &[&str] = &[
     "community_serving_write_leases",
 ];
 
+/// Operator-global staff enforcement tables that still hold one community's
+/// rows, keyed by `report_community_id` instead of `community_id`.
+///
+/// Each entry is `(table, row source)`; the row source binds the community as
+/// `$1` and is prefixed with `DELETE`, `SELECT count(*)`, or `SELECT EXISTS`.
+/// The order is FK-safe for deletion: outbox rows before their actions, and
+/// both before `moderation_reports`.
+pub const RELAY_ADMIN_TABLES: &[(&str, &str)] = &[
+    (
+        "relay_admin_outbox",
+        "FROM relay_admin_outbox WHERE action_id IN \
+         (SELECT id FROM relay_admin_actions WHERE report_community_id = $1)",
+    ),
+    (
+        "relay_admin_actions",
+        "FROM relay_admin_actions WHERE report_community_id = $1",
+    ),
+];
+
 /// Expected community-scoped tables purged by V1.
 ///
 /// Catalog inventory compares the live database against this exact set before
@@ -1203,6 +1222,14 @@ impl DeletionStore {
                 .await?;
             row_counts.insert(table.clone(), count);
         }
+        for (table, rows) in RELAY_ADMIN_TABLES {
+            let sql = format!("SELECT count(*)::BIGINT {rows}");
+            let count: i64 = sqlx::query_scalar(AssertSqlSafe(sql))
+                .bind(community.as_uuid())
+                .fetch_one(&self.pool)
+                .await?;
+            row_counts.insert((*table).to_owned(), count);
+        }
         Ok(SchemaManifest {
             scoped_tables: live_tables.into_iter().collect(),
             row_counts,
@@ -2230,26 +2257,16 @@ impl DeletionStore {
         }
 
         let mut deleted = BTreeMap::new();
-        // Staff enforcement rows are operator-global and keyed by
-        // report_community_id, so the scoped loop never sees them. Delete them
-        // first: outbox → actions → moderation_reports is the only FK-safe order.
-        for (table, sql) in [
-            (
-                "relay_admin_outbox",
-                "DELETE FROM relay_admin_outbox o USING relay_admin_actions a \
-                 WHERE o.action_id = a.id AND a.report_community_id = $1",
-            ),
-            (
-                "relay_admin_actions",
-                "DELETE FROM relay_admin_actions WHERE report_community_id = $1",
-            ),
-        ] {
-            let affected = sqlx::query(sql)
+        // Staff enforcement rows are operator-global, so the scoped loop never
+        // sees them. They must go before moderation_reports (FK order).
+        for (table, rows) in RELAY_ADMIN_TABLES {
+            let sql = format!("DELETE {rows}");
+            let affected = sqlx::query(AssertSqlSafe(sql))
                 .bind(token.community_id.as_uuid())
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
-            deleted.insert(table.to_owned(), affected);
+            deleted.insert((*table).to_owned(), affected);
             checkpoint_completed_tx(
                 &mut tx,
                 token,
@@ -2364,9 +2381,14 @@ impl DeletionStore {
                 token.community_id
             )));
         }
-        for table in EXPECTED_SCOPED_TABLES {
-            let sql =
-                format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE community_id = $1 LIMIT 1)");
+        let scoped = EXPECTED_SCOPED_TABLES
+            .iter()
+            .map(|table| (*table, format!("FROM {table} WHERE community_id = $1")));
+        let relay_admin = RELAY_ADMIN_TABLES
+            .iter()
+            .map(|(table, rows)| (*table, (*rows).to_owned()));
+        for (table, rows) in scoped.chain(relay_admin) {
+            let sql = format!("SELECT EXISTS(SELECT 1 {rows} LIMIT 1)");
             let remains: bool = sqlx::query_scalar(AssertSqlSafe(sql))
                 .bind(token.community_id.as_uuid())
                 .fetch_one(&mut *tx)
@@ -6967,7 +6989,15 @@ mod postgres_tests {
             .await
             .expect("bindings");
         let first = store.purge_postgres(&token).await.expect("purge postgres");
-        assert_eq!(first.len(), EXPECTED_SCOPED_TABLES.len());
+        let expected_tables: BTreeSet<&str> = EXPECTED_SCOPED_TABLES
+            .iter()
+            .chain(RELAY_ADMIN_TABLES.iter().map(|(table, _)| table))
+            .copied()
+            .collect();
+        assert_eq!(
+            first.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            expected_tables
+        );
         assert!(
             store.purge_postgres(&token).await.is_err(),
             "completed stage cannot be replayed under stale checkpoint state"
@@ -7455,6 +7485,12 @@ mod postgres_tests {
             .as_uuid()
             .to_owned();
         seed_relay_admin_rows(&db, bystander).await;
+        let live = store
+            .inventory_schema(request.community_id)
+            .await
+            .expect("inventory");
+        assert_eq!(live.row_counts.get("relay_admin_outbox"), Some(&2));
+        assert_eq!(live.row_counts.get("relay_admin_actions"), Some(&2));
 
         store
             .approve(request.id, "approver", None)
@@ -7486,6 +7522,43 @@ mod postgres_tests {
         assert_eq!(deleted.get("relay_admin_actions"), Some(&2));
         assert_eq!(relay_admin_row_counts(&db, community).await, (0, 0));
         assert_eq!(relay_admin_row_counts(&db, bystander).await, (2, 2));
+
+        // Logical verification must prove these tables empty too: a straggler
+        // direct action (not write-fenced, no report FK) fails the proof.
+        store
+            .mark_cache_purged(&token, serde_json::json!({"keys": 0}))
+            .await
+            .expect("cache");
+        let straggler: Uuid = sqlx::query_scalar(
+            "INSERT INTO relay_admin_actions \
+             (report_community_id, request_id, actor_pubkey, actor_role, action, state, \
+              enforcement_target_pubkey) \
+             VALUES ($1, $2, $3, 'operator', 'ban', 'succeeded', $4) RETURNING id",
+        )
+        .bind(community)
+        .bind(Uuid::new_v4())
+        .bind([4u8; 32].as_slice())
+        .bind([3u8; 32].as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .expect("seed straggler");
+        let err = store
+            .verify_postgres_logically_deleted(&token)
+            .await
+            .expect_err("straggler relay admin action must fail verification");
+        assert!(
+            err.to_string().contains("relay_admin_actions"),
+            "unexpected verification error: {err}"
+        );
+        sqlx::query("DELETE FROM relay_admin_actions WHERE id = $1")
+            .bind(straggler)
+            .execute(&db.pool)
+            .await
+            .expect("remove straggler");
+        store
+            .verify_postgres_logically_deleted(&token)
+            .await
+            .expect("verify after straggler removed");
     }
 
     /// A database bootstrapped from `schema/schema.sql` (the pgschema
