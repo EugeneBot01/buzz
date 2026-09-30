@@ -155,7 +155,10 @@ Admission is idempotent on the request UUID. Resending the same UUID with the
 same host, owner, and acknowledgement version returns `202` with that request's
 current `status` at any stage, including after membership purge, and admits no
 new work. Clients recover an ambiguous submission by resending it. The same
-UUID with a different tuple returns `409 deletion_request_conflict`.
+UUID with a different host or owner returns `409 deletion_request_conflict`.
+An unsupported acknowledgement version is the exception: it is rejected before
+the UUID lookup with `400 unsupported_acknowledgement_version`, even for a
+known UUID.
 
 The acknowledgement version is a compile-time constant
 (`OWNER_DELETION_ACKNOWLEDGEMENT_VERSION`), not operator configuration.
@@ -169,14 +172,19 @@ until none remain in a non-terminal stage.
 
 ## Owner quota
 
-The relay enforces two per-owner caps on create and on transfer-in, both as
-`limit_reached`:
+The relay enforces two per-owner caps on create and on transfer-in. Either
+rejects with `409` and `code: "limit_reached"` (the `error` message keeps its
+`limit_reached:` prefix for older clients):
 
 - **Active:** live ownership plus incomplete owner deletions
   (`BUZZ_MAX_COMMUNITIES_PER_OWNER`, default 5). A deletion keeps its slot
   until logical completion records `completed_at`.
 - **Lifetime:** live ownership plus every non-aborted owner deletion, including
   completed ones, capped at an absolute 20 regardless of the active limit.
+  Lifetime usage includes live ownership, so no owner can hold more than 20
+  live communities; a `BUZZ_MAX_COMMUNITIES_PER_OWNER` above 20 is
+  unreachable, and owner lists would report a `quota_limit` the owner can
+  never reach.
   Deleted communities keep their hosts as permanent tombstones, so this bounds
   create-then-delete host squatting. Aborted deletions restore the community
   and count only through its live membership.

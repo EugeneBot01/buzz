@@ -24,7 +24,7 @@ use crate::state::AppState;
 
 use super::{api_error, bridge, internal_error};
 
-fn deletion_api_error(
+fn coded_api_error(
     status: StatusCode,
     code: &'static str,
     message: &str,
@@ -304,11 +304,10 @@ pub async fn provision_community(
         Err(msg) if msg.starts_with("actor not authorized") => {
             Err(api_error(StatusCode::FORBIDDEN, &msg))
         }
-        Err(msg)
-            if msg == "community already exists"
-                || msg.starts_with("limit_reached:")
-                || msg.starts_with("owner_conflict:") =>
-        {
+        Err(msg) if msg.starts_with("limit_reached:") => {
+            Err(coded_api_error(StatusCode::CONFLICT, "limit_reached", &msg))
+        }
+        Err(msg) if msg == "community already exists" || msg.starts_with("owner_conflict:") => {
             Err(api_error(StatusCode::CONFLICT, &msg))
         }
         Err(msg)
@@ -430,7 +429,7 @@ pub async fn unarchive_community(
     let record = match result {
         buzz_db::UnarchiveCommunityResult::Unarchived(record) => record,
         buzz_db::UnarchiveCommunityResult::DeletionPending => {
-            return Err(deletion_api_error(
+            return Err(coded_api_error(
                 StatusCode::CONFLICT,
                 "deletion_lifecycle_conflict",
                 "community deletion is pending",
@@ -470,13 +469,16 @@ pub async fn unarchive_community(
 /// Resubmitting the same UUID with the same host, owner, and acknowledgement
 /// version returns `202` with that request's current `status`, at any stage and
 /// even after membership purge, and never admits new work. Callers recover an
-/// ambiguous submission by resending it; a different tuple under a known UUID
-/// is `409 deletion_request_conflict`.
+/// ambiguous submission by resending it; a different host or owner under a
+/// known UUID is `409 deletion_request_conflict`. An unsupported
+/// acknowledgement version is rejected before the UUID lookup with
+/// `400 unsupported_acknowledgement_version`, even for a known UUID.
 ///
 /// Owner consent is asserted by the operator, not proven to the relay. The
 /// operator authenticates the owner and collects the acknowledgement upstream;
 /// this request carries only the operator's NIP-98 signature. Authorization is
-/// therefore operator authority plus "the asserted pubkey is still the owner".
+/// therefore operator authority plus "the asserted pubkey is the community's
+/// sole current owner".
 /// `owner_pubkey` and `acknowledgement_version` are recorded as provenance for
 /// that upstream ceremony, not verified as cryptographic owner consent.
 pub async fn delete_community(
@@ -488,16 +490,16 @@ pub async fn delete_community(
     let operator =
         authorize_operator_request(&state, &headers, "POST", PATH, None, Some(&body)).await?;
     let request: DeleteCommunityRequest = serde_json::from_slice(&body).map_err(|e| {
-        deletion_api_error(
+        coded_api_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             &format!("invalid delete-community JSON: {e}"),
         )
     })?;
     let normalized_host = normalize_candidate_host(&request.host)
-        .map_err(|msg| deletion_api_error(StatusCode::BAD_REQUEST, "invalid_request", &msg))?;
+        .map_err(|msg| coded_api_error(StatusCode::BAD_REQUEST, "invalid_request", &msg))?;
     if normalized_host != request.host {
-        return Err(deletion_api_error(
+        return Err(coded_api_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "host must use its exact canonical authority spelling",
@@ -505,14 +507,14 @@ pub async fn delete_community(
     }
     let deployment_host = buzz_core::tenant::relay_url_authority(&state.config.relay_url);
     if normalized_host == deployment_host {
-        return Err(deletion_api_error(
+        return Err(coded_api_error(
             StatusCode::CONFLICT,
             "protected_community",
             "the deployment community cannot be deleted",
         ));
     }
     let owner = validate_pubkey_hex(&request.owner_pubkey).ok_or_else(|| {
-        deletion_api_error(
+        coded_api_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "invalid owner_pubkey: expected 64-char hex pubkey",
@@ -534,35 +536,35 @@ pub async fn delete_community(
     let accepted = match admission {
         buzz_db::deletion::OwnerDeletionAdmission::Accepted(request) => request,
         buzz_db::deletion::OwnerDeletionAdmission::NotFoundOrNotOwner => {
-            return Err(deletion_api_error(
+            return Err(coded_api_error(
                 StatusCode::NOT_FOUND,
                 "community_not_found",
                 "community not found",
             ));
         }
         buzz_db::deletion::OwnerDeletionAdmission::NotArchived => {
-            return Err(deletion_api_error(
+            return Err(coded_api_error(
                 StatusCode::CONFLICT,
                 "community_not_archived",
                 "community must be archived before deletion",
             ));
         }
         buzz_db::deletion::OwnerDeletionAdmission::LifecycleConflict => {
-            return Err(deletion_api_error(
+            return Err(coded_api_error(
                 StatusCode::CONFLICT,
                 "deletion_lifecycle_conflict",
                 "community deletion lifecycle is already active",
             ));
         }
         buzz_db::deletion::OwnerDeletionAdmission::RequestConflict => {
-            return Err(deletion_api_error(
+            return Err(coded_api_error(
                 StatusCode::CONFLICT,
                 "deletion_request_conflict",
                 "deletion request conflicts with existing intent",
             ));
         }
         buzz_db::deletion::OwnerDeletionAdmission::UnsupportedAcknowledgementVersion => {
-            return Err(deletion_api_error(
+            return Err(coded_api_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_acknowledgement_version",
                 "unsupported acknowledgement_version",
@@ -713,15 +715,16 @@ pub async fn transfer_community(
             ));
         }
         buzz_db::relay_members::TransferResult::DeletionPending => {
-            return Err(deletion_api_error(
+            return Err(coded_api_error(
                 StatusCode::CONFLICT,
                 "deletion_lifecycle_conflict",
                 "community deletion is pending",
             ));
         }
         buzz_db::relay_members::TransferResult::LimitReached => {
-            return Err(api_error(
+            return Err(coded_api_error(
                 StatusCode::CONFLICT,
+                "limit_reached",
                 "limit_reached: transferee has reached the community limit",
             ));
         }
@@ -2544,6 +2547,7 @@ mod postgres_tests {
         let response = provision_community(state.clone(), &operator, &host, &owner).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let json = read_json(response).await;
+        assert_eq!(json["code"], "limit_reached");
         assert!(json["error"]
             .as_str()
             .is_some_and(|error| error.starts_with("limit_reached:")));
@@ -2642,6 +2646,80 @@ mod postgres_tests {
             &[(&new_owner_hex, "owner"), (&initial_owner_hex, "member")],
         )
         .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn transfer_to_owner_at_limit_returns_coded_limit_reached_without_mutation() {
+        let operator = Keys::generate();
+        let initial_owner = Keys::generate();
+        let transferee = Keys::generate();
+        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+            return;
+        };
+
+        for _ in 0..buzz_db::relay_members::MAX_COMMUNITIES_PER_OWNER {
+            let host = format!("community-{}.example", Uuid::new_v4().simple());
+            assert_eq!(
+                provision_community(state.clone(), &operator, &host, &transferee)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        let host = format!("community-{}.example", Uuid::new_v4().simple());
+        assert_eq!(
+            provision_community(state.clone(), &operator, &host, &initial_owner)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let community = state
+            .db
+            .lookup_community_by_host(&host)
+            .await
+            .expect("lookup community")
+            .expect("community exists");
+        let initial_owner_hex = initial_owner.public_key().to_hex();
+        let transferee_hex = transferee.public_key().to_hex();
+
+        let transfer_body = serde_json::json!({
+            "community_id": community.id.to_string(),
+            "new_owner_pubkey": transferee_hex,
+            "expected_owner_pubkey": initial_owner_hex,
+        })
+        .to_string();
+        let response = signed_operator_request(
+            state.clone(),
+            &operator,
+            "POST",
+            "/operator/communities/transfer",
+            Some(transfer_body),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let json = read_json(response).await;
+        assert_eq!(json["code"], "limit_reached");
+        assert!(json["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("limit_reached:")));
+        assert_eq!(
+            state
+                .db
+                .get_relay_member(community.id, &initial_owner_hex)
+                .await
+                .expect("get initial owner")
+                .expect("initial owner exists")
+                .role,
+            "owner"
+        );
+        assert!(state
+            .db
+            .get_relay_member(community.id, &transferee_hex)
+            .await
+            .expect("get transferee")
+            .is_none());
     }
 
     #[tokio::test]
