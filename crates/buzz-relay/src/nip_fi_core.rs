@@ -1,0 +1,202 @@
+//! Shared NIP-FI assertion evaluation for every relay ingress adapter.
+//!
+//! The HTTP guard, WebSocket upgrade, and HTTP admission each decide *when*
+//! to evaluate an attached assertion (mode short-circuits, exemptions, NIP-98
+//! ordering) and what to do with the result. This module owns the part they
+//! must agree on: extracting the `Nostr-Federated-Identity` bearer, verifying
+//! it, mapping failures to a [`DenialClass`], rendering the exact HTTP denial,
+//! and the key-pairing predicate. [FI-TRACE-AUTHORITY-UNIFORM]
+
+use axum::{
+    body::Body,
+    http::{HeaderMap, Response, StatusCode},
+};
+use buzz_auth::{
+    DenialClass, VerifiedAssertion, VerifierError, VerifyAssertion, CLIENT_ATTACHED_HEADER,
+};
+
+// ── Assertion evaluation ──────────────────────────────────────────────────────
+
+/// Why an attached assertion was not accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssertionRejection {
+    /// The header was absent or malformed. [FI-TRACE-TRANSPORT-CLOSED]
+    Transport(DenialClass),
+    /// No verifier is constructed yet (startup race); fail closed.
+    VerifierUnavailable,
+    /// The verifier rejected the token.
+    Verifier(VerifierError),
+}
+
+impl AssertionRejection {
+    /// The public denial class for this rejection.
+    pub(crate) const fn denial_class(self) -> DenialClass {
+        match self {
+            Self::Transport(class) => class,
+            Self::VerifierUnavailable => DenialClass::AuthorizationUnavailable,
+            Self::Verifier(err) => err.denial_class(),
+        }
+    }
+}
+
+/// Extract and verify the attached assertion.
+///
+/// Transport extraction runs before the verifier-presence check, so a
+/// malformed header is `evidence_rejected` even while no verifier exists.
+pub(crate) fn evaluate_attached_assertion(
+    headers: &HeaderMap,
+    verifier: Option<&dyn VerifyAssertion>,
+) -> Result<VerifiedAssertion, AssertionRejection> {
+    let token = extract_bearer_token(headers).map_err(AssertionRejection::Transport)?;
+    let verifier = verifier.ok_or(AssertionRejection::VerifierUnavailable)?;
+    verifier
+        .verify_assertion(token)
+        .map_err(AssertionRejection::Verifier)
+}
+
+/// The assertion's `nostr_pubkey` claim equals the key the client proved.
+/// A claimless assertion never matches. [FI-INV-05]
+pub(crate) fn asserted_key_matches(
+    assertion: &VerifiedAssertion,
+    proven_pubkey: nostr::PublicKey,
+) -> bool {
+    assertion.asserted_key() == Some(proven_pubkey)
+}
+
+// ── Transport extraction ──────────────────────────────────────────────────────
+
+/// Extract the single `Bearer <token>` from the `Nostr-Federated-Identity`
+/// header.
+///
+/// Rejects all forms the spec prohibits:
+/// - Absent → `MissingEvidence`
+/// - Repeated (multiple header values) → `EvidenceRejected`
+/// - Comma-combined (`,` in a single value) → `EvidenceRejected`
+/// - Empty after `Bearer ` stripping → `EvidenceRejected`
+/// - Non-`Bearer ` prefix → `EvidenceRejected`
+/// - Whitespace in the token (after scheme) → `EvidenceRejected`
+///
+/// [FI-TRACE-TRANSPORT-CLOSED]
+pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Result<&str, DenialClass> {
+    let mut values = headers.get_all(CLIENT_ATTACHED_HEADER).iter();
+    let first = match values.next() {
+        Some(v) => v,
+        None => return Err(DenialClass::MissingEvidence),
+    };
+    // Repeated header fields deny. [FI-TRACE-TRANSPORT-CLOSED]
+    if values.next().is_some() {
+        return Err(DenialClass::EvidenceRejected);
+    }
+    let raw = first.to_str().map_err(|_| DenialClass::EvidenceRejected)?;
+    // Comma-combined values deny.
+    if raw.contains(',') {
+        return Err(DenialClass::EvidenceRejected);
+    }
+    let token = raw
+        .strip_prefix("Bearer ")
+        .ok_or(DenialClass::EvidenceRejected)?;
+    // Empty or whitespace-containing token denies.
+    if token.is_empty() || token.contains(ascii_whitespace) {
+        return Err(DenialClass::EvidenceRejected);
+    }
+    Ok(token)
+}
+
+fn ascii_whitespace(c: char) -> bool {
+    c.is_ascii_whitespace()
+}
+
+// ── HTTP denial response ──────────────────────────────────────────────────────
+
+/// Build the exact HTTP denial response for the given class.
+///
+/// The response contract is fixed by NIP-FI.md rejection table:
+/// - Status, Content-Type, WWW-Authenticate (for 401), and body bytes are the
+///   closed contract.  No other fields are added that depend on the private
+///   condition. [FI-TRACE-DENIAL-ORACLE]
+pub(crate) fn http_denial(class: DenialClass) -> Response<Body> {
+    let mut builder = Response::builder()
+        .status(StatusCode::from_u16(class.http_status()).expect("valid status"))
+        .header("Content-Type", class.content_type());
+    if let Some(challenge) = class.www_authenticate() {
+        builder = builder.header("WWW-Authenticate", challenge);
+    }
+    builder
+        .body(Body::from(class.http_body()))
+        .expect("valid denial response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    struct FixedVerifier(Result<Option<nostr::PublicKey>, VerifierError>);
+    impl VerifyAssertion for FixedVerifier {
+        fn verify_assertion(&self, _token: &str) -> Result<VerifiedAssertion, VerifierError> {
+            self.0.map(|key| {
+                VerifiedAssertion::for_test(
+                    key,
+                    vec![chrono::Utc::now() + chrono::Duration::hours(1)],
+                )
+            })
+        }
+    }
+
+    fn headers(value: &'static str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(CLIENT_ATTACHED_HEADER, HeaderValue::from_static(value));
+        h
+    }
+
+    #[test]
+    fn missing_header_is_transport_missing_evidence() {
+        let v = FixedVerifier(Ok(None));
+        assert_eq!(
+            evaluate_attached_assertion(&HeaderMap::new(), Some(&v)).unwrap_err(),
+            AssertionRejection::Transport(DenialClass::MissingEvidence)
+        );
+    }
+
+    #[test]
+    fn transport_rejection_precedes_missing_verifier() {
+        let err = evaluate_attached_assertion(&headers("junk"), None).unwrap_err();
+        assert_eq!(
+            err,
+            AssertionRejection::Transport(DenialClass::EvidenceRejected)
+        );
+    }
+
+    #[test]
+    fn missing_verifier_is_authorization_unavailable() {
+        let err = evaluate_attached_assertion(&headers("Bearer a.b.c"), None).unwrap_err();
+        assert_eq!(err, AssertionRejection::VerifierUnavailable);
+        assert_eq!(err.denial_class(), DenialClass::AuthorizationUnavailable);
+    }
+
+    #[test]
+    fn verifier_error_keeps_its_denial_class() {
+        for err in [
+            VerifierError::KeySourceUnavailable,
+            VerifierError::InvalidSignatureOrClaims,
+        ] {
+            let v = FixedVerifier(Err(err));
+            let rejection =
+                evaluate_attached_assertion(&headers("Bearer a.b.c"), Some(&v)).unwrap_err();
+            assert_eq!(rejection, AssertionRejection::Verifier(err));
+            assert_eq!(rejection.denial_class(), err.denial_class());
+        }
+    }
+
+    #[test]
+    fn asserted_key_matches_only_the_proven_key() {
+        let proven = nostr::Keys::generate().public_key();
+        let other = nostr::Keys::generate().public_key();
+        let at = |k| {
+            VerifiedAssertion::for_test(k, vec![chrono::Utc::now() + chrono::Duration::hours(1)])
+        };
+        assert!(asserted_key_matches(&at(Some(proven)), proven));
+        assert!(!asserted_key_matches(&at(Some(other)), proven));
+        assert!(!asserted_key_matches(&at(None), proven));
+    }
+}

@@ -85,7 +85,7 @@ pub(crate) async fn enforce_nip_fi_key_pairing(
     };
 
     // Matching key → pass.
-    if matches!(assertion.asserted_key(), Some(k) if k == proven_pubkey) {
+    if crate::nip_fi_core::asserted_key_matches(assertion, proven_pubkey) {
         return PairingOutcome::Paired;
     }
 

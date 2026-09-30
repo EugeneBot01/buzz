@@ -63,6 +63,10 @@ use chrono::{DateTime, Utc};
 use nostr::PublicKey;
 use std::fmt;
 
+use crate::nip_fi_core::{
+    asserted_key_matches, evaluate_attached_assertion, http_denial, AssertionRejection,
+};
+
 // ── Deny-map seam ─────────────────────────────────────────────────────────────
 
 /// Narrow interface consumed by HTTP enforcement.  Production implements it
@@ -343,37 +347,29 @@ where
 
     // Steps 4–8 — Enforce mode.
 
-    // Step 4: extract the assertion token.
-    let token = extract_bearer_token(headers).map_err(http_denial)?;
-
-    // Step 5: cryptographic verification (signature, issuer, expiry, claims).
-    let verifier = verifier.ok_or_else(|| {
-        // Verifier not yet constructed (startup race); fail closed.
-        http_denial(DenialClass::AuthorizationUnavailable)
-    })?;
-    let assertion = verifier.verify_assertion(token).map_err(|e| {
-        tracing::debug!(code = e.code(), "nip-fi assertion denied at http ingress");
-        http_denial(e.denial_class())
+    // Steps 4–5: extract and verify the assertion.
+    let assertion = evaluate_attached_assertion(headers, verifier).map_err(|rejection| {
+        if let AssertionRejection::Verifier(e) = rejection {
+            tracing::debug!(code = e.code(), "nip-fi assertion denied at http ingress");
+        }
+        http_denial(rejection.denial_class())
     })?;
 
     // Step 6: key pairing — assertion.asserted_key MUST equal proven NIP-98 key.
     // A claimless assertion (no nostr_pubkey) is also a denial.  [FI-INV-05]
-    match assertion.asserted_key() {
-        Some(k) if k == proven_pubkey => {}
-        _ => {
-            metrics::counter!(
-                "buzz_auth_failures_total",
-                "reason" => "nip_fi_http_key_mismatch"
-            )
-            .increment(1);
-            tracing::debug!(
-                proven = %proven_pubkey.to_hex(),
-                "NIP-FI HTTP key pairing mismatch"
-            );
-            // Key mismatch is a private-state denial: authorization_denied (403).
-            // [FI-TRACE-DENIAL-ORACLE]
-            return Err(http_denial(DenialClass::AuthorizationDenied));
-        }
+    if !asserted_key_matches(&assertion, proven_pubkey) {
+        metrics::counter!(
+            "buzz_auth_failures_total",
+            "reason" => "nip_fi_http_key_mismatch"
+        )
+        .increment(1);
+        tracing::debug!(
+            proven = %proven_pubkey.to_hex(),
+            "NIP-FI HTTP key pairing mismatch"
+        );
+        // Key mismatch is a private-state denial: authorization_denied (403).
+        // [FI-TRACE-DENIAL-ORACLE]
+        return Err(http_denial(DenialClass::AuthorizationDenied));
     }
 
     // Step 7: deny-map check — (iss, pubkey) must not be in an active deny window.
@@ -395,69 +391,6 @@ where
         assertion: Some(assertion),
         extra,
     })
-}
-
-// ── Transport extraction ──────────────────────────────────────────────────────
-
-/// Extract the single `Bearer <token>` from the `Nostr-Federated-Identity`
-/// header.
-///
-/// Rejects all forms the spec prohibits:
-/// - Absent → `MissingEvidence`
-/// - Repeated (multiple header values) → `EvidenceRejected`
-/// - Comma-combined (`,` in a single value) → `EvidenceRejected`
-/// - Empty after `Bearer ` stripping → `EvidenceRejected`
-/// - Non-`Bearer ` prefix → `EvidenceRejected`
-/// - Whitespace in the token (after scheme) → `EvidenceRejected`
-///
-/// [FI-TRACE-TRANSPORT-CLOSED]
-pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Result<&str, DenialClass> {
-    let mut values = headers.get_all(CLIENT_ATTACHED_HEADER).iter();
-    let first = match values.next() {
-        Some(v) => v,
-        None => return Err(DenialClass::MissingEvidence),
-    };
-    // Repeated header fields deny. [FI-TRACE-TRANSPORT-CLOSED]
-    if values.next().is_some() {
-        return Err(DenialClass::EvidenceRejected);
-    }
-    let raw = first.to_str().map_err(|_| DenialClass::EvidenceRejected)?;
-    // Comma-combined values deny.
-    if raw.contains(',') {
-        return Err(DenialClass::EvidenceRejected);
-    }
-    let token = raw
-        .strip_prefix("Bearer ")
-        .ok_or(DenialClass::EvidenceRejected)?;
-    // Empty or whitespace-containing token denies.
-    if token.is_empty() || token.contains(ascii_whitespace) {
-        return Err(DenialClass::EvidenceRejected);
-    }
-    Ok(token)
-}
-
-fn ascii_whitespace(c: char) -> bool {
-    c.is_ascii_whitespace()
-}
-
-// ── HTTP denial response ──────────────────────────────────────────────────────
-
-/// Build the exact HTTP denial response for the given class.
-///
-/// The response contract is fixed by NIP-FI.md rejection table:
-/// - Status, Content-Type, WWW-Authenticate (for 401), and body bytes are the
-///   closed contract.  No other fields are added that depend on the private
-///   condition. [FI-TRACE-DENIAL-ORACLE]
-pub(crate) fn http_denial(class: DenialClass) -> Response<Body> {
-    let mut builder = Response::builder()
-        .status(StatusCode::from_u16(class.http_status()).expect("valid status"))
-        .header("Content-Type", class.content_type());
-    if let Some(challenge) = class.www_authenticate() {
-        builder = builder.header("WWW-Authenticate", challenge);
-    }
-    builder
-        .body(Body::from(class.http_body()))
-        .expect("valid denial response")
 }
 
 // ── State-convenience wrapper ─────────────────────────────────────────────────
@@ -500,6 +433,7 @@ mod tests {
     // throughout this module — it IS the HTTP response returned from tests.
     #![allow(clippy::result_large_err)]
     use super::*;
+    use crate::nip_fi_core::extract_bearer_token;
 
     /// Test fixture: a deny map with no entries.
     struct AlwaysAdmitStubDenyMap;

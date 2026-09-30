@@ -24,7 +24,7 @@ use crate::audio;
 use crate::connection::handle_connection;
 use crate::metrics::track_metrics;
 use crate::nip11::{nip11_document, relay_info_handler};
-use crate::nip_fi_http::http_denial;
+use crate::nip_fi_core::http_denial;
 use crate::readiness::{self, DependencySnapshot, ReadinessReason};
 use crate::state::AppState;
 
@@ -177,7 +177,6 @@ async fn nip_fi_assertion_guard(
     request: Request<Body>,
     next: middleware::Next,
 ) -> axum::response::Response {
-    use crate::nip_fi_http::extract_bearer_token;
     use buzz_auth::NipFiMode;
 
     // Off mode: fully transparent. [FI-INV-15]
@@ -234,31 +233,18 @@ async fn nip_fi_assertion_guard(
         return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
     }
 
-    // Enforce mode: full offline assertion verification.
-    //
-    // Step 1 — transport: extract the Bearer token.  Rejects absent, junk,
-    // repeated, comma-combined, empty, and whitespace-containing values.
-    // [FI-TRACE-TRANSPORT-CLOSED]
-    let token = match extract_bearer_token(request.headers()) {
-        Ok(t) => t,
-        Err(class) => return http_denial(class),
-    };
-
-    // Step 2 — cryptographic: verify signature, issuer, expiry, and claims.
-    // A forgotten-gate handler that omits `admit_nip_fi_http_on_state` can
-    // only be reached with a cryptographically valid assertion.  Key pairing
-    // and deny-map are performed by `admit_nip_fi_http_on_state` in the
-    // handler, not here.  [FI-TRACE-AUTHORITY-UNIFORM]
-    let verifier = match state.nip_fi_verifier.as_deref() {
-        Some(v) => v,
-        None => {
-            // Verifier not yet constructed (startup race); fail closed.
-            return http_denial(buzz_auth::DenialClass::AuthorizationUnavailable);
-        }
-    };
-    match verifier.verify_assertion(token) {
+    // Enforce mode: full offline assertion verification (transport, then
+    // signature, issuer, expiry and claims).  A forgotten-gate handler that
+    // omits `admit_nip_fi_http_on_state` can only be reached with a
+    // cryptographically valid assertion.  Key pairing and deny-map are
+    // performed by `admit_nip_fi_http_on_state` in the handler, not here.
+    // [FI-TRACE-TRANSPORT-CLOSED] [FI-TRACE-AUTHORITY-UNIFORM]
+    match crate::nip_fi_core::evaluate_attached_assertion(
+        request.headers(),
+        state.nip_fi_verifier.as_deref(),
+    ) {
         Ok(_) => next.run(request).await,
-        Err(e) => http_denial(e.denial_class()),
+        Err(rejection) => http_denial(rejection.denial_class()),
     }
 }
 
@@ -3176,7 +3162,7 @@ mod tests {
     // 403 into 401 (handler's NIP-98 auth fires instead).
     #[test]
     fn guard_rejects_junk_assertion_not_just_absent_header() {
-        use crate::nip_fi_http::extract_bearer_token;
+        use crate::nip_fi_core::extract_bearer_token;
         use axum::http::HeaderMap;
         use buzz_auth::CLIENT_ATTACHED_HEADER;
 

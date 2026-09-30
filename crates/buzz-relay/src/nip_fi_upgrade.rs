@@ -1,7 +1,8 @@
 //! NIP-FI assertion validation at WebSocket upgrade.
 //!
-//! Header parsing and the HTTP denial contract are shared with HTTP ingress:
-//! both come from [`crate::nip_fi_http`], so the transports cannot drift.
+//! Assertion evaluation and the HTTP denial contract are shared with HTTP
+//! ingress: both come from [`crate::nip_fi_core`], so the transports cannot
+//! drift.
 //!
 //! Per [NIP-FI.md](../../../docs/nips/NIP-FI.md) §Client-attached transport:
 //! - Exactly one `Nostr-Federated-Identity: Bearer <compact-JWS>` field.
@@ -14,7 +15,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Response};
 use buzz_auth::{DenialClass, NipFiMode, VerifiedAssertion, VerifyAssertion};
 
-use crate::nip_fi_http::{extract_bearer_token, http_denial};
+use crate::nip_fi_core::{evaluate_attached_assertion, http_denial, AssertionRejection};
 
 /// Outcome of NIP-FI assertion validation at upgrade time.
 pub(crate) enum NipFiUpgradeOutcome {
@@ -54,24 +55,13 @@ pub(crate) fn check_nip_fi_at_upgrade(
     }
 
     // Enforce mode: validate the assertion.
-    let token = match extract_bearer_token(headers) {
-        Ok(t) => t,
-        Err(class) => return NipFiUpgradeOutcome::Denied(http_denial(class)),
-    };
-
-    let verifier = match verifier {
-        Some(v) => v,
-        None => {
-            // Verifier not yet constructed (startup race); fail closed.
-            return NipFiUpgradeOutcome::Denied(http_denial(DenialClass::AuthorizationUnavailable));
-        }
-    };
-
-    match verifier.verify_assertion(token) {
+    match evaluate_attached_assertion(headers, verifier) {
         Ok(assertion) => NipFiUpgradeOutcome::Admitted(assertion),
-        Err(err) => {
-            tracing::debug!(code = err.code(), "nip-fi assertion denied at upgrade");
-            NipFiUpgradeOutcome::Denied(http_denial(err.denial_class()))
+        Err(rejection) => {
+            if let AssertionRejection::Verifier(err) = rejection {
+                tracing::debug!(code = err.code(), "nip-fi assertion denied at upgrade");
+            }
+            NipFiUpgradeOutcome::Denied(http_denial(rejection.denial_class()))
         }
     }
 }
@@ -79,6 +69,7 @@ pub(crate) fn check_nip_fi_at_upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nip_fi_core::extract_bearer_token;
     use axum::http::{HeaderValue, StatusCode};
     use buzz_auth::CLIENT_ATTACHED_HEADER;
 
