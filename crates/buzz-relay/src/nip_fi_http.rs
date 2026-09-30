@@ -54,11 +54,9 @@
 
 use axum::{
     body::Body,
-    http::{HeaderMap, Response, StatusCode},
+    http::{HeaderMap, Response},
 };
-use buzz_auth::{
-    DenialClass, NipFiMode, VerifiedAssertion, VerifyAssertion, CLIENT_ATTACHED_HEADER,
-};
+use buzz_auth::{DenialClass, NipFiMode, VerifiedAssertion, VerifyAssertion};
 use chrono::{DateTime, Utc};
 use nostr::PublicKey;
 use std::fmt;
@@ -434,6 +432,8 @@ mod tests {
     #![allow(clippy::result_large_err)]
     use super::*;
     use crate::nip_fi_core::extract_bearer_token;
+    use axum::http::StatusCode;
+    use buzz_auth::CLIENT_ATTACHED_HEADER;
 
     /// Test fixture: a deny map with no entries.
     struct AlwaysAdmitStubDenyMap;

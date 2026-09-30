@@ -88,7 +88,7 @@ use crate::state::AppState;
 // middleware.  `admit_nip_fi_http_on_state` performs the full sequence.
 //
 // [FI-TRACE-AUTHORITY-UNIFORM] Both the guard and `admit_nip_fi_http_on_state`
-// delegate to `nip_fi_http.rs`; the guard fires first.
+// evaluate the assertion through `nip_fi_core.rs`; the guard fires first.
 
 /// Path prefixes that are exempt from NIP-FI assertion enforcement.
 ///
@@ -2586,6 +2586,161 @@ mod tests {
             assert!(
                 body.get("supported_nips").is_some(),
                 "F6: response body must be NIP-11 JSON with `supported_nips` field; got {body}"
+            );
+        }
+
+        /// Verifier whose first call admits `key` and whose second call
+        /// returns `second`. Counts every call.
+        struct TwoStepVerifier {
+            key: nostr::PublicKey,
+            second: Result<(), buzz_auth::VerifierError>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl buzz_auth::VerifyAssertion for TwoStepVerifier {
+            fn verify_assertion(
+                &self,
+                _token: &str,
+            ) -> Result<buzz_auth::VerifiedAssertion, buzz_auth::VerifierError> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n >= 1 {
+                    self.second?;
+                }
+                Ok(buzz_auth::VerifiedAssertion::for_test(
+                    Some(self.key),
+                    vec![chrono::Utc::now() + chrono::Duration::hours(1)],
+                ))
+            }
+        }
+
+        /// Send a NIP-98-signed, assertion-carrying GET for a workflow's runs
+        /// through the real router on a seeded Host. Returns the response and
+        /// the verifier call count.
+        async fn routed_workflow_runs(
+            second: Result<(), buzz_auth::VerifierError>,
+        ) -> (axum::http::StatusCode, Vec<u8>, usize) {
+            use axum::body::Body;
+            use axum::http::Request;
+            use base64::Engine as _;
+            use tower::ServiceExt;
+            use uuid::Uuid;
+
+            let base = real_db_state()
+                .await
+                .expect("PostgreSQL must be available — set BUZZ_TEST_DATABASE_URL");
+            let pool = base.db.pool().clone();
+            let community_id = Uuid::new_v4();
+            let host = format!("reverify-{}.example", community_id.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community_id)
+                .bind(&host)
+                .execute(&pool)
+                .await
+                .expect("seed community");
+
+            let keys = nostr::Keys::generate();
+            let verifier = Arc::new(TwoStepVerifier {
+                key: keys.public_key(),
+                second,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let mut state = (*base).clone();
+            let mut config = (*state.config).clone();
+            config.nip_fi.mode = buzz_auth::NipFiMode::Enforce;
+            state.config = Arc::new(config);
+            state.nip_fi_verifier = Some(verifier.clone());
+
+            let path = format!("/workflows/{}/runs", Uuid::new_v4());
+            let scheme = if state.config.relay_url.trim_start().starts_with("wss://") {
+                "https"
+            } else {
+                "http"
+            };
+            let url = format!("{scheme}://{host}{path}");
+            let event = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
+                .tags([
+                    nostr::Tag::parse(["u", url.as_str()]).expect("u tag"),
+                    nostr::Tag::parse(["method", "GET"]).expect("method tag"),
+                ])
+                .sign_with_keys(&keys)
+                .expect("sign NIP-98");
+            let auth = format!(
+                "Nostr {}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(serde_json::to_vec(&event).expect("event json"))
+            );
+
+            let req = Request::get(&path)
+                .header(axum::http::header::HOST, &host)
+                .header(axum::http::header::AUTHORIZATION, auth)
+                .header("Nostr-Federated-Identity", "Bearer a.b.c")
+                .body(Body::empty())
+                .expect("request");
+            let resp = build_router(Arc::new(state))
+                .oneshot(req)
+                .await
+                .expect("router response");
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("body")
+                .to_vec();
+            let calls = verifier.calls.load(std::sync::atomic::Ordering::SeqCst);
+            (status, body, calls)
+        }
+
+        // Pins guard + handler double verification on one routed request: the
+        // guard's verify succeeds, handler admission re-verifies and its
+        // failure decides the response.
+        // Mutation: reusing the guard's verdict in admission (skipping the
+        // second verify) admits the request and the count is 1.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn characterize_routed_request_reverifies_in_admission() {
+            use buzz_auth::VerifierError;
+            let rows = [
+                (
+                    VerifierError::Expired,
+                    axum::http::StatusCode::FORBIDDEN,
+                    &b"evidence rejected\n"[..],
+                ),
+                (
+                    VerifierError::KeySourceUnavailable,
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    &b"authorization unavailable\n"[..],
+                ),
+            ];
+            for (err, status, body) in rows {
+                let (got_status, got_body, calls) = routed_workflow_runs(Err(err)).await;
+                assert_eq!(calls, 2, "guard and admission each verify once: {err:?}");
+                assert_eq!(got_status, status, "{err:?}");
+                assert_eq!(got_body, body, "{err:?}");
+            }
+        }
+
+        // Control: both verifies succeed, so the request passes NIP-FI
+        // admission with two verifies and is answered by a post-admission
+        // step (the handler's rate-limit/replay/workflow checks, whose exact
+        // result depends on Redis availability), never a NIP-FI denial body.
+        #[tokio::test]
+        #[ignore = "requires Postgres — runs in postgres-ci nextest lane"]
+        async fn characterize_routed_request_passes_after_two_verifies() {
+            let (status, body, calls) = routed_workflow_runs(Ok(())).await;
+            assert_eq!(calls, 2);
+            let nip_fi_bodies: [&[u8]; 4] = [
+                b"authentication required\n",
+                b"evidence rejected\n",
+                b"authorization denied\n",
+                b"authorization unavailable\n",
+            ];
+            assert!(
+                !nip_fi_bodies.contains(&body.as_slice()),
+                "request must pass NIP-FI admission; got {status} {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(
+                serde_json::from_slice::<serde_json::Value>(&body).is_ok(),
+                "post-admission handler responses are JSON; got {status} {}",
+                String::from_utf8_lossy(&body)
             );
         }
     }
