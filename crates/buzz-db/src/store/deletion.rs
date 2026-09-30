@@ -332,6 +332,8 @@ pub enum OwnerDeletionAdmission {
     NotArchived,
     /// The community is already quiescing, fenced, or deleted.
     LifecycleConflict,
+    /// The asserted community UUID does not match the host's community.
+    CommunityIdMismatch,
     /// The request UUID targets different intent, or another active request exists.
     RequestConflict,
     /// The owner acknowledgement contract is not supported.
@@ -871,6 +873,27 @@ impl DeletionStore {
         acknowledgement_version: i32,
         request_id: Uuid,
     ) -> Result<OwnerDeletionAdmission> {
+        self.admit_owner_request_with_community_id(
+            normalized_community_host,
+            owner_pubkey,
+            mediating_operator_pubkey,
+            acknowledgement_version,
+            request_id,
+            None,
+        )
+        .await
+    }
+
+    /// Admit owner intent, rejecting an optional community UUID that does not belong to the host.
+    pub async fn admit_owner_request_with_community_id(
+        &self,
+        normalized_community_host: &str,
+        owner_pubkey: &str,
+        mediating_operator_pubkey: &str,
+        acknowledgement_version: i32,
+        request_id: Uuid,
+        expected_community_id: Option<Uuid>,
+    ) -> Result<OwnerDeletionAdmission> {
         if acknowledgement_version != OWNER_DELETION_ACKNOWLEDGEMENT_VERSION {
             return Ok(OwnerDeletionAdmission::UnsupportedAcknowledgementVersion);
         }
@@ -891,6 +914,10 @@ impl DeletionStore {
             .await?
         {
             let existing = row_to_request(row)?;
+            if expected_community_id.is_some_and(|id| id != *existing.community_id.as_uuid()) {
+                tx.rollback().await?;
+                return Ok(OwnerDeletionAdmission::CommunityIdMismatch);
+            }
             let converges = existing.community_host == normalized_community_host
                 && existing.request_origin == DeletionRequestOrigin::Owner
                 && existing.owner_pubkey.as_deref() == Some(owner_pubkey.as_str())
@@ -915,6 +942,10 @@ impl DeletionStore {
             return Ok(OwnerDeletionAdmission::NotFoundOrNotOwner);
         };
         let community_id: Uuid = target.try_get("id")?;
+        if expected_community_id.is_some_and(|id| id != community_id) {
+            tx.rollback().await?;
+            return Ok(OwnerDeletionAdmission::CommunityIdMismatch);
+        }
         let canonical_host: String = target.try_get("host")?;
         let deletion_state: String = target.try_get("deletion_state")?;
         let deleted_at: Option<DateTime<Utc>> = target.try_get("deleted_at")?;

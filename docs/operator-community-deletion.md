@@ -163,6 +163,11 @@ new work. Clients recover an ambiguous submission by resending it. The same
 UUID used for any other request returns `409 deletion_request_conflict`: a
 different host, owner, or stored acknowledgement version, or a UUID held by an
 operator-origin request.
+The optional `community_id` UUID binds the request to the community resolved
+from `host` without changing the host-derived authority. A different UUID
+returns `409 community_id_mismatch` before admission or on replay, with no
+mutation. A malformed UUID returns `400 invalid_request`; omitting the field
+preserves existing clients.
 An unsupported acknowledgement version is the exception: it is rejected before
 the UUID lookup with `400 unsupported_acknowledgement_version`, even for a
 known UUID.
