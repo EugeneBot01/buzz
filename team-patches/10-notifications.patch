@@ -1,0 +1,1128 @@
+diff --git a/desktop/src-tauri/src/macos_notifications.rs b/desktop/src-tauri/src/macos_notifications.rs
+index dde4ae1d..dfe5183b 100644
+--- a/desktop/src-tauri/src/macos_notifications.rs
++++ b/desktop/src-tauri/src/macos_notifications.rs
+@@ -79,9 +79,12 @@ define_class!(
+             _notification: &objc2_user_notifications::UNNotification,
+             completion_handler: &Block<dyn Fn(UNNotificationPresentationOptions)>,
+         ) {
+-            // Preserve the prior macOS behavior: keep foreground notifications
+-            // in Notification Center without interrupting the user with a banner.
+-            completion_handler.call((UNNotificationPresentationOptions::List,));
++            // The frontend already suppresses alerts for the channel being
++            // viewed, so anything that reaches here should be visible even
++            // while Buzz is frontmost (another channel open, window behind).
++            completion_handler
++                .call((UNNotificationPresentationOptions::Banner
++                    | UNNotificationPresentationOptions::List,));
+         }
+ 
+         #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
+diff --git a/desktop/src/app/AppShell.tsx b/desktop/src/app/AppShell.tsx
+index b4c20390..82b51683 100644
+--- a/desktop/src/app/AppShell.tsx
++++ b/desktop/src/app/AppShell.tsx
+@@ -244,6 +244,10 @@ export function AppShell() {
+   );
+   const refetchHomeFeedFromLiveSignal = React.useEffectEvent(() => {
+     void homeFeedQuery.refetch();
++    // Home-feed polling pauses while the app is unfocused, so this live
++    // signal is the only trigger for mention cards in the background. Retry
++    // once in case the feed query raced the relay's indexing of the event.
++    window.setTimeout(() => void homeFeedQuery.refetch(), 3_000);
+   });
+   useLiveHomeFeedActions(
+     identityQuery.data?.pubkey,
+@@ -352,6 +356,7 @@ export function AppShell() {
+     handleDmNotification,
+     handleThreadReplyDesktopNotification,
+   } = useAppShellDesktopNotifications({
++    activeChannelId: activeChannel?.id ?? null,
+     channels,
+     enabled: !isHuddleRoom,
+     goChannel,
+diff --git a/desktop/src/app/useAppShellDesktopNotifications.ts b/desktop/src/app/useAppShellDesktopNotifications.ts
+index b86b9536..bdf14d0f 100644
+--- a/desktop/src/app/useAppShellDesktopNotifications.ts
++++ b/desktop/src/app/useAppShellDesktopNotifications.ts
+@@ -5,7 +5,10 @@ import {
+   createDesktopNotificationActivationQueue,
+   shouldBounceForChannelNotification,
+ } from "@/app/AppShell.helpers";
++import { MISSED_MESSAGE_ALERT_WINDOW_SECONDS } from "@/features/channels/useLiveChannelUpdates";
+ import { useCommunityJoinAlerts } from "@/features/community-members/useCommunityJoinAlerts";
++import { useChannelAllMessageAlerts } from "@/features/notifications/lib/channelAllMessageAlerts";
++import { useInactiveCommunityNotifications } from "@/features/notifications/lib/inactiveCommunityAlerts";
+ import { hasMentionForEvent } from "@/features/notifications/lib/shouldNotify";
+ import type { NotificationSettings } from "@/features/notifications/hooks";
+ import {
+@@ -25,6 +28,7 @@ import { useNotificationSenderName } from "@/features/notifications/useNotificat
+ import type { Channel, RelayEvent } from "@/shared/api/types";
+ 
+ export function useAppShellDesktopNotifications({
++  activeChannelId,
+   channels,
+   enabled,
+   goChannel,
+@@ -34,6 +38,7 @@ export function useAppShellDesktopNotifications({
+   pubkey,
+   silentChannelIds,
+ }: {
++  activeChannelId?: string | null;
+   channels: Channel[];
+   enabled: boolean;
+   goChannel: (
+@@ -57,12 +62,66 @@ export function useAppShellDesktopNotifications({
+   });
+ 
+   const resolveSenderName = useNotificationSenderName();
++  const allMessageChannelIds = useChannelAllMessageAlerts(pubkey);
++  useInactiveCommunityNotifications({
++    allMessageChannelIds,
++    enabled,
++    notificationSettings,
++    pubkey,
++  });
++
++  // Channels opted into "All messages" get a DM-style card for every new
++  // top-level post. Mentions stay on the home-feed path and DMs on their own
++  // path, so neither can double-notify from here.
++  const sendChannelMessageNotification = (
++    channelId: string,
++    event: RelayEvent,
++  ): boolean => {
++    if (!allMessageChannelIds.has(channelId)) return false;
++    if (!notificationSettings.slotAlertsEnabled.channel_message) return false;
++    const channel = channels.find((c) => c.id === channelId);
++    if (!channel || channel.channelType === "dm") return false;
++    if (
++      channelId === activeChannelId &&
++      !notificationSettings.notifyWhileViewing
++    )
++      return false;
++    const normalizedPubkey = pubkey?.trim().toLowerCase() ?? "";
++    if (hasMentionForEvent(event, normalizedPubkey)) return false;
++    const nowSeconds = Math.floor(Date.now() / 1_000);
++    if (event.created_at < nowSeconds - MISSED_MESSAGE_ALERT_WINDOW_SECONDS)
++      return false;
++
++    const channelName = channel.name?.trim() || null;
++    const { title, body } = formatMessageNotification({
++      source: "channel_message",
++      senderName: resolveSenderName(event.pubkey),
++      channelName,
++      content: event.content,
++    });
++    void sendDesktopNotification({
++      title,
++      body,
++      target: buildEventNotificationTarget(event, {
++        id: channelId,
++        name: channelName,
++      }),
++    }).then((didSend) => {
++      if (didSend && shouldPlayNotificationSound(channelId, silentChannelIds)) {
++        playNotificationSound(
++          resolveSlotSound(notificationSettings, "channel_message"),
++        );
++      }
++    });
++    return true;
++  };
+ 
+   const handleChannelNotification = React.useEffectEvent(
+-    (_channelId: string, event: RelayEvent) => {
++    (channelId: string, event: RelayEvent) => {
+       if (!enabled) return;
+       if (!shouldBounceForChannelNotification(event.tags)) return;
+       if (!notificationSettings.desktopEnabled) return;
++      sendChannelMessageNotification(channelId, event);
+       void requestDockBounce();
+     },
+   );
+diff --git a/desktop/src/features/channels/useLiveChannelUpdates.ts b/desktop/src/features/channels/useLiveChannelUpdates.ts
+index 3bb9fe39..d869fa0a 100644
+--- a/desktop/src/features/channels/useLiveChannelUpdates.ts
++++ b/desktop/src/features/channels/useLiveChannelUpdates.ts
+@@ -128,6 +128,16 @@ function retireLiveChannel(entry: LiveChannelEntry) {
+ 
+ const SEEN_NOTIFICATION_EVENT_LIMIT = 5_000;
+ 
++// Reconnect replay (sleep/wake, network blips) backfills messages missed while
++// disconnected. Still alert for recent ones; older backlog stays silent so a
++// long sleep doesn't unleash a flood of cards.
++export const MISSED_MESSAGE_ALERT_WINDOW_SECONDS = 10 * 60;
++
++// A channel that appears after the initial sync (e.g. a brand-new DM whose
++// first message is what created it) is subscribed slightly in the past so the
++// message that caused it to appear is not lost.
++const NEW_CHANNEL_BACKFILL_SECONDS = 120;
++
+ export function trackSeenEvent(
+   seenEventIds: Set<string>,
+   eventId: string,
+@@ -214,7 +224,10 @@ export function useLiveChannelUpdates(
+ 
+       // Suppress backlog events that predate our subscription — these are
+       // historical replays, not live messages.
+-      if (event.created_at < dmSubscriptionStartedAtRef.current) {
++      if (
++        event.created_at <
++        dmSubscriptionStartedAtRef.current - MISSED_MESSAGE_ALERT_WINDOW_SECONDS
++      ) {
+         return;
+       }
+ 
+@@ -381,6 +394,7 @@ export function useLiveChannelUpdates(
+   );
+ 
+   const liveSubsRef = React.useRef(new Map<string, LiveChannelEntry>());
++  const hasInitialChannelSyncRef = React.useRef(false);
+ 
+   React.useEffect(() => {
+     let isCancelled = false;
+@@ -404,6 +418,12 @@ export function useLiveChannelUpdates(
+         dmSubscriptionStartedAtRef.current = Math.floor(Date.now() / 1000);
+       }
+ 
++      const nowSeconds = Math.floor(Date.now() / 1_000);
++      const since = hasInitialChannelSyncRef.current
++        ? nowSeconds - NEW_CHANNEL_BACKFILL_SECONDS
++        : nowSeconds;
++      if (targetIds.size > 0) hasInitialChannelSyncRef.current = true;
++
+       const pending = Array.from(targetIds).map((channelId) => {
+         const existing = activeSubs.get(channelId);
+         if (existing) return existing.pending;
+@@ -419,7 +439,7 @@ export function useLiveChannelUpdates(
+               kinds: [...CHANNEL_EVENT_KINDS],
+               "#h": [channelId],
+               limit: 1000,
+-              since: Math.floor(Date.now() / 1_000),
++              since,
+             },
+             (event) => {
+               if (activeSubs.get(channelId) === entry) {
+diff --git a/desktop/src/features/communities/communityUnreadObserver.ts b/desktop/src/features/communities/communityUnreadObserver.ts
+index e729831e..6cd78e28 100644
+--- a/desktop/src/features/communities/communityUnreadObserver.ts
++++ b/desktop/src/features/communities/communityUnreadObserver.ts
+@@ -73,7 +73,9 @@ function readFollowedRootIds(pubkey: string): Set<string> {
+   }
+ }
+ 
+-function defaultReadThreadRelationships(pubkey: string): ThreadRelationships {
++export function defaultReadThreadRelationships(
++  pubkey: string,
++): ThreadRelationships {
+   return {
+     participatedRootIds: participationStore.read(pubkey),
+     followedRootIds: readFollowedRootIds(pubkey),
+diff --git a/desktop/src/features/notifications/lib/channelAllMessageAlerts.ts b/desktop/src/features/notifications/lib/channelAllMessageAlerts.ts
+new file mode 100644
+index 00000000..172c63d9
+--- /dev/null
++++ b/desktop/src/features/notifications/lib/channelAllMessageAlerts.ts
+@@ -0,0 +1,156 @@
++import * as React from "react";
++
++/**
++ * Discord-style channel notification levels. "Nothing" is the existing
++ * channel mute; this store tracks the remaining two levels: a global default
++ * ("All messages" unless changed) plus explicit per-channel overrides. A
++ * channel whose effective level is "all" raises a notification card for every
++ * new post; "mentions" keeps the default Buzz behavior (only @mentions,
++ * followed thread replies and DMs). Device-local, keyed by pubkey.
++ */
++export type ChannelAlertLevel = "all" | "mentions";
++
++export type ChannelAlertPrefs = {
++  defaultLevel: ChannelAlertLevel;
++  overrides: Readonly<Record<string, ChannelAlertLevel>>;
++};
++
++export type ChannelIdMatcher = { has(channelId: string): boolean };
++
++const STORAGE_KEY = "buzz-channel-alert-levels.v2";
++const DEFAULT_PREFS: ChannelAlertPrefs = { defaultLevel: "all", overrides: {} };
++
++const listeners = new Set<() => void>();
++const cache = new Map<string, ChannelAlertPrefs>();
++
++function storageKey(pubkey: string) {
++  return `${STORAGE_KEY}:${pubkey}`;
++}
++
++function normalize(pubkey: string | undefined) {
++  return pubkey?.trim().toLowerCase() ?? "";
++}
++
++function isLevel(value: unknown): value is ChannelAlertLevel {
++  return value === "all" || value === "mentions";
++}
++
++function read(pubkey: string): ChannelAlertPrefs {
++  const cached = cache.get(pubkey);
++  if (cached) return cached;
++
++  let prefs = DEFAULT_PREFS;
++  try {
++    const raw = window.localStorage.getItem(storageKey(pubkey));
++    const parsed = raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
++    if (parsed && typeof parsed === "object") {
++      const overrides: Record<string, ChannelAlertLevel> = {};
++      const rawOverrides = parsed.overrides;
++      if (rawOverrides && typeof rawOverrides === "object") {
++        for (const [id, level] of Object.entries(rawOverrides)) {
++          if (isLevel(level)) overrides[id] = level;
++        }
++      }
++      prefs = {
++        defaultLevel: isLevel(parsed.defaultLevel)
++          ? parsed.defaultLevel
++          : DEFAULT_PREFS.defaultLevel,
++        overrides,
++      };
++    }
++  } catch {
++    prefs = DEFAULT_PREFS;
++  }
++  cache.set(pubkey, prefs);
++  return prefs;
++}
++
++function write(pubkey: string | undefined, next: ChannelAlertPrefs) {
++  const key = normalize(pubkey);
++  if (!key || typeof window === "undefined") return;
++  cache.set(key, next);
++  try {
++    window.localStorage.setItem(storageKey(key), JSON.stringify(next));
++  } catch {
++    // Best effort — the in-memory prefs still apply for this session.
++  }
++  for (const listener of listeners) listener();
++}
++
++function subscribe(listener: () => void) {
++  listeners.add(listener);
++  const handleStorage = (event: StorageEvent) => {
++    if (event.key?.startsWith(STORAGE_KEY)) {
++      cache.clear();
++      listener();
++    }
++  };
++  window.addEventListener("storage", handleStorage);
++  return () => {
++    listeners.delete(listener);
++    window.removeEventListener("storage", handleStorage);
++  };
++}
++
++export function effectiveChannelAlertLevel(
++  prefs: ChannelAlertPrefs,
++  channelId: string,
++): ChannelAlertLevel {
++  return prefs.overrides[channelId] ?? prefs.defaultLevel;
++}
++
++/** Set (or with `null`, clear back to the global default) one channel's level. */
++export function setChannelAlertOverride(
++  pubkey: string | undefined,
++  channelId: string,
++  level: ChannelAlertLevel | null,
++) {
++  const key = normalize(pubkey);
++  if (!key) return;
++  const current = read(key);
++  const overrides = { ...current.overrides };
++  if (level === null) delete overrides[channelId];
++  else overrides[channelId] = level;
++  write(key, { ...current, overrides });
++}
++
++export function setDefaultChannelAlertLevel(
++  pubkey: string | undefined,
++  defaultLevel: ChannelAlertLevel,
++) {
++  const key = normalize(pubkey);
++  if (!key) return;
++  write(key, { ...read(key), defaultLevel });
++}
++
++/** Drop every per-channel override so all channels follow the global default. */
++export function resetChannelAlertOverrides(pubkey: string | undefined) {
++  const key = normalize(pubkey);
++  if (!key) return;
++  write(key, { ...read(key), overrides: {} });
++}
++
++export function useChannelAlertPrefs(
++  pubkey: string | undefined,
++): ChannelAlertPrefs {
++  const key = normalize(pubkey);
++  return React.useSyncExternalStore(
++    subscribe,
++    () => (key && typeof window !== "undefined" ? read(key) : DEFAULT_PREFS),
++    () => DEFAULT_PREFS,
++  );
++}
++
++/** Channels whose effective level is "All messages". */
++export function useChannelAllMessageAlerts(
++  pubkey: string | undefined,
++): ChannelIdMatcher {
++  const prefs = useChannelAlertPrefs(pubkey);
++  return React.useMemo(
++    () => ({
++      has: (channelId: string) =>
++        effectiveChannelAlertLevel(prefs, channelId) === "all",
++    }),
++    [prefs],
++  );
++}
+diff --git a/desktop/src/features/notifications/lib/inactiveCommunityAlerts.test.mjs b/desktop/src/features/notifications/lib/inactiveCommunityAlerts.test.mjs
+new file mode 100644
+index 00000000..03cf683e
+--- /dev/null
++++ b/desktop/src/features/notifications/lib/inactiveCommunityAlerts.test.mjs
+@@ -0,0 +1,81 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import { classifyInactiveCommunityEvent } from "./inactiveCommunityAlerts.ts";
++
++const ME = "a".repeat(64);
++const OTHER = "b".repeat(64);
++const CHANNEL = "chan-1";
++const EMPTY = new Set();
++const relationships = {
++  participatedRootIds: EMPTY,
++  followedRootIds: EMPTY,
++  authoredRootIds: EMPTY,
++  mutedRootIds: EMPTY,
++};
++
++function event(overrides = {}) {
++  return {
++    id: "e1",
++    pubkey: OTHER,
++    kind: 9,
++    content: "hi",
++    created_at: 1,
++    sig: "",
++    tags: [["h", CHANNEL]],
++    ...overrides,
++  };
++}
++
++function classify(ev, channelType = "stream", opts = {}) {
++  return classifyInactiveCommunityEvent(
++    ev,
++    { name: "general", channelType },
++    ME,
++    {
++      allMessageChannelIds: opts.all ?? EMPTY,
++      mutedChannelIds: opts.muted ?? EMPTY,
++      relationships,
++      channelId: CHANNEL,
++    },
++  );
++}
++
++test("own messages never alert", () => {
++  assert.equal(classify(event({ pubkey: ME }), "dm"), null);
++});
++
++test("DMs alert as dm", () => {
++  assert.equal(classify(event(), "dm")?.slot, "dm");
++});
++
++test("mentions alert even in muted channels", () => {
++  const ev = event({
++    tags: [
++      ["h", CHANNEL],
++      ["p", ME],
++    ],
++  });
++  assert.equal(
++    classify(ev, "stream", { muted: new Set([CHANNEL]) })?.slot,
++    "mention",
++  );
++});
++
++test("plain posts alert only for All-messages channels", () => {
++  assert.equal(classify(event()), null);
++  assert.equal(
++    classify(event(), "stream", { all: new Set([CHANNEL]) })?.slot,
++    "channel_message",
++  );
++});
++
++test("muted channel suppresses All-messages posts", () => {
++  assert.equal(
++    classify(event(), "stream", {
++      all: new Set([CHANNEL]),
++      muted: new Set([CHANNEL]),
++    }),
++    null,
++  );
++});
+diff --git a/desktop/src/features/notifications/lib/inactiveCommunityAlerts.ts b/desktop/src/features/notifications/lib/inactiveCommunityAlerts.ts
+new file mode 100644
+index 00000000..5cc1508d
+--- /dev/null
++++ b/desktop/src/features/notifications/lib/inactiveCommunityAlerts.ts
+@@ -0,0 +1,337 @@
++import * as React from "react";
++
++import type { ChannelIdMatcher } from "@/features/notifications/lib/channelAllMessageAlerts";
++import { DM_NOTIFIABLE_EVENT_KINDS } from "@/features/channels/isDmNotifiableKind";
++import {
++  defaultReadThreadRelationships,
++  fetchObservedChannels,
++} from "@/features/communities/communityUnreadObserver";
++import type { Community } from "@/features/communities/types";
++import { useCommunities } from "@/features/communities/useCommunities";
++import type { NotificationSettings } from "@/features/notifications/hooks";
++import { sendDesktopNotification } from "@/features/notifications/lib/desktop";
++import {
++  formatMessageNotification,
++  type MessageNotificationSource,
++} from "@/features/notifications/lib/notificationFormat";
++import {
++  hasMentionForEvent,
++  shouldNotifyForEvent,
++} from "@/features/notifications/lib/shouldNotify";
++import {
++  playNotificationSound,
++  resolveSlotSound,
++  type SoundSlot,
++} from "@/features/notifications/lib/sound";
++import { isThreadReply } from "@/features/messages/lib/threading";
++import {
++  mutedChannelIdsFromStore,
++  parseMutePayload,
++} from "@/features/sidebar/lib/channelMutesStorage";
++import { withReadOnlyRelayClient } from "@/shared/api/readOnlyRelayClient";
++import { nip44DecryptFromSelf } from "@/shared/api/tauri";
++import type { RelayEvent } from "@/shared/api/types";
++import { KIND_CHANNEL_MUTES } from "@/shared/constants/kinds";
++
++/**
++ * Only the active community holds a live relay subscription; the rest are
++ * polled for the rail's unread dot and never alerted. This poller fills that
++ * gap: every POLL_MS (30s) it asks each inactive community's relay for new messages
++ * and raises the same cards the active community would (DMs, @mentions,
++ * followed thread replies, "All messages" channels).
++ */
++const POLL_MS = 30_000;
++const MAX_EVENT_AGE_SECONDS = 10 * 60;
++const FETCH_LIMIT = 100;
++const KIND_NIP29_GROUP_METADATA = 39000;
++const KIND_PROFILE = 0;
++
++type ChannelInfo = { name: string | null; channelType: string };
++
++export type InactiveAlert = {
++  slot: SoundSlot;
++  source: MessageNotificationSource;
++  event: RelayEvent;
++  channelName: string | null;
++};
++
++export function classifyInactiveCommunityEvent(
++  event: RelayEvent,
++  channel: ChannelInfo,
++  pubkey: string,
++  ctx: {
++    allMessageChannelIds: ChannelIdMatcher;
++    mutedChannelIds: ReadonlySet<string>;
++    relationships: ReturnType<typeof defaultReadThreadRelationships>;
++    channelId: string;
++  },
++): Pick<InactiveAlert, "slot" | "source"> | null {
++  if (event.pubkey.toLowerCase() === pubkey) return null;
++  if (channel.channelType === "dm") return { slot: "dm", source: "dm" };
++  if (hasMentionForEvent(event, pubkey)) {
++    return { slot: "mention", source: "mention" };
++  }
++  if (ctx.mutedChannelIds.has(ctx.channelId)) return null;
++  if (isThreadReply(event.tags)) {
++    const notify = shouldNotifyForEvent(event, pubkey, {
++      ...ctx.relationships,
++      mutedChannelIds: ctx.mutedChannelIds,
++      channelId: ctx.channelId,
++    });
++    return notify ? { slot: "thread_reply", source: "thread_reply" } : null;
++  }
++  if (ctx.allMessageChannelIds.has(ctx.channelId)) {
++    return { slot: "channel_message", source: "channel_message" };
++  }
++  return null;
++}
++
++function channelIdOf(event: RelayEvent): string | null {
++  return event.tags.find((tag) => tag[0] === "h")?.[1] ?? null;
++}
++
++function profileName(event: RelayEvent): string | null {
++  try {
++    const profile = JSON.parse(event.content) as Record<string, unknown>;
++    for (const key of ["display_name", "displayName", "name"]) {
++      const value = profile[key];
++      if (typeof value === "string" && value.trim()) return value.trim();
++    }
++  } catch {
++    // Malformed profile — fall back to neutral copy.
++  }
++  return null;
++}
++
++type CommunityChannelSnapshot = {
++  channels: Awaited<ReturnType<typeof fetchObservedChannels>>;
++  channelNames: Map<string, string>;
++  mutedChannelIds: Set<string>;
++  fetchedAt: number;
++};
++
++// Channel membership, names and mutes change rarely; refetching them on every
++// poll is what makes the poller expensive, so they are cached per community.
++const SNAPSHOT_TTL_MS = 5 * 60_000;
++const snapshots = new Map<string, CommunityChannelSnapshot>();
++
++type RelayFetcher = Parameters<typeof fetchObservedChannels>[0];
++
++async function loadSnapshot(
++  client: RelayFetcher,
++  community: Community,
++  pubkey: string,
++): Promise<CommunityChannelSnapshot> {
++  const cached = snapshots.get(community.id);
++  if (cached && Date.now() - cached.fetchedAt < SNAPSHOT_TTL_MS) return cached;
++
++  const channels = await fetchObservedChannels(client, pubkey);
++  const channelIds = channels.map((channel) => channel.id);
++  const [metadataEvents, mutesEvents] =
++    channelIds.length === 0
++      ? [[], []]
++      : await Promise.all([
++          client.fetchEvents({
++            kinds: [KIND_NIP29_GROUP_METADATA],
++            "#d": channelIds,
++            limit: channelIds.length + 50,
++          }),
++          client.fetchEvents({
++            kinds: [KIND_CHANNEL_MUTES],
++            authors: [pubkey],
++            "#d": ["channel-mutes"],
++            limit: 1,
++          }),
++        ]);
++
++  const channelNames = new Map<string, string>();
++  for (const event of metadataEvents) {
++    const id = event.tags.find((tag) => tag[0] === "d")?.[1];
++    const name = event.tags.find((tag) => tag[0] === "name")?.[1];
++    if (id && name) channelNames.set(id, name);
++  }
++
++  let mutedChannelIds = new Set<string>();
++  if (mutesEvents.length > 0) {
++    try {
++      const store = parseMutePayload(
++        JSON.parse(await nip44DecryptFromSelf(mutesEvents[0].content)),
++      );
++      if (store) mutedChannelIds = mutedChannelIdsFromStore(store);
++    } catch {
++      // Undecryptable mutes → treat as none muted.
++    }
++  }
++
++  const snapshot = {
++    channels,
++    channelNames,
++    mutedChannelIds,
++    fetchedAt: Date.now(),
++  };
++  snapshots.set(community.id, snapshot);
++  return snapshot;
++}
++
++async function collectCommunityAlerts(
++  community: Community,
++  pubkey: string,
++  since: number,
++  allMessageChannelIds: ChannelIdMatcher,
++): Promise<{ alerts: InactiveAlert[]; names: Map<string, string> }> {
++  return withReadOnlyRelayClient(community.relayUrl, async (client) => {
++    const { channels, channelNames, mutedChannelIds } = await loadSnapshot(
++      client,
++      community,
++      pubkey,
++    );
++    if (channels.length === 0) return { alerts: [], names: new Map() };
++
++    const events = await client.fetchEvents({
++      kinds: [...DM_NOTIFIABLE_EVENT_KINDS],
++      "#h": channels.map((channel) => channel.id),
++      since,
++      limit: FETCH_LIMIT,
++    });
++
++    const relationships = defaultReadThreadRelationships(pubkey);
++    const alerts: InactiveAlert[] = [];
++    for (const event of events) {
++      const channelId = channelIdOf(event);
++      const channel = channels.find((candidate) => candidate.id === channelId);
++      if (!channelId || !channel) continue;
++      const decision = classifyInactiveCommunityEvent(
++        event,
++        {
++          name: channelNames.get(channelId) ?? null,
++          channelType: channel.channelType,
++        },
++        pubkey,
++        { allMessageChannelIds, mutedChannelIds, relationships, channelId },
++      );
++      if (decision) {
++        alerts.push({
++          ...decision,
++          event,
++          channelName:
++            channel.channelType === "dm"
++              ? null
++              : (channelNames.get(channelId) ?? null),
++        });
++      }
++    }
++
++    const names = new Map<string, string>();
++    const authors = [...new Set(alerts.map((alert) => alert.event.pubkey))];
++    if (authors.length > 0) {
++      const profiles = await client.fetchEvents({
++        kinds: [KIND_PROFILE],
++        authors,
++        limit: authors.length * 2,
++      });
++      for (const profile of profiles) {
++        const name = profileName(profile);
++        if (name) names.set(profile.pubkey, name);
++      }
++    }
++    return { alerts, names };
++  });
++}
++
++export function useInactiveCommunityNotifications({
++  allMessageChannelIds,
++  enabled,
++  notificationSettings,
++  pubkey,
++}: {
++  allMessageChannelIds: ChannelIdMatcher;
++  enabled: boolean;
++  notificationSettings: NotificationSettings;
++  pubkey?: string;
++}) {
++  const { communities, activeCommunity } = useCommunities();
++  const normalizedPubkey = pubkey?.trim().toLowerCase() ?? "";
++  const activeCommunityId = activeCommunity?.id ?? null;
++  const inactive = React.useMemo(
++    () => communities.filter((community) => community.id !== activeCommunityId),
++    [communities, activeCommunityId],
++  );
++
++  const latest = React.useRef({ allMessageChannelIds, notificationSettings });
++  latest.current = { allMessageChannelIds, notificationSettings };
++  const sinceByCommunity = React.useRef(new Map<string, number>());
++  const seenEventIds = React.useRef(new Set<string>());
++  const previousActiveId = React.useRef<string | null>(null);
++
++  React.useEffect(() => {
++    if (!enabled || !normalizedPubkey || inactive.length === 0) return;
++    // The community we just left was covered by the live path until now;
++    // restart its window so nothing it already alerted is re-sent.
++    if (previousActiveId.current) {
++      sinceByCommunity.current.delete(previousActiveId.current);
++    }
++    previousActiveId.current = activeCommunityId;
++    let cancelled = false;
++    let timer: number | undefined;
++
++    const poll = async () => {
++      const nowSeconds = Math.floor(Date.now() / 1_000);
++      for (const community of inactive) {
++        if (cancelled) return;
++        // First observation of a community starts "now" — no backlog flood.
++        const since = sinceByCommunity.current.get(community.id) ?? nowSeconds;
++        try {
++          const { alerts, names } = await collectCommunityAlerts(
++            community,
++            normalizedPubkey,
++            since,
++            latest.current.allMessageChannelIds,
++          );
++          sinceByCommunity.current.set(community.id, nowSeconds - 5);
++          if (cancelled) return;
++          const settings = latest.current.notificationSettings;
++          for (const alert of alerts.sort(
++            (a, b) => a.event.created_at - b.event.created_at,
++          )) {
++            if (seenEventIds.current.has(alert.event.id)) continue;
++            seenEventIds.current.add(alert.event.id);
++            if (alert.event.created_at < nowSeconds - MAX_EVENT_AGE_SECONDS)
++              continue;
++            if (!settings.desktopEnabled) continue;
++            if (!settings.slotAlertsEnabled[alert.slot]) continue;
++            const { title, body } = formatMessageNotification({
++              source: alert.source,
++              senderName: names.get(alert.event.pubkey) ?? null,
++              channelName: alert.channelName,
++              content: alert.event.content,
++            });
++            const didSend = await sendDesktopNotification({
++              title: `${title} · ${community.name}`,
++              body,
++            });
++            if (didSend) {
++              playNotificationSound(resolveSlotSound(settings, alert.slot));
++            }
++          }
++          if (seenEventIds.current.size > 2_000) {
++            seenEventIds.current = new Set(
++              [...seenEventIds.current].slice(-1_000),
++            );
++          }
++        } catch (error) {
++          console.debug(
++            `[InactiveCommunityAlerts] poll failed community=${community.id}:`,
++            error,
++          );
++        }
++      }
++      if (!cancelled) timer = window.setTimeout(() => void poll(), POLL_MS);
++    };
++
++    void poll();
++    return () => {
++      cancelled = true;
++      if (timer !== undefined) window.clearTimeout(timer);
++    };
++  }, [activeCommunityId, enabled, inactive, normalizedPubkey]);
++}
+diff --git a/desktop/src/features/notifications/lib/notificationFormat.ts b/desktop/src/features/notifications/lib/notificationFormat.ts
+index 04c951c3..d5e79fe9 100644
+--- a/desktop/src/features/notifications/lib/notificationFormat.ts
++++ b/desktop/src/features/notifications/lib/notificationFormat.ts
+@@ -53,7 +53,8 @@ export type MessageNotificationSource =
+   | "approval"
+   | "needs_action"
+   | "dm"
+-  | "thread_reply";
++  | "thread_reply"
++  | "channel_message";
+ 
+ const MESSAGE_BODY_FALLBACKS: Record<MessageNotificationSource, string> = {
+   mention: "Something in Buzz needs your attention.",
+@@ -61,6 +62,7 @@ const MESSAGE_BODY_FALLBACKS: Record<MessageNotificationSource, string> = {
+   needs_action: "Something in Buzz needs your attention.",
+   dm: "New message",
+   thread_reply: "New reply",
++  channel_message: "New message",
+ };
+ 
+ /**
+@@ -106,7 +108,9 @@ export function formatMessageNotification(opts: {
+           ? senderName
+             ? `${senderName} replied`
+             : "Reply"
+-          : (senderName ?? "Needs Action");
++          : source === "channel_message"
++            ? (senderName ?? "New message")
++            : (senderName ?? "Needs Action");
+ 
+   return { title: formatNotificationTitle({ prefix, channelLabel }), body };
+ }
+diff --git a/desktop/src/features/notifications/lib/sound.ts b/desktop/src/features/notifications/lib/sound.ts
+index 3371658a..fd06bc6d 100644
+--- a/desktop/src/features/notifications/lib/sound.ts
++++ b/desktop/src/features/notifications/lib/sound.ts
+@@ -26,6 +26,7 @@ export const SOUND_SLOTS = [
+   "dm",
+   "mention",
+   "thread_reply",
++  "channel_message",
+   "needs_action",
+   "job_accepted",
+   "job_progress",
+@@ -38,6 +39,7 @@ export const SLOT_LABELS: Record<SoundSlot, string> = {
+   dm: "Direct messages",
+   mention: "@Mentions",
+   thread_reply: "Thread replies",
++  channel_message: "Channel messages",
+   needs_action: "Needs action",
+   job_accepted: "Agent: job accepted",
+   job_progress: "Agent: progress update",
+@@ -60,6 +62,8 @@ export const SLOT_DESCRIPTIONS: Record<SoundSlot, string> = {
+   dm: "When someone messages you directly.",
+   mention: "When someone tags you in a channel.",
+   thread_reply: "When someone replies in a thread you follow or posted in.",
++  channel_message:
++    'Every new message in channels set to "All messages" (right-click a channel → Notifications).',
+   needs_action: "When an approval or reminder is waiting on you.",
+   job_accepted: "When an agent picks up a job.",
+   job_progress: "While an agent works through a job.",
+@@ -71,6 +75,7 @@ export const RECOMMENDED_SOUND_BY_SLOT: Record<SoundSlot, SoundName> = {
+   dm: "unison",
+   mention: "ping",
+   thread_reply: "doop",
++  channel_message: "unison",
+   needs_action: "doodone",
+   job_accepted: "boo",
+   job_progress: "dng",
+@@ -84,6 +89,7 @@ export const DEFAULT_SLOT_SOUNDS: SlotSounds = {
+   dm: "flutter",
+   mention: "flutter",
+   thread_reply: "flutter",
++  channel_message: "flutter",
+   needs_action: "flutter",
+   job_accepted: "flutter",
+   job_progress: "flutter",
+@@ -96,6 +102,7 @@ export const DEFAULT_SLOT_ALERTS_ENABLED: Record<SoundSlot, boolean> = {
+   dm: true,
+   mention: true,
+   thread_reply: true,
++  channel_message: true,
+   needs_action: true,
+   job_accepted: true,
+   job_progress: false,
+diff --git a/desktop/src/features/settings/ui/NotificationSettingsCard.tsx b/desktop/src/features/settings/ui/NotificationSettingsCard.tsx
+index dcab32f0..faedb637 100644
+--- a/desktop/src/features/settings/ui/NotificationSettingsCard.tsx
++++ b/desktop/src/features/settings/ui/NotificationSettingsCard.tsx
+@@ -14,6 +14,13 @@ import {
+   type SoundName,
+   type SoundSlot,
+ } from "@/features/notifications/lib/sound";
++import {
++  resetChannelAlertOverrides,
++  setDefaultChannelAlertLevel,
++  useChannelAlertPrefs,
++  type ChannelAlertLevel,
++} from "@/features/notifications/lib/channelAllMessageAlerts";
++import { useIdentityQuery } from "@/shared/api/hooks";
+ import { cn } from "@/shared/lib/cn";
+ import { Button } from "@/shared/ui/button";
+ import { Switch } from "@/shared/ui/switch";
+@@ -25,6 +32,78 @@ import {
+ import { SettingsSectionHeader } from "./SettingsSectionHeader";
+ import { SoundPicker } from "./SoundPicker";
+ 
++const CHANNEL_LEVEL_OPTIONS: ReadonlyArray<{
++  level: ChannelAlertLevel;
++  label: string;
++}> = [
++  { level: "all", label: "All messages" },
++  { level: "mentions", label: "Only @mentions" },
++];
++
++/**
++ * Global default for channel notification levels, plus a reset that drops
++ * every per-channel override (right-click a channel → Notifications).
++ */
++function ChannelMessageDefaultGroup() {
++  const pubkey = useIdentityQuery().data?.pubkey;
++  const prefs = useChannelAlertPrefs(pubkey);
++  const overrideCount = Object.keys(prefs.overrides).length;
++
++  return (
++    <SettingsOptionGroup title="Channel notifications">
++      <SettingsOptionRow>
++        <div className="min-w-0">
++          <span className="text-sm font-medium">Default for all channels</span>
++          <p
++            className="text-sm font-normal text-muted-foreground/70"
++            data-settings-subcopy
++          >
++            "All messages" shows a banner for every new post. Muted channels
++            stay silent.
++          </p>
++        </div>
++        <span className="flex shrink-0 gap-1">
++          {CHANNEL_LEVEL_OPTIONS.map(({ level, label }) => (
++            <Button
++              data-testid={`channel-default-level-${level}`}
++              key={level}
++              onClick={() => setDefaultChannelAlertLevel(pubkey, level)}
++              size="sm"
++              type="button"
++              variant={prefs.defaultLevel === level ? "default" : "secondary"}
++            >
++              {label}
++            </Button>
++          ))}
++        </span>
++      </SettingsOptionRow>
++      <SettingsOptionRow>
++        <div className="min-w-0">
++          <span className="text-sm font-medium">Per-channel overrides</span>
++          <p
++            className="text-sm font-normal text-muted-foreground/70"
++            data-settings-subcopy
++          >
++            {overrideCount === 0
++              ? "Every channel follows the default."
++              : `${overrideCount} channel${overrideCount === 1 ? "" : "s"} set individually.`}
++          </p>
++        </div>
++        <Button
++          data-testid="channel-level-reset"
++          disabled={overrideCount === 0}
++          onClick={() => resetChannelAlertOverrides(pubkey)}
++          size="sm"
++          type="button"
++          variant="secondary"
++        >
++          Apply default to all channels
++        </Button>
++      </SettingsOptionRow>
++    </SettingsOptionGroup>
++  );
++}
++
+ export function NotificationSettingsCard({
+   isUpdatingDesktopNotifications,
+   notificationErrorMessage,
+@@ -172,6 +251,8 @@ export function NotificationSettingsCard({
+               </SettingsOptionRow>
+             </SettingsOptionGroup>
+ 
++            <ChannelMessageDefaultGroup />
++
+             {anyAlertsOn ? (
+               <div className="space-y-4">
+                 <SettingsOptionGroup title="Alert sounds">
+diff --git a/desktop/src/features/sidebar/ui/ChannelContextMenu.tsx b/desktop/src/features/sidebar/ui/ChannelContextMenu.tsx
+index 78f3929f..49f0b8f5 100644
+--- a/desktop/src/features/sidebar/ui/ChannelContextMenu.tsx
++++ b/desktop/src/features/sidebar/ui/ChannelContextMenu.tsx
+@@ -21,6 +21,11 @@ import {
+   useChannelMembersQuery,
+ } from "@/features/channels/hooks";
+ import { useChannelModerationCapabilities } from "@/features/channels/ui/ChannelManagementModerationActions";
++import {
++  effectiveChannelAlertLevel,
++  setChannelAlertOverride,
++  useChannelAlertPrefs,
++} from "@/features/notifications/lib/channelAllMessageAlerts";
+ import type { ChannelSection } from "@/features/sidebar/lib/useChannelSections";
+ import {
+   ContextMenuIconSlot,
+@@ -103,6 +108,91 @@ function MoveToSectionSubmenu({
+   );
+ }
+ 
++type ChannelMenuLevel = "default" | "all" | "mentions" | "nothing";
++
++const LEVEL_LABELS: Record<"all" | "mentions", string> = {
++  all: "All messages",
++  mentions: "Only @mentions",
++};
++
++/**
++ * Discord-style per-channel notification level. "Default" follows the global
++ * setting (Settings → Notifications); "Nothing" is the existing channel mute.
++ */
++function ChannelNotificationsSubmenu({
++  channelId,
++  isMuted,
++  onMuteChannel,
++  onUnmuteChannel,
++}: {
++  channelId: string;
++  isMuted: boolean;
++  onMuteChannel: (channelId: string) => void;
++  onUnmuteChannel: (channelId: string) => void;
++}) {
++  const pubkey = useIdentityQuery().data?.pubkey;
++  const prefs = useChannelAlertPrefs(pubkey);
++  const override = prefs.overrides[channelId];
++  const current: ChannelMenuLevel = isMuted
++    ? "nothing"
++    : (override ?? "default");
++  const options: ReadonlyArray<{ level: ChannelMenuLevel; label: string }> = [
++    {
++      level: "default",
++      label: `Default (${LEVEL_LABELS[prefs.defaultLevel]})`,
++    },
++    { level: "all", label: LEVEL_LABELS.all },
++    { level: "mentions", label: LEVEL_LABELS.mentions },
++    { level: "nothing", label: "Nothing" },
++  ];
++
++  const apply = (level: ChannelMenuLevel) => {
++    if (level !== "nothing") {
++      setChannelAlertOverride(
++        pubkey,
++        channelId,
++        level === "default" ? null : level,
++      );
++    }
++    if (level === "nothing" && !isMuted) onMuteChannel(channelId);
++    if (level !== "nothing" && isMuted) onUnmuteChannel(channelId);
++  };
++
++  const effectiveAll =
++    !isMuted && effectiveChannelAlertLevel(prefs, channelId) === "all";
++
++  return (
++    <ContextMenuSub>
++      <ContextMenuSubTrigger>
++        <ContextMenuIconSlot>
++          {isMuted ? (
++            <BellOff className="h-4 w-4" />
++          ) : (
++            <Bell className="h-4 w-4" />
++          )}
++        </ContextMenuIconSlot>
++        <span>Notifications</span>
++        <span className="ml-auto pl-3 text-xs text-muted-foreground">
++          {isMuted ? "Off" : effectiveAll ? "All" : "@"}
++        </span>
++      </ContextMenuSubTrigger>
++      <ContextMenuSubContent>
++        {options.map(({ level, label }) => (
++          <ContextMenuItem
++            key={level}
++            onSelect={() => deferMenuAction(() => apply(level))}
++          >
++            <ContextMenuIconSlot>
++              {current === level ? <Check className="h-4 w-4" /> : null}
++            </ContextMenuIconSlot>
++            <span>{label}</span>
++          </ContextMenuItem>
++        ))}
++      </ContextMenuSubContent>
++    </ContextMenuSub>
++  );
++}
++
+ /**
+  * The channel/DM context menu's Copy actions, grouped under a single
+  * "Copy" submenu (channel name / channel ID).
+@@ -276,7 +366,14 @@ export function ChannelContextMenuItems({
+         </ContextMenuItem>
+       ) : null}
+       {showMuteToggle || showStar ? <ContextMenuSeparator /> : null}
+-      {showMuteToggle ? (
++      {showMuteToggle && channel.channelType !== "dm" ? (
++        <ChannelNotificationsSubmenu
++          channelId={channel.id}
++          isMuted={Boolean(isMuted)}
++          onMuteChannel={onMuteChannel ?? (() => {})}
++          onUnmuteChannel={onUnmuteChannel ?? (() => {})}
++        />
++      ) : showMuteToggle ? (
+         isMuted ? (
+           <ContextMenuItem
+             onSelect={() =>

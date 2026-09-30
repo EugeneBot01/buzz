@@ -1,0 +1,431 @@
+diff --git a/desktop/src-tauri/src/events.rs b/desktop/src-tauri/src/events.rs
+index 70039689..93227985 100644
+--- a/desktop/src-tauri/src/events.rs
++++ b/desktop/src-tauri/src/events.rs
+@@ -22,8 +22,10 @@ use message_tags::{
+ /// Maximum content size — matches buzz-sdk (64 KiB).
+ const MAX_CONTENT_BYTES: usize = 64 * 1024;
+ 
+-/// Maximum mention count — matches buzz-sdk.
+-const MAX_MENTIONS: usize = 50;
++/// Maximum mention count. buzz-sdk caps explicit mentions at 50; the relay
++/// itself has no limit, and @everyone/@all expand to every channel member, so
++/// the desktop allows larger recipient sets.
++const MAX_MENTIONS: usize = 300;
+ 
+ /// Maximum emoji length in characters — matches buzz-sdk.
+ const MAX_EMOJI_CHARS: usize = 64;
+diff --git a/desktop/src/features/messages/hooks.ts b/desktop/src/features/messages/hooks.ts
+index d28f2926..6a6f965c 100644
+--- a/desktop/src/features/messages/hooks.ts
++++ b/desktop/src/features/messages/hooks.ts
+@@ -37,7 +37,14 @@ import {
+ 
+ export { mergeMessages, mergeTimelineCacheMessages };
+ import { splitOutgoingTags } from "@/features/messages/lib/imetaMediaMarkdown";
++import {
++  detectGroupMentions,
++  expandGroupMentionPubkeys,
++  hasGroupMention,
++  MAX_GROUP_MENTION_RECIPIENTS,
++} from "@/shared/lib/groupMentions";
+ import { messageMentionPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
++import { getChannelMembers } from "@/shared/api/tauriChannels";
+ import { buildSentFromThreadTag } from "@/features/messages/lib/sentFromThread";
+ import {
+   clearTimeoutState,
+@@ -544,11 +551,39 @@ export function useSendMessageMutation(
+         mentionTags,
+         linkPreviewTags,
+       } = splitOutgoingTags(mediaTags);
+-      const recipientPubkeys = messageMentionPubkeys(
++      let recipientPubkeys = messageMentionPubkeys(
+         effectiveChannel,
+         identity.pubkey,
+         mentionPubkeys,
+       );
++      // @everyone (humans) / @all (humans + agents) expand to every channel
++      // member as ordinary recipient p-tags.
++      const groupMentions = detectGroupMentions(content);
++      if (
++        effectiveChannel.channelType !== "dm" &&
++        hasGroupMention(groupMentions)
++      ) {
++        const members = await queryClient.fetchQuery({
++          queryKey: ["channels", effectiveChannel.id, "members"],
++          queryFn: () => getChannelMembers(effectiveChannel.id),
++          staleTime: 60_000,
++        });
++        recipientPubkeys = [
++          ...new Set([
++            ...recipientPubkeys,
++            ...expandGroupMentionPubkeys(
++              members,
++              groupMentions,
++              identity.pubkey,
++            ),
++          ]),
++        ];
++        if (recipientPubkeys.length > MAX_GROUP_MENTION_RECIPIENTS) {
++          throw new Error(
++            `@everyone/@all can notify at most ${MAX_GROUP_MENTION_RECIPIENTS} members (this channel has ${recipientPubkeys.length}).`,
++          );
++        }
++      }
+       if (sentFromThreadRootId && parentEventId) {
+         throw new Error(
+           "A thread message can only be sent as a top-level message.",
+diff --git a/desktop/src/features/messages/lib/useMentions.ts b/desktop/src/features/messages/lib/useMentions.ts
+index 63f8aaa1..bfaccd68 100644
+--- a/desktop/src/features/messages/lib/useMentions.ts
++++ b/desktop/src/features/messages/lib/useMentions.ts
+@@ -57,6 +57,10 @@ import {
+   type MentionPickerMode,
+   useMentionSelection,
+ } from "./useMentionSelection";
++import {
++  GROUP_MENTION_LABELS,
++  matchGroupMentionKeys,
++} from "@/shared/lib/groupMentions";
+ import { rankMentionCandidates } from "./mentionRanking";
+ import { mapMentionCandidateToSuggestion } from "./mentionSuggestionMapping";
+ import { getMentionMemberPubkeys } from "./mentionMemberPubkeys";
+@@ -418,12 +422,29 @@ export function useMentions(
+       void userSearchQuery.fetchNextPage();
+     }
+   }, [userSearchQuery]);
++  const groupSuggestions = React.useMemo<MentionSuggestion[]>(() => {
++    if (mentionQuery === null || options?.channelType === "dm") return [];
++    return matchGroupMentionKeys(mentionQuery).map((key) => ({
++      displayName: GROUP_MENTION_LABELS[key],
++      groupMention: key,
++      kind: "identity",
++    }));
++  }, [mentionQuery, options?.channelType]);
+   const suggestions = React.useMemo<MentionSuggestion[]>(() => {
+     if (mentionQuery === null) {
+       return [];
+     }
++    // A typed "@a…"/"@e…" puts the group entries first; a bare "@" lists them
++    // after people so the default picker is unchanged at the top.
++    const withGroups = (people: MentionSuggestion[]) =>
++      mentionQuery.trim()
++        ? [...groupSuggestions, ...people]
++        : [...people, ...groupSuggestions];
+     if (matchingSuggestions.length > 0) {
+-      return matchingSuggestions;
++      return withGroups(matchingSuggestions);
++    }
++    if (groupSuggestions.length > 0 && !userSearchQuery.isFetching) {
++      return groupSuggestions;
+     }
+     if (userSearchQuery.isFetching) {
+       return filterCachedAgentSuggestions(
+@@ -433,6 +454,7 @@ export function useMentions(
+     }
+     return [];
+   }, [
++    groupSuggestions,
+     matchingSuggestions,
+     mentionCandidatesWithTeams,
+     mentionQuery,
+@@ -494,6 +516,20 @@ export function useMentions(
+         clearTimeout(debounceTimerRef.current);
+         debounceTimerRef.current = null;
+       }
++      if (suggestion.groupMention) {
++        // Literal token; expanded into recipients at send time.
++        mentionPickerOriginRef.current = null;
++        setMentionQuery(null);
++        setSelected(0);
++        const groupStart =
++          flushedMentionStartIndexRef.current ?? mentionStartIndex;
++        flushedMentionStartIndexRef.current = null;
++        return {
++          replaceFromOffset: groupStart,
++          replaceToOffset: selectionEnd,
++          insertText: `@${suggestion.groupMention} `,
++        };
++      }
+       const [boundSuggestion] = selectedMentionLabels(
+         [suggestion],
+         mentionMapRef.current,
+diff --git a/desktop/src/features/messages/ui/MentionAutocomplete.tsx b/desktop/src/features/messages/ui/MentionAutocomplete.tsx
+index 65ae331d..5b74ba6b 100644
+--- a/desktop/src/features/messages/ui/MentionAutocomplete.tsx
++++ b/desktop/src/features/messages/ui/MentionAutocomplete.tsx
+@@ -24,6 +24,8 @@ export type MentionSuggestion = {
+   teamId?: string;
+   teamMembers?: TeamMentionMember[];
+   kind?: "identity" | "persona" | "team";
++  /** @all / @everyone pseudo-entry: inserts the literal token. */
++  groupMention?: "all" | "everyone";
+   displayName: string;
+   avatarUrl?: string | null;
+   isAgent?: boolean;
+@@ -250,6 +252,9 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
+                 ? `persona-${suggestion.personaId}`
+                 : null) ??
+               (suggestion.teamId ? `team-${suggestion.teamId}` : null) ??
++              (suggestion.groupMention
++                ? `group-${suggestion.groupMention}`
++                : null) ??
+               suggestion.displayName;
+             const hasNameCollision =
+               (nameCounts.get(suggestion.displayName.toLowerCase()) ?? 0) > 1;
+@@ -264,7 +269,8 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
+                 ? safeNpub(suggestion.pubkey)
+                 : null;
+             const hasMetadataBeforeNpub = Boolean(
+-              suggestion.kind === "team" ||
++              suggestion.groupMention ||
++                suggestion.kind === "team" ||
+                 suggestion.isAgent ||
+                 suggestion.role ||
+                 ownerLabel ||
+@@ -305,7 +311,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
+                   tabIndex={-1}
+                   type="button"
+                 >
+-                  {suggestion.kind === "team" ? (
++                  {suggestion.kind === "team" || suggestion.groupMention ? (
+                     <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+                       <Users aria-hidden="true" className="h-4 w-4" />
+                     </span>
+@@ -338,7 +344,14 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
+                             : "text-muted-foreground",
+                         )}
+                       >
+-                        {suggestion.kind === "team" ? (
++                        {suggestion.groupMention ? (
++                          <span className="inline-flex shrink-0 items-center gap-1">
++                            <Users aria-hidden="true" className="h-3.5 w-3.5" />
++                            {suggestion.groupMention === "all"
++                              ? "everyone in channel, agents included"
++                              : "all people in channel (no agents)"}
++                          </span>
++                        ) : suggestion.kind === "team" ? (
+                           <span className="inline-flex shrink-0 items-center gap-1">
+                             <Users aria-hidden="true" className="h-3.5 w-3.5" />
+                             team · {suggestion.teamMembers?.length ?? 0} agents
+diff --git a/desktop/src/shared/lib/groupMentions.test.mjs b/desktop/src/shared/lib/groupMentions.test.mjs
+new file mode 100644
+index 00000000..86a627c1
+--- /dev/null
++++ b/desktop/src/shared/lib/groupMentions.test.mjs
+@@ -0,0 +1,84 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import {
++  detectGroupMentions,
++  expandGroupMentionPubkeys,
++  isGroupMentionLabel,
++  matchGroupMentionKeys,
++} from "./groupMentions.ts";
++import { resolveMentionProps } from "./resolveMentionNames.ts";
++
++const SENDER = "a".repeat(64);
++const HUMAN = "b".repeat(64);
++const AGENT = "c".repeat(64);
++const members = [
++  { pubkey: SENDER, isAgent: false },
++  { pubkey: HUMAN, isAgent: false },
++  { pubkey: AGENT, isAgent: true },
++];
++
++test("detects standalone @everyone and @all, case-insensitive", () => {
++  assert.deepEqual(detectGroupMentions("hi @everyone"), {
++    everyone: true,
++    all: false,
++  });
++  assert.deepEqual(detectGroupMentions("@ALL 확인 부탁"), {
++    everyone: false,
++    all: true,
++  });
++  assert.deepEqual(detectGroupMentions("@all, @everyone!"), {
++    everyone: true,
++    all: true,
++  });
++  assert.deepEqual(detectGroupMentions("(@all)"), {
++    everyone: false,
++    all: true,
++  });
++});
++
++test("ignores lookalikes, emails and code", () => {
++  const none = { everyone: false, all: false };
++  assert.deepEqual(detectGroupMentions("@allison @everyones"), none);
++  assert.deepEqual(detectGroupMentions("mail me: me@all.com"), none);
++  assert.deepEqual(detectGroupMentions("x@all y"), none);
++  assert.deepEqual(detectGroupMentions("`@all` and ```\n@everyone\n```"), none);
++  assert.deepEqual(detectGroupMentions("https://x.com/@all"), none);
++});
++
++test("@everyone expands to humans only, excluding the sender", () => {
++  assert.deepEqual(
++    expandGroupMentionPubkeys(members, { everyone: true, all: false }, SENDER),
++    [HUMAN],
++  );
++});
++
++test("@all includes agents", () => {
++  assert.deepEqual(
++    expandGroupMentionPubkeys(members, { everyone: false, all: true }, SENDER),
++    [HUMAN, AGENT],
++  );
++});
++
++test("no group mention expands to nothing", () => {
++  assert.deepEqual(
++    expandGroupMentionPubkeys(members, { everyone: false, all: false }, SENDER),
++    [],
++  );
++});
++
++test("picker offers group entries by prefix", () => {
++  assert.deepEqual(matchGroupMentionKeys(""), ["all", "everyone"]);
++  assert.deepEqual(matchGroupMentionKeys("A"), ["all"]);
++  assert.deepEqual(matchGroupMentionKeys("ev"), ["everyone"]);
++  assert.deepEqual(matchGroupMentionKeys("bob"), []);
++  assert.equal(isGroupMentionLabel(" ALL "), true);
++  assert.equal(isGroupMentionLabel("allison"), false);
++});
++
++test("group token is highlighted only when the event carries recipients", () => {
++  const tagged = resolveMentionProps([["p", HUMAN]], {}, "@all 확인");
++  assert.ok(tagged.mentionNames?.includes("all"));
++  const untagged = resolveMentionProps([], {}, "@all 확인");
++  assert.equal(untagged.mentionNames, undefined);
++});
+diff --git a/desktop/src/shared/lib/groupMentions.ts b/desktop/src/shared/lib/groupMentions.ts
+new file mode 100644
+index 00000000..c5311377
+--- /dev/null
++++ b/desktop/src/shared/lib/groupMentions.ts
+@@ -0,0 +1,76 @@
++import type { ChannelMember } from "@/shared/api/types";
++import { normalizePubkey } from "@/shared/lib/pubkey";
++
++/**
++ * Group mentions, expanded client-side at send time into ordinary recipient
++ * `p` tags so every recipient (patched or not) gets a normal @mention alert
++ * and agents treat it as being addressed:
++ *
++ * - `@everyone` — every human member of the channel
++ * - `@all`      — every member, agents included
++ *
++ * DMs already address every participant, so they are left alone.
++ */
++export type GroupMentionFlags = { everyone: boolean; all: boolean };
++
++export type GroupMentionKey = keyof GroupMentionFlags;
++
++export const GROUP_MENTION_LABELS: Record<GroupMentionKey, string> = {
++  everyone: "everyone",
++  all: "all",
++};
++
++/** Group mentions offered by the @ picker for a typed query (prefix match). */
++export function matchGroupMentionKeys(query: string): GroupMentionKey[] {
++  const normalized = query.trim().toLowerCase();
++  return (["all", "everyone"] as const).filter((key) =>
++    key.startsWith(normalized),
++  );
++}
++
++export function isGroupMentionLabel(label: string): boolean {
++  const normalized = label.trim().toLowerCase();
++  return normalized === "everyone" || normalized === "all";
++}
++
++// Standalone token: not preceded by a word char, dot or another @ (so
++// emails like a@all.com or @@all never match), and not followed by a word
++// char (so @allison / @everyones stay ordinary text).
++const GROUP_MENTION_PATTERN =
++  /(?<![\p{L}\p{N}_.@/])@(everyone|all)(?![\p{L}\p{N}_])/giu;
++
++/** Must match MAX_MENTIONS in desktop/src-tauri/src/events.rs. */
++export const MAX_GROUP_MENTION_RECIPIENTS = 300;
++
++export function detectGroupMentions(content: string): GroupMentionFlags {
++  const flags: GroupMentionFlags = { everyone: false, all: false };
++  // Inline/fenced code is literal text, not an instruction to notify.
++  const withoutCode = content
++    .replace(/```[\s\S]*?```/g, " ")
++    .replace(/`[^`\n]*`/g, " ");
++  for (const match of withoutCode.matchAll(GROUP_MENTION_PATTERN)) {
++    if (match[1].toLowerCase() === "all") flags.all = true;
++    else flags.everyone = true;
++  }
++  return flags;
++}
++
++export function hasGroupMention(flags: GroupMentionFlags): boolean {
++  return flags.everyone || flags.all;
++}
++
++export function expandGroupMentionPubkeys(
++  members: readonly Pick<ChannelMember, "pubkey" | "isAgent">[],
++  flags: GroupMentionFlags,
++  senderPubkey: string,
++): string[] {
++  if (!hasGroupMention(flags)) return [];
++  const sender = normalizePubkey(senderPubkey);
++  return [
++    ...new Set(
++      members
++        .filter((member) => flags.all || !member.isAgent)
++        .map((member) => normalizePubkey(member.pubkey)),
++    ),
++  ].filter((pubkey) => pubkey.length > 0 && pubkey !== sender);
++}
+diff --git a/desktop/src/shared/lib/resolveMentionNames.ts b/desktop/src/shared/lib/resolveMentionNames.ts
+index 270ee945..8620f6af 100644
+--- a/desktop/src/shared/lib/resolveMentionNames.ts
++++ b/desktop/src/shared/lib/resolveMentionNames.ts
+@@ -1,3 +1,4 @@
++import { detectGroupMentions, GROUP_MENTION_LABELS } from "./groupMentions";
+ import { mentionOccurrences } from "./mentionOccurrences";
+ import type { UserProfileSummary } from "@/shared/api/types";
+ 
+@@ -159,6 +160,14 @@ export function resolveMentionProps(
+     names.add(entry.displayName);
+     if (keys.length === 1) pubkeysByName[label] = keys[0];
+   }
++  // @everyone / @all expanded into recipient tags at send time: highlight the
++  // literal token too. Only when the event actually carries recipients, so an
++  // unpatched sender's plain "@all" text is not dressed up as a mention.
++  if (taggedKeys.size > 0) {
++    const groups = detectGroupMentions(content);
++    if (groups.everyone) names.add(GROUP_MENTION_LABELS.everyone);
++    if (groups.all) names.add(GROUP_MENTION_LABELS.all);
++  }
+ 
+   return {
+     mentionNames: names.size > 0 ? [...names] : undefined,
+diff --git a/desktop/src/shared/ui/markdown/MarkdownMention.tsx b/desktop/src/shared/ui/markdown/MarkdownMention.tsx
+index 9d9f59ad..139871bf 100644
+--- a/desktop/src/shared/ui/markdown/MarkdownMention.tsx
++++ b/desktop/src/shared/ui/markdown/MarkdownMention.tsx
+@@ -2,6 +2,7 @@ import type * as React from "react";
+ import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
+ import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
+ import { cn } from "@/shared/lib/cn";
++import { isGroupMentionLabel } from "@/shared/lib/groupMentions";
+ import { formatMentionDisplayLabel } from "@/shared/lib/mentionDisplay";
+ import {
+   inlineChipIconClasses,
+@@ -27,8 +28,10 @@ export function createMarkdownMention(interactive: boolean) {
+     const mentionText = String(children ?? "");
+     const mentionName = mentionText.replace(/^@/, "").trim().toLowerCase();
+     const pubkey = mentionPubkeysByName?.[mentionName];
+-    // Unbound literal competitors consume their full range, without a chip.
+-    if (mentionPubkeysByName && !pubkey) return mentionText;
++    // Unbound literal competitors consume their full range, without a chip —
++    // except @everyone/@all, which stand for every recipient of the event.
++    if (mentionPubkeysByName && !pubkey && !isGroupMentionLabel(mentionName))
++      return mentionText;
+     const isAgentMention =
+       pubkey !== undefined &&
+       agentMentionPubkeysByName?.[mentionName] === pubkey;
