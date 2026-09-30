@@ -149,13 +149,18 @@ has no human approval step or cooling-off period: operator-attested owner intent
 is prepared automatically under privileged policy and becomes immediately
 eligible for execution. Transient preparation failures use the existing retry
 schedule; permanent or exhausted failures block durably. Owner-facing
-admission has no cancellation endpoint.
+admission has no cancellation endpoint. Admission requires the asserted owner
+to be the community's sole current owner: a legacy community with more than
+one owner row is rejected as `404 community_not_found`, indistinguishable from
+a missing host. Converge ownership with a transfer first.
 
 Admission is idempotent on the request UUID. Resending the same UUID with the
 same host, owner, and acknowledgement version returns `202` with that request's
 current `status` at any stage, including after membership purge, and admits no
 new work. Clients recover an ambiguous submission by resending it. The same
-UUID with a different host or owner returns `409 deletion_request_conflict`.
+UUID used for any other request returns `409 deletion_request_conflict`: a
+different host, owner, or stored acknowledgement version, or a UUID held by an
+operator-origin request.
 An unsupported acknowledgement version is the exception: it is rejected before
 the UUID lookup with `400 unsupported_acknowledgement_version`, even for a
 known UUID.

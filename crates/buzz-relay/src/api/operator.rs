@@ -469,8 +469,9 @@ pub async fn unarchive_community(
 /// Resubmitting the same UUID with the same host, owner, and acknowledgement
 /// version returns `202` with that request's current `status`, at any stage and
 /// even after membership purge, and never admits new work. Callers recover an
-/// ambiguous submission by resending it; a different host or owner under a
-/// known UUID is `409 deletion_request_conflict`. An unsupported
+/// ambiguous submission by resending it; any other owner request under a known
+/// UUID (different host, owner, or stored acknowledgement version, or a UUID
+/// held by an operator-origin request) is `409 deletion_request_conflict`. An unsupported
 /// acknowledgement version is rejected before the UUID lookup with
 /// `400 unsupported_acknowledgement_version`, even for a known UUID.
 ///

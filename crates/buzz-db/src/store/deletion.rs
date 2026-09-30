@@ -5940,7 +5940,11 @@ mod postgres_tests {
             .complete_owner_preparation(&claim.lease, &inventory)
             .await
             .expect_err("drift must prevent automatic approval");
-        assert!(failure.to_string().contains("owner deletion"), "{failure}");
+        assert!(
+            matches!(failure, DbError::DeletionSafety(_))
+                && failure.to_string().contains("sole-owner authority drifted"),
+            "{failure}"
+        );
         assert_eq!(
             store
                 .get(request_id)
