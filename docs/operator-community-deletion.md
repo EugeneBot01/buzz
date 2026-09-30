@@ -152,7 +152,9 @@ schedule; permanent or exhausted failures block durably. Owner-facing
 admission has no cancellation endpoint. Admission requires the asserted owner
 to be the community's sole current owner: a legacy community with more than
 one owner row is rejected as `404 community_not_found`, indistinguishable from
-a missing host. Converge ownership with a transfer first.
+a missing host. Converge ownership first: transfer rejects archived communities,
+so unarchive, transfer to the intended owner (a self-transfer demotes the other
+owner rows; the transferee's quota still applies), re-archive, then resubmit.
 
 Admission is idempotent on the request UUID. Resending the same UUID with the
 same host, owner, and acknowledgement version returns `202` with that request's
