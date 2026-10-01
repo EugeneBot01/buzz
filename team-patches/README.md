@@ -10,6 +10,7 @@ with `git apply --3way`.
 | `10-notifications.patch` | Notification fixes (foreground banners, per-channel levels, reconnect / first-DM gaps, inactive communities) | `BUZZ-NOTIFY-PATCH.md` |
 | `20-group-mentions.patch` | `@everyone` (all humans) / `@all` (humans + agents) group mentions | `BUZZ-GROUP-MENTION-PATCH.md` |
 | `30-shared-sections.patch` | Team sections: one sidebar section layout shared by, and editable by, every member | `BUZZ-SHARED-SECTIONS-PATCH.md` |
+| `40-korean.patch` | Korean UI (display-layer translation, toggle in Settings → Appearance; message bodies/inputs never translated) | `BUZZ-KOREAN-PATCH.md` |
 
 If a patch stops applying to a new upstream tag, re-implement it from section 3
 ("intent") of its doc.
