@@ -1,0 +1,1064 @@
+diff --git a/desktop/src/features/sidebar/lib/teamSectionsSync.test.mjs b/desktop/src/features/sidebar/lib/teamSectionsSync.test.mjs
+new file mode 100644
+index 0000000..3779490
+--- /dev/null
++++ b/desktop/src/features/sidebar/lib/teamSectionsSync.test.mjs
+@@ -0,0 +1,256 @@
++import assert from "node:assert/strict";
++import test, { beforeEach, mock } from "node:test";
++
++import { projectSections } from "./channelSectionsSync.ts";
++import { encodeDoc } from "./sidebarLaneStore.ts";
++import { canonical, mergeTrees, setRegs } from "./sidebarLwwMap.ts";
++import {
++  TEAM_SECTIONS_D_TAG,
++  TEAM_SECTIONS_LANE,
++  TeamSectionsReconciler,
++  shouldSeedTeamSections,
++} from "./teamSectionsSync.ts";
++
++const ALICE = "a".repeat(64);
++const BOB = "b".repeat(64);
++
++const storage = new Map();
++globalThis.window ??= {};
++globalThis.window.localStorage = {
++  getItem: (k) => storage.get(k) ?? null,
++  setItem: (k, v) => storage.set(k, v),
++  removeItem: (k) => storage.delete(k),
++};
++
++beforeEach(() => {
++  storage.clear();
++  mock.restoreAll();
++  mock.timers.reset();
++  mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_800_000_000_000 });
++});
++
++/** A member: in-memory tree store, a reconciler, and a scripted relay. */
++function member(pubkey, relay) {
++  let tree = {};
++  const store = {
++    get: () => tree,
++    merge: (remote) => {
++      tree = mergeTrees(tree, remote);
++    },
++  };
++  const me = { pubkey, published: [], failPublish: 0, failFetch: false };
++  me.rec = new TeamSectionsReconciler(store, pubkey, {
++    fetch: async () => {
++      if (me.failFetch) throw new Error("offline");
++      return [...relay.values()];
++    },
++    publish: async (content, createdAt) => {
++      if (me.failPublish > 0) {
++        me.failPublish--;
++        throw new Error("rejected");
++      }
++      const event = ev(pubkey, content, createdAt);
++      me.published.push(event);
++      relay.set(pubkey, event);
++    },
++  });
++  me.tree = () => tree;
++  me.view = () => projectSections(tree);
++  me.edit = (fn) => {
++    tree = fn(tree);
++    me.rec.defer();
++  };
++  return me;
++}
++
++let seq = 0;
++function ev(pubkey, content, createdAt, dTag = TEAM_SECTIONS_D_TAG) {
++  return {
++    id: `id-${String(++seq).padStart(6, "0")}`,
++    pubkey,
++    kind: 30078,
++    content,
++    created_at: createdAt,
++    tags: [
++      ["d", dTag],
++      ["t", dTag],
++    ],
++    sig: "s",
++  };
++}
++
++const addSection = (id, name) => (tree) =>
++  setRegs(tree, [
++    [["s", id, "name"], name],
++    [["s", id, "icon"], null],
++    [["s", id, "order"], 0],
++    [["s", id, "live"], true],
++  ]);
++const assign = (channelId, sectionId) => (tree) =>
++  setRegs(tree, [[["a", channelId], sectionId]]);
++
++/** Runs the debounce/backoff timers and lets async publishes settle. */
++async function settle(ms = 2_000) {
++  mock.timers.tick(ms);
++  for (let i = 0; i < 10; i++) await Promise.resolve();
++}
++
++test("an edit publishes one plaintext event that another member merges without echoing", async () => {
++  const relay = new Map();
++  const alice = member(ALICE, relay);
++  const bob = member(BOB, relay);
++  await alice.rec.read();
++  await bob.rec.read();
++
++  alice.edit(addSection("s1", "Work"));
++  alice.edit(assign("chan-1", "s1"));
++  assert.equal(alice.published.length, 0, "debounced");
++  await settle();
++  assert.equal(alice.published.length, 1);
++  const doc = JSON.parse(alice.published[0].content);
++  assert.deepEqual(doc.sections, [{ id: "s1", name: "Work", order: 0 }]);
++  assert.deepEqual(doc.assignments, { "chan-1": "s1" });
++
++  bob.rec.ingest(alice.published[0]);
++  assert.deepEqual(bob.view(), alice.view());
++  await settle(60_000);
++  assert.equal(bob.published.length, 0, "reading never causes a write");
++  assert.equal(alice.published.length, 1, "no republish without a new edit");
++});
++
++test("edits by two members converge on both sides, per field", async () => {
++  const relay = new Map();
++  const alice = member(ALICE, relay);
++  const bob = member(BOB, relay);
++  await alice.rec.read();
++  await bob.rec.read();
++
++  alice.edit(addSection("s1", "Work"));
++  await settle();
++  bob.rec.ingest(alice.published[0]);
++
++  // Concurrent edits to different fields both survive.
++  alice.edit(assign("chan-1", "s1"));
++  mock.timers.tick(5);
++  bob.edit((tree) => setRegs(tree, [[["s", "s1", "name"], "Workroom"]]));
++  await settle();
++  alice.rec.ingest(bob.published.at(-1));
++  bob.rec.ingest(alice.published.at(-1));
++
++  const expected = {
++    sections: [{ id: "s1", name: "Workroom", order: 0 }],
++    assignments: { "chan-1": "s1" },
++  };
++  assert.deepEqual(alice.view(), expected);
++  assert.deepEqual(bob.view(), expected);
++  assert.equal(canonical(alice.tree()), canonical(bob.tree()));
++
++  // Between them the two events already carry every register, so merging
++  // the other side's edit triggers no further publish.
++  const counts = [alice.published.length, bob.published.length];
++  await settle(60_000);
++  assert.deepEqual([alice.published.length, bob.published.length], counts);
++  assert.equal(alice.rec.needsPublish(), false);
++  assert.equal(bob.rec.needsPublish(), false);
++});
++
++test("a deleted section stays deleted for a member who still held it", async () => {
++  const relay = new Map();
++  const alice = member(ALICE, relay);
++  const bob = member(BOB, relay);
++  await alice.rec.read();
++  alice.edit(addSection("s1", "Work"));
++  await settle();
++  await bob.rec.read();
++  assert.equal(bob.view().sections.length, 1);
++
++  mock.timers.tick(5);
++  alice.edit((tree) => setRegs(tree, [[["s", "s1", "live"], false]]));
++  await settle();
++  bob.rec.ingest(alice.published.at(-1));
++  assert.deepEqual(bob.view(), { sections: [], assignments: {} });
++});
++
++test("nothing is published before a read succeeds, then the pending edit goes out", async () => {
++  const relay = new Map();
++  const alice = member(ALICE, relay);
++  alice.failFetch = true;
++  await assert.rejects(alice.rec.read());
++  alice.edit(addSection("s1", "Work"));
++  await settle(60_000);
++  assert.equal(alice.published.length, 0);
++
++  alice.failFetch = false;
++  await alice.rec.read();
++  await settle();
++  assert.equal(alice.published.length, 1);
++});
++
++test("a failed publish retries behind the backoff", async () => {
++  const relay = new Map();
++  const alice = member(ALICE, relay);
++  await alice.rec.read();
++  alice.failPublish = 1;
++  alice.edit(addSection("s1", "Work"));
++  await settle();
++  assert.equal(alice.published.length, 0);
++  await settle(4_000);
++  assert.equal(alice.published.length, 0, "still inside the 5s backoff");
++  await settle(1_000);
++  assert.equal(alice.published.length, 1);
++});
++
++test("unreadable, foreign-coordinate, oversized and stale events are ignored", async () => {
++  const relay = new Map();
++  const bob = member(BOB, relay);
++  await bob.rec.read();
++  const good = canonical(
++    encodeDoc(TEAM_SECTIONS_LANE, addSection("s1", "Work")({})),
++  );
++  const legacy = JSON.stringify({
++    version: 1,
++    sections: [{ id: "x", name: "Legacy", order: 0 }],
++    assignments: {},
++  });
++
++  bob.rec.ingest(ev(ALICE, "not json", 10));
++  bob.rec.ingest(ev(ALICE, legacy, 10));
++  bob.rec.ingest(ev(ALICE, good, 10, "channel-sections"));
++  bob.rec.ingest(ev(ALICE, `${good}${" ".repeat(70_000)}`, 10));
++  assert.deepEqual(bob.view(), { sections: [], assignments: {} });
++
++  bob.rec.ingest(ev(ALICE, good, 10));
++  assert.equal(bob.view().sections.length, 1);
++
++  // An older event from the same author never replaces the newer one.
++  const renamed = canonical(
++    encodeDoc(TEAM_SECTIONS_LANE, addSection("s2", "Old")({})),
++  );
++  bob.rec.ingest(ev(ALICE, renamed, 9));
++  assert.deepEqual(
++    bob.view().sections.map((s) => s.id),
++    ["s1"],
++  );
++  await settle(60_000);
++  assert.equal(bob.published.length, 0);
++});
++
++test("only the owner seeds, only a never-used team layout, only once", () => {
++  const ok = {
++    isOwner: true,
++    synced: true,
++    teamEmpty: true,
++    personalSectionCount: 3,
++    alreadySeeded: false,
++  };
++  assert.equal(shouldSeedTeamSections(ok), true);
++  assert.equal(shouldSeedTeamSections({ ...ok, isOwner: false }), false);
++  // Before a read succeeds an existing team layout would look empty.
++  assert.equal(shouldSeedTeamSections({ ...ok, synced: false }), false);
++  assert.equal(shouldSeedTeamSections({ ...ok, teamEmpty: false }), false);
++  assert.equal(
++    shouldSeedTeamSections({ ...ok, personalSectionCount: 0 }),
++    false,
++  );
++  assert.equal(shouldSeedTeamSections({ ...ok, alreadySeeded: true }), false);
++});
+diff --git a/desktop/src/features/sidebar/lib/teamSectionsSync.ts b/desktop/src/features/sidebar/lib/teamSectionsSync.ts
+new file mode 100644
+index 0000000..f6d6019
+--- /dev/null
++++ b/desktop/src/features/sidebar/lib/teamSectionsSync.ts
+@@ -0,0 +1,228 @@
++import type { RelayEvent } from "@/shared/api/types";
++import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
++import { SECTIONS_LANE } from "./channelSectionsSync";
++import { decodeDoc, encodeDoc, type LaneCodec } from "./sidebarLaneStore";
++import { canonical, isEmptyTree, mergeTrees, type Tree } from "./sidebarLwwMap";
++
++/**
++ * Team sections: one section layout shared by every member of a community.
++ *
++ * Each member publishes their merged copy as a plaintext kind 30078 event at
++ * their own `(pubkey, d = team-channel-sections)` coordinate. Readers merge
++ * every member's event per field (the same LWW registers as personal
++ * sections), so nobody can overwrite anyone else's event and any two members
++ * who have seen the same events hold the same layout.
++ *
++ * Section names and channel assignments are therefore readable by every
++ * community member. Personal sections (`channel-sections`) stay encrypted and
++ * are untouched.
++ */
++export const TEAM_SECTIONS_D_TAG = "team-channel-sections";
++
++/** Relay event size ceiling shared by every sidebar blob. */
++const MAX_CONTENT_BYTES = 65_535;
++/** Most member events merged per read; a community larger than this is out of scope. */
++export const MAX_TEAM_SECTION_AUTHORS = 200;
++const DEBOUNCE_MS = 2_000;
++const BACKOFF_MS = [5_000, 10_000, 30_000, 60_000, 60_000];
++
++const TEAM_STORAGE_KEY_PREFIX = "buzz-team-sections.v1";
++
++/** Same register shape as personal sections, in its own relay-scoped cache. */
++export const TEAM_SECTIONS_LANE: LaneCodec & {
++  withinLimits: (projection: Record<string, unknown>) => boolean;
++} = {
++  storageKey: (pubkey, relayUrl) =>
++    `${TEAM_STORAGE_KEY_PREFIX}:${pubkey}:${encodeURIComponent(normalizeRelayUrl(relayUrl))}`,
++  shape: SECTIONS_LANE.shape,
++  // Team documents always carry registers; a meta-less payload is unreadable.
++  fromLegacy: () => null,
++  project: SECTIONS_LANE.project,
++  withinLimits: SECTIONS_LANE.withinLimits,
++};
++
++/** The tree store this reconciler drives (`LaneStore` in the app). */
++export type TeamSectionsStore = {
++  get: () => Tree;
++  merge: (remote: Tree) => void;
++};
++
++export type TeamSectionsTransport = {
++  /** Every member's current team-sections event. Throws on transport failure. */
++  fetch: () => Promise<RelayEvent[]>;
++  /** Signs and publishes this member's event. Throws on failure. */
++  publish: (content: string, createdAt: number) => Promise<void>;
++};
++
++type Seen = { id: string; createdAt: number; tree: Tree };
++
++const byteLength = (text: string) => new TextEncoder().encode(text).length;
++
++/**
++ * Converges the local team tree with every member's event. Remote events only
++ * ever merge in. This member's event is (re)published only when the local
++ * tree holds a register the union of all seen events lacks — that is, after a
++ * local edit — so reading never causes a write and edits cannot echo.
++ */
++export class TeamSectionsReconciler {
++  private seen = new Map<string, Seen>();
++  private ready = false;
++  private publishing = false;
++  private failures = 0;
++  private notBefore = 0;
++  private timer: ReturnType<typeof setTimeout> | null = null;
++  private destroyed = false;
++
++  private readonly store: TeamSectionsStore;
++  private readonly pubkey: string;
++  private readonly transport: TeamSectionsTransport;
++
++  constructor(
++    store: TeamSectionsStore,
++    pubkey: string,
++    transport: TeamSectionsTransport,
++  ) {
++    this.store = store;
++    this.pubkey = pubkey;
++    this.transport = transport;
++  }
++
++  /** Merges one member's event if it is their newest readable one. */
++  ingest(event: RelayEvent): void {
++    if (this.destroyed) return;
++    const d = event.tags.filter((tag) => tag[0] === "d");
++    if (d.length !== 1 || d[0]?.[1] !== TEAM_SECTIONS_D_TAG) return;
++    if (byteLength(event.content) > MAX_CONTENT_BYTES) return;
++    const prev = this.seen.get(event.pubkey);
++    // The relay's replaceable winner: later `created_at`, then lower id.
++    if (
++      prev &&
++      !(
++        event.created_at > prev.createdAt ||
++        (event.created_at === prev.createdAt && event.id < prev.id)
++      )
++    )
++      return;
++    if (!prev && this.seen.size >= MAX_TEAM_SECTION_AUTHORS) return;
++    let json: unknown = null;
++    try {
++      json = JSON.parse(event.content);
++    } catch {
++      return;
++    }
++    const doc = decodeDoc(TEAM_SECTIONS_LANE, json, 0);
++    if (!doc || doc.legacy) return;
++    this.seen.set(event.pubkey, {
++      id: event.id,
++      createdAt: event.created_at,
++      tree: doc.tree,
++    });
++    this.store.merge(doc.tree);
++    this.schedule();
++  }
++
++  /** One relay read of every member's event. Throws on transport failure. */
++  async read(): Promise<void> {
++    const events = await this.transport.fetch();
++    if (this.destroyed) return;
++    for (const event of events) this.ingest(event);
++    this.ready = true;
++    this.schedule();
++  }
++
++  /** A local edit: publish after the debounce. */
++  defer(): void {
++    this.notBefore = Date.now() + DEBOUNCE_MS;
++    this.schedule();
++  }
++
++  /** True when the local tree holds registers no seen event carries. */
++  needsPublish(): boolean {
++    const local = this.store.get();
++    if (isEmptyTree(local)) return false;
++    let union: Tree = {};
++    for (const { tree } of this.seen.values()) union = mergeTrees(union, tree);
++    // `mergeTrees` returns its first argument when the second adds nothing.
++    return mergeTrees(union, local) !== union;
++  }
++
++  private schedule(): void {
++    if (this.destroyed || this.publishing || !this.ready) return;
++    if (this.timer !== null) {
++      clearTimeout(this.timer);
++      this.timer = null;
++    }
++    if (!this.needsPublish()) return;
++    this.timer = setTimeout(
++      () => {
++        this.timer = null;
++        void this.attempt();
++      },
++      Math.max(0, this.notBefore - Date.now()),
++    );
++  }
++
++  private async attempt(): Promise<void> {
++    if (this.destroyed || this.publishing || !this.needsPublish()) return;
++    const tree = this.store.get();
++    // Over today's caps or the relay's size ceiling: keep it local, never
++    // publish a truncated layout.
++    if (!TEAM_SECTIONS_LANE.withinLimits(TEAM_SECTIONS_LANE.project(tree)))
++      return;
++    const content = canonical(encodeDoc(TEAM_SECTIONS_LANE, tree));
++    if (byteLength(content) > MAX_CONTENT_BYTES) return;
++    const mine = this.seen.get(this.pubkey);
++    const createdAt = Math.max(
++      Math.floor(Date.now() / 1_000),
++      (mine?.createdAt ?? 0) + 1,
++    );
++    this.publishing = true;
++    try {
++      await this.transport.publish(content, createdAt);
++      this.failures = 0;
++      // Our own event now carries `tree`; the live echo (same `created_at`,
++      // any id) never beats this entry, so it is not merged twice.
++      this.seen.set(this.pubkey, { id: "", createdAt, tree });
++    } catch (error) {
++      console.warn(`[${TEAM_SECTIONS_D_TAG}] publish failed:`, error);
++      this.notBefore =
++        Date.now() +
++        (BACKOFF_MS[Math.min(this.failures, BACKOFF_MS.length - 1)] as number);
++      this.failures++;
++    } finally {
++      this.publishing = false;
++      // Picks up an edit made mid-publish, or retries behind the backoff.
++      this.schedule();
++    }
++  }
++
++  destroy(): void {
++    this.destroyed = true;
++    if (this.timer !== null) clearTimeout(this.timer);
++  }
++}
++
++/**
++ * Whether the community owner's app should copy the owner's personal layout
++ * into the team one. Only into a team layout that has never held anything
++ * (confirmed by a successful read), and only once per install, so it can
++ * never re-add sections the team has since deleted or override a layout
++ * someone else started.
++ */
++export function shouldSeedTeamSections(input: {
++  isOwner: boolean;
++  /** A relay read of every member's event has succeeded. */
++  synced: boolean;
++  /** The merged team tree has no registers at all, tombstones included. */
++  teamEmpty: boolean;
++  personalSectionCount: number;
++  alreadySeeded: boolean;
++}): boolean {
++  return (
++    input.isOwner &&
++    input.synced &&
++    input.teamEmpty &&
++    input.personalSectionCount > 0 &&
++    !input.alreadySeeded
++  );
++}
+diff --git a/desktop/src/features/sidebar/lib/useTeamChannelSections.ts b/desktop/src/features/sidebar/lib/useTeamChannelSections.ts
+new file mode 100644
+index 0000000..7825255
+--- /dev/null
++++ b/desktop/src/features/sidebar/lib/useTeamChannelSections.ts
+@@ -0,0 +1,384 @@
++import * as React from "react";
++
++import { relayClient } from "@/shared/api/relayClient";
++import { signRelayEvent } from "@/shared/api/tauri";
++import { KIND_CHANNEL_SECTIONS } from "@/shared/constants/kinds";
++import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
++import type { ChannelSection } from "./channelSectionsStorage";
++import {
++  maxLiveOrder,
++  projectSections,
++  type SectionsView,
++} from "./channelSectionsSync";
++import { LaneStore } from "./sidebarLaneStore";
++import { isEmptyTree, own, setRegs, type Tree } from "./sidebarLwwMap";
++import {
++  MAX_TEAM_SECTION_AUTHORS,
++  TEAM_SECTIONS_D_TAG,
++  TEAM_SECTIONS_LANE,
++  TeamSectionsReconciler,
++  shouldSeedTeamSections,
++  type TeamSectionsTransport,
++} from "./teamSectionsSync";
++
++const EMPTY: Tree = Object.freeze({}) as Tree;
++const REFRESH_MS = 5 * 60 * 1_000;
++
++const TEAM_FILTER = {
++  kinds: [KIND_CHANNEL_SECTIONS],
++  "#d": [TEAM_SECTIONS_D_TAG],
++};
++
++const relayTransport: TeamSectionsTransport = {
++  fetch: () =>
++    relayClient.fetchEvents({
++      ...TEAM_FILTER,
++      limit: MAX_TEAM_SECTION_AUTHORS,
++    }),
++  async publish(content, createdAt) {
++    const event = await signRelayEvent({
++      kind: KIND_CHANNEL_SECTIONS,
++      content,
++      createdAt,
++      tags: [
++        ["d", TEAM_SECTIONS_D_TAG],
++        ["t", TEAM_SECTIONS_D_TAG],
++      ],
++    });
++    try {
++      await relayClient.publishEvent(
++        event,
++        `Timed out publishing ${TEAM_SECTIONS_D_TAG}.`,
++        `Failed to publish ${TEAM_SECTIONS_D_TAG}.`,
++      );
++    } catch (error) {
++      if (!String((error as Error)?.message).startsWith("duplicate:"))
++        throw error;
++    }
++  },
++};
++
++/** Same whole-list reorder as personal sections (`useChannelSections`). */
++function writeOrder(tree: Tree, requested: string[]) {
++  const live = projectSections(tree).sections.map((s) => s.id);
++  const wanted = new Set(requested.filter((id) => live.includes(id)));
++  const ids = [...wanted, ...live.filter((id) => !wanted.has(id))];
++  return setRegs(
++    tree,
++    ids.map((id, index) => [["s", id, "order"], index]),
++    true,
++  );
++}
++
++/**
++ * Team sections for one pubkey + relay scope: the layout every member shares
++ * and any member can edit (see `teamSectionsSync`). Same surface as
++ * `useChannelSections`, plus `adoptSections` to seed the team layout from a
++ * personal one.
++ */
++export function useTeamChannelSections(
++  pubkey: string | undefined,
++  relayUrl?: string,
++) {
++  const store = React.useMemo(
++    () =>
++      pubkey && relayUrl
++        ? new LaneStore(TEAM_SECTIONS_LANE, pubkey, relayUrl)
++        : null,
++    [pubkey, relayUrl],
++  );
++  const reconcilerRef = React.useRef<TeamSectionsReconciler | null>(null);
++  // The store whose relay read has succeeded; compared by identity so a scope
++  // change is never mistaken for a synced one.
++  const [syncedStore, setSyncedStore] = React.useState<LaneStore | null>(null);
++  const tree = React.useSyncExternalStore(
++    React.useCallback(
++      (fn: () => void) => store?.subscribe(fn) ?? (() => {}),
++      [store],
++    ),
++    () => store?.get() ?? EMPTY,
++  );
++
++  React.useEffect(() => {
++    if (!store || !pubkey) return;
++    const rec = new TeamSectionsReconciler(store, pubkey, relayTransport);
++    reconcilerRef.current = rec;
++    let disposed = false;
++    let unsubLive: (() => Promise<void>) | null = null;
++    const read = () =>
++      void rec.read().then(
++        () => {
++          if (!disposed) setSyncedStore(store);
++        },
++        () => {},
++      );
++    const detachTabs = store.attachCrossTab();
++    const unsubReconnect = relayClient.subscribeToReconnects(read);
++    void relayClient
++      .subscribeLive({ ...TEAM_FILTER, limit: 0 }, (event) => {
++        if (!disposed) rec.ingest(event);
++      })
++      .then((dispose) => {
++        if (disposed) void dispose();
++        else unsubLive = dispose;
++      })
++      .catch(() => {});
++    read();
++    // A missed live event or a failed first read is repaired here.
++    const refresh = setInterval(read, REFRESH_MS);
++    return () => {
++      disposed = true;
++      rec.destroy();
++      reconcilerRef.current = null;
++      clearInterval(refresh);
++      detachTabs();
++      unsubReconnect();
++      if (unsubLive) void unsubLive();
++    };
++  }, [store, pubkey]);
++
++  const edit = React.useCallback(
++    (fn: (tree: Tree) => Tree) => {
++      if (!store) return;
++      const before = store.get();
++      store.transact(fn);
++      if (store.get() !== before) reconcilerRef.current?.defer();
++    },
++    [store],
++  );
++
++  const { sections, assignments } = React.useMemo(
++    () => projectSections(tree),
++    [tree],
++  );
++
++  const createSection = React.useCallback(
++    (name: string, icon?: string): ChannelSection | null => {
++      if (!pubkey || !relayUrl) return null;
++      const id = crypto.randomUUID();
++      let order = 0;
++      edit((prev) => {
++        order = projectSections(prev).sections.length;
++        return setRegs(prev, [
++          [["s", id, "name"], name],
++          [["s", id, "icon"], icon || null],
++          [["s", id, "order"], maxLiveOrder(prev) + 1],
++          [["s", id, "live"], true],
++        ]);
++      });
++      return { id, name, ...(icon ? { icon } : {}), order };
++    },
++    [pubkey, relayUrl, edit],
++  );
++
++  const renameSection = React.useCallback(
++    (sectionId: string, newName: string, icon?: string) =>
++      edit((prev) =>
++        setRegs(prev, [
++          [["s", sectionId, "name"], newName],
++          [["s", sectionId, "icon"], icon || null],
++        ]),
++      ),
++    [edit],
++  );
++
++  const deleteSection = React.useCallback(
++    (sectionId: string) =>
++      edit((prev) => setRegs(prev, [[["s", sectionId, "live"], false]])),
++    [edit],
++  );
++
++  const reorderSections = React.useCallback(
++    (orderedIds: string[]) => edit((prev) => writeOrder(prev, orderedIds)),
++    [edit],
++  );
++
++  const moveSection = React.useCallback(
++    (sectionId: string, step: -1 | 1) =>
++      edit((prev) => {
++        const ids = projectSections(prev).sections.map((s) => s.id);
++        const from = ids.indexOf(sectionId);
++        const to = from + step;
++        if (from < 0 || to < 0 || to >= ids.length) return prev;
++        [ids[from], ids[to]] = [ids[to] as string, sectionId];
++        return writeOrder(prev, ids);
++      }),
++    [edit],
++  );
++  const moveSectionUp = React.useCallback(
++    (sectionId: string) => moveSection(sectionId, -1),
++    [moveSection],
++  );
++  const moveSectionDown = React.useCallback(
++    (sectionId: string) => moveSection(sectionId, 1),
++    [moveSection],
++  );
++
++  const assignChannel = React.useCallback(
++    (channelId: string, sectionId: string) =>
++      edit((prev) => setRegs(prev, [[["a", channelId], sectionId]])),
++    [edit],
++  );
++
++  const unassignChannel = React.useCallback(
++    (channelId: string) =>
++      edit((prev) =>
++        prev.a && own(prev.a as Tree, channelId)
++          ? setRegs(prev, [[["a", channelId], null]])
++          : prev,
++      ),
++    [edit],
++  );
++
++  /** Adds `view`'s sections (after the existing ones) and assignments, as one edit. */
++  const adoptSections = React.useCallback(
++    (view: SectionsView) =>
++      edit((prev) => {
++        const base = maxLiveOrder(prev) + 1;
++        return setRegs(prev, [
++          ...view.sections.flatMap(
++            (section, index): Array<[string[], unknown]> => [
++              [["s", section.id, "name"], section.name],
++              [["s", section.id, "icon"], section.icon ?? null],
++              [["s", section.id, "order"], base + index],
++              [["s", section.id, "live"], true],
++            ],
++          ),
++          ...Object.entries(view.assignments).map(
++            ([channelId, sectionId]): [string[], unknown] => [
++              ["a", channelId],
++              sectionId,
++            ],
++          ),
++        ]);
++      }),
++    [edit],
++  );
++
++  return {
++    sections,
++    assignments,
++    createSection,
++    renameSection,
++    deleteSection,
++    moveSectionUp,
++    moveSectionDown,
++    reorderSections,
++    assignChannel,
++    unassignChannel,
++    adoptSections,
++    /** A relay read of every member's event has succeeded in this scope. */
++    synced: store !== null && syncedStore === store,
++    /** The team layout has never held anything (no registers, no tombstones). */
++    isEmpty: isEmptyTree(tree),
++  };
++}
++
++const seededKey = (pubkey: string, relayUrl: string) =>
++  `buzz-team-sections-seeded.v1:${pubkey}:${encodeURIComponent(normalizeRelayUrl(relayUrl))}`;
++
++/**
++ * Makes the community owner's personal layout the team's starting layout: the
++ * first time the owner's app sees a never-used team layout, it copies the
++ * owner's personal sections into it (see `shouldSeedTeamSections`). Members
++ * who never chose then see that layout by default.
++ */
++export function useSeedTeamSectionsFromOwner(
++  isOwner: boolean,
++  team: {
++    synced: boolean;
++    isEmpty: boolean;
++    adoptSections: (view: SectionsView) => void;
++  },
++  personal: SectionsView,
++  pubkey: string | undefined,
++  relayUrl: string | undefined,
++) {
++  const { synced, isEmpty, adoptSections } = team;
++  const { sections, assignments } = personal;
++  React.useEffect(() => {
++    if (!pubkey || !relayUrl) return;
++    const key = seededKey(pubkey, relayUrl);
++    let alreadySeeded = true;
++    try {
++      alreadySeeded = window.localStorage.getItem(key) !== null;
++    } catch {
++      // Unreadable storage: never seed, rather than seed on every launch.
++    }
++    if (
++      !shouldSeedTeamSections({
++        isOwner,
++        synced,
++        teamEmpty: isEmpty,
++        personalSectionCount: sections.length,
++        alreadySeeded,
++      })
++    )
++      return;
++    try {
++      window.localStorage.setItem(key, "1");
++    } catch {
++      return;
++    }
++    adoptSections({ sections, assignments });
++  }, [
++    isOwner,
++    synced,
++    isEmpty,
++    sections,
++    assignments,
++    adoptSections,
++    pubkey,
++    relayUrl,
++  ]);
++}
++
++type TeamSectionsPreference = "on" | "off" | null;
++
++const preferenceKey = (pubkey: string, relayUrl: string) =>
++  `buzz-team-sections-pref.v1:${pubkey}:${encodeURIComponent(normalizeRelayUrl(relayUrl))}`;
++
++function readPreference(key: string | null): TeamSectionsPreference {
++  try {
++    const raw = key ? window.localStorage.getItem(key) : null;
++    return raw === "on" || raw === "off" ? raw : null;
++  } catch {
++    return null;
++  }
++}
++
++/**
++ * This install's choice for one pubkey + relay scope: `"on"` shows the team
++ * layout, `"off"` the personal one, and `null` (never chosen) follows the
++ * team layout once it has any section.
++ */
++export function useTeamSectionsPreference(
++  pubkey: string | undefined,
++  relayUrl: string | undefined,
++): [TeamSectionsPreference, (next: boolean) => void] {
++  const key = pubkey && relayUrl ? preferenceKey(pubkey, relayUrl) : null;
++  const [state, setState] = React.useState(() => ({
++    key,
++    value: readPreference(key),
++  }));
++  // Re-read during render when the scope changes, so no frame shows the
++  // previous community's choice.
++  const current =
++    state.key === key ? state : { key, value: readPreference(key) };
++  if (current !== state) setState(current);
++
++  const set = React.useCallback(
++    (next: boolean) => {
++      if (!key) return;
++      const value = next ? "on" : "off";
++      try {
++        window.localStorage.setItem(key, value);
++      } catch {
++        // Still applies for this session.
++      }
++      setState({ key, value });
++    },
++    [key],
++  );
++  return [current.value, set];
++}
+diff --git a/desktop/src/features/sidebar/ui/AppSidebar.tsx b/desktop/src/features/sidebar/ui/AppSidebar.tsx
+index 0bc6186..98fa570 100644
+--- a/desktop/src/features/sidebar/ui/AppSidebar.tsx
++++ b/desktop/src/features/sidebar/ui/AppSidebar.tsx
+@@ -10,6 +10,13 @@ import {
+   useChannelSections,
+   type ChannelSection,
+ } from "@/features/sidebar/lib/useChannelSections";
++import { useMyRelayMembershipLookupQuery } from "@/features/community-members/hooks";
++import {
++  useSeedTeamSectionsFromOwner,
++  useTeamChannelSections,
++  useTeamSectionsPreference,
++} from "@/features/sidebar/lib/useTeamChannelSections";
++import { useProvideTeamSectionsMenu } from "@/features/sidebar/ui/TeamSectionsMenu";
+ import { useActiveWorkingChannelsById } from "@/features/sidebar/lib/useActiveWorkingChannelsById";
+ import { useDmSidebarMetadata } from "@/features/sidebar/useDmSidebarMetadata";
+ import { sortDmChannelsForSidebar } from "@/features/sidebar/lib/dmSidebarSort";
+@@ -265,6 +272,21 @@ export function AppSidebar({
+     }));
+   }, []);
+ 
++  // Team sections: one layout shared by every member. Shown when chosen, or
++  // by default once the team layout has any section.
++  const personalSections = useChannelSections(
++    currentPubkey,
++    activeCommunity?.relayUrl,
++  );
++  const teamSections = useTeamChannelSections(
++    currentPubkey,
++    activeCommunity?.relayUrl,
++  );
++  const [teamSectionsPreference, setTeamSectionsActive] =
++    useTeamSectionsPreference(currentPubkey, activeCommunity?.relayUrl);
++  const teamSectionsActive =
++    teamSectionsPreference === "on" ||
++    (teamSectionsPreference === null && teamSections.sections.length > 0);
+   const {
+     sections: channelSections,
+     assignments: channelAssignments,
+@@ -276,7 +298,22 @@ export function AppSidebar({
+     reorderSections,
+     assignChannel,
+     unassignChannel,
+-  } = useChannelSections(currentPubkey, activeCommunity?.relayUrl);
++  } = teamSectionsActive ? teamSections : personalSections;
++  // The owner's personal layout becomes the team's starting layout, once.
++  const myMembershipQuery = useMyRelayMembershipLookupQuery();
++  useSeedTeamSectionsFromOwner(
++    myMembershipQuery.data?.membership?.role === "owner",
++    teamSections,
++    personalSections,
++    currentPubkey,
++    activeCommunity?.relayUrl,
++  );
++  useProvideTeamSectionsMenu(
++    teamSectionsActive,
++    setTeamSectionsActive,
++    personalSections,
++    teamSections.adoptSections,
++  );
+ 
+   const sectionIds = React.useMemo(
+     () => channelSections.map((s) => s.id),
+diff --git a/desktop/src/features/sidebar/ui/ChannelContextMenu.tsx b/desktop/src/features/sidebar/ui/ChannelContextMenu.tsx
+index 49f0b8f..442745c 100644
+--- a/desktop/src/features/sidebar/ui/ChannelContextMenu.tsx
++++ b/desktop/src/features/sidebar/ui/ChannelContextMenu.tsx
+@@ -31,6 +31,7 @@ import {
+   ContextMenuIconSlot,
+   deferMenuAction,
+ } from "@/features/sidebar/ui/sidebarMenuHelpers";
++import { TeamSectionsMenuItems } from "@/features/sidebar/ui/TeamSectionsMenu";
+ import { StatusEmoji } from "@/features/user-status/ui/StatusEmoji";
+ import type { Channel } from "@/shared/api/types";
+ import { useIdentityQuery } from "@/shared/api/hooks";
+@@ -103,6 +104,7 @@ function MoveToSectionSubmenu({
+             <span>Remove from section</span>
+           </ContextMenuItem>
+         ) : null}
++        <TeamSectionsMenuItems />
+       </ContextMenuSubContent>
+     </ContextMenuSub>
+   );
+diff --git a/desktop/src/features/sidebar/ui/TeamSectionsMenu.tsx b/desktop/src/features/sidebar/ui/TeamSectionsMenu.tsx
+new file mode 100644
+index 0000000..5936110
+--- /dev/null
++++ b/desktop/src/features/sidebar/ui/TeamSectionsMenu.tsx
+@@ -0,0 +1,88 @@
++import { Check, Users } from "lucide-react";
++import * as React from "react";
++
++import type { SectionsView } from "@/features/sidebar/lib/channelSectionsSync";
++import {
++  ContextMenuIconSlot,
++  deferMenuAction,
++} from "@/features/sidebar/ui/sidebarMenuHelpers";
++import {
++  ContextMenuItem,
++  ContextMenuSeparator,
++} from "@/shared/ui/context-menu";
++
++type TeamSectionsMenuState = {
++  /** The sidebar is showing the shared team layout. */
++  active: boolean;
++  setActive: (next: boolean) => void;
++  /** Copies the personal layout into the team one; null when there is nothing to copy. */
++  copyPersonal: (() => void) | null;
++};
++
++// What the mounted sidebar currently offers. Channel menus render deep below
++// the sidebar through several prop layers, so they read it from here instead.
++// Set by `useProvideTeamSectionsMenu` and cleared when the sidebar unmounts
++// (which a community switch does), so nothing outlives its community.
++let current: TeamSectionsMenuState | null = null;
++const listeners = new Set<() => void>();
++
++function publish(next: TeamSectionsMenuState | null) {
++  current = next;
++  for (const listener of listeners) listener();
++}
++
++const subscribe = (listener: () => void) => {
++  listeners.add(listener);
++  return () => {
++    listeners.delete(listener);
++  };
++};
++
++/** Called by the sidebar: exposes its team-section state to the channel menus. */
++export function useProvideTeamSectionsMenu(
++  active: boolean,
++  setActive: (next: boolean) => void,
++  personal: SectionsView,
++  adoptSections: (view: SectionsView) => void,
++) {
++  const { sections, assignments } = personal;
++  React.useEffect(() => {
++    publish({
++      active,
++      setActive,
++      copyPersonal:
++        sections.length > 0
++          ? () => adoptSections({ sections, assignments })
++          : null,
++    });
++    return () => publish(null);
++  }, [active, setActive, sections, assignments, adoptSections]);
++}
++
++/** Team-section entries for the channel "Move to section" submenu. */
++export function TeamSectionsMenuItems() {
++  const team = React.useSyncExternalStore(subscribe, () => current);
++  if (!team) return null;
++  const { active, setActive, copyPersonal } = team;
++  return (
++    <>
++      <ContextMenuSeparator />
++      <ContextMenuItem
++        onSelect={() => deferMenuAction(() => setActive(!active))}
++      >
++        <ContextMenuIconSlot>
++          {active ? <Check className="h-4 w-4" /> : null}
++        </ContextMenuIconSlot>
++        <span>Use team sections (shared with everyone)</span>
++      </ContextMenuItem>
++      {active && copyPersonal ? (
++        <ContextMenuItem onSelect={() => deferMenuAction(copyPersonal)}>
++          <ContextMenuIconSlot>
++            <Users className="h-4 w-4" />
++          </ContextMenuIconSlot>
++          <span>Copy my sections to team</span>
++        </ContextMenuItem>
++      ) : null}
++    </>
++  );
++}
