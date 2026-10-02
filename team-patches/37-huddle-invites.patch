@@ -1,0 +1,703 @@
+diff --git a/desktop/src-tauri/src/huddle/agents.rs b/desktop/src-tauri/src/huddle/agents.rs
+index 2bdf05442..d12195ea9 100644
+--- a/desktop/src-tauri/src/huddle/agents.rs
++++ b/desktop/src-tauri/src/huddle/agents.rs
+@@ -139,6 +139,52 @@ pub async fn add_agent_to_huddle(
+     })
+ }
+ 
++/// Outcome of inviting a person into the active huddle.
++#[derive(Debug, Serialize)]
++pub struct HumanInviteResult {
++    pub parent_channel_id: String,
++    pub ephemeral_channel_id: String,
++    /// The kind:48100 "huddle started" event, when known — lets the invite
++    /// card join with the same thread context as the channel card.
++    pub huddle_event_id: Option<String>,
++    /// Whether the person is (now) a member of the parent channel.
++    pub parent_added: bool,
++    pub parent_error: Option<String>,
++}
++
++/// Let a person into the huddle (Discord-style "invite to call").
++///
++/// Adds them to the private ephemeral huddle channel as `member` — the relay
++/// admits explicit ephemeral members even if they are not in the parent
++/// channel. With `add_to_parent`, also adds them to the parent channel
++/// (best-effort, existing membership and role are left untouched).
++pub async fn add_human_to_huddle(
++    ephemeral_channel_id: Uuid,
++    parent_channel_id: Uuid,
++    pubkey: &str,
++    add_to_parent: bool,
++    state: &AppState,
++) -> Result<(bool, Option<String>), String> {
++    let add_eph = events::build_add_member(ephemeral_channel_id, pubkey, Some("member"))?;
++    submit_event(add_eph, state).await?;
++
++    let parent_id = parent_channel_id.to_string();
++    let already_in_parent = fetch_channel_members_with_roles(&parent_id, state)
++        .await
++        .is_ok_and(|members| contains_member(&members, pubkey));
++    if already_in_parent || !add_to_parent {
++        return Ok((already_in_parent, None));
++    }
++    let add_parent = events::build_add_member(parent_channel_id, pubkey, Some("member"))?;
++    match submit_event(add_parent, state).await {
++        Ok(_) => Ok((true, None)),
++        Err(e) => {
++            eprintln!("buzz-desktop: add person to parent channel failed: {e}");
++            Ok((false, Some(e)))
++        }
++    }
++}
++
+ /// Reconcile explicitly added channel agents into the active Huddle.
+ ///
+ /// The source channel may be either the Huddle's parent or its ephemeral chat.
+diff --git a/desktop/src-tauri/src/huddle/commands.rs b/desktop/src-tauri/src/huddle/commands.rs
+index e4f25a93f..ca91ca58f 100644
+--- a/desktop/src-tauri/src/huddle/commands.rs
++++ b/desktop/src-tauri/src/huddle/commands.rs
+@@ -214,3 +214,70 @@ pub async fn add_agent_to_huddle(
+ 
+     Ok(result)
+ }
++
++/// Invite a person into the active huddle: admit them to the huddle channel
++/// and (optionally) add them to the parent channel. The caller then sends the
++/// ringing invite message to their DM.
++#[tauri::command]
++pub async fn invite_to_huddle(
++    pubkey: String,
++    add_to_parent: bool,
++    state: State<'_, AppState>,
++) -> Result<agents::HumanInviteResult, String> {
++    validate_pubkey_hex(&pubkey)?;
++    let (eph_id, parent_id, huddle_event_id) = {
++        let hs = state.huddle()?;
++        if !matches!(hs.phase, HuddlePhase::Connected | HuddlePhase::Active) {
++            return Err("no active huddle".to_string());
++        }
++        (
++            hs.ephemeral_channel_id
++                .clone()
++                .ok_or("no ephemeral channel")?,
++            hs.parent_channel_id.clone().ok_or("no parent channel")?,
++            hs.huddle_thread_event_id.clone(),
++        )
++    };
++    let eph_uuid = Uuid::parse_str(&eph_id).map_err(|e| e.to_string())?;
++    let parent_uuid = Uuid::parse_str(&parent_id).map_err(|e| e.to_string())?;
++
++    let (parent_added, parent_error) =
++        agents::add_human_to_huddle(eph_uuid, parent_uuid, &pubkey, add_to_parent, &state).await?;
++
++    Ok(agents::HumanInviteResult {
++        parent_channel_id: parent_id,
++        ephemeral_channel_id: eph_id,
++        huddle_event_id,
++        parent_added,
++        parent_error,
++    })
++}
++
++/// Ring a person by posting this huddle's "started" card into their DM.
++///
++/// The relay accepts a join through a parent only when that parent holds a
++/// creator-signed kind:48100 for the huddle, so only the huddle's creator can
++/// ring. Every Buzz client already renders the card with a Join button and
++/// raises a call notification for it in DMs. Returns the card's event id.
++#[tauri::command]
++pub async fn ring_huddle_in_dm(
++    dm_channel_id: String,
++    state: State<'_, AppState>,
++) -> Result<String, String> {
++    let eph_id = {
++        let hs = state.huddle()?;
++        if !matches!(hs.phase, HuddlePhase::Connected | HuddlePhase::Active) {
++            return Err("no active huddle".to_string());
++        }
++        if !hs.is_creator {
++            return Err("only the huddle's creator can ring".to_string());
++        }
++        hs.ephemeral_channel_id
++            .clone()
++            .ok_or("no ephemeral channel")?
++    };
++    Uuid::parse_str(&dm_channel_id).map_err(|e| e.to_string())?;
++    let builder = events::build_huddle_started(&dm_channel_id, &eph_id)?;
++    let event = submit_event(builder, &state).await?;
++    Ok(event.event_id)
++}
+diff --git a/desktop/src-tauri/src/huddle/mod.rs b/desktop/src-tauri/src/huddle/mod.rs
+index 5cb8cc70b..92faa6ca6 100644
+--- a/desktop/src-tauri/src/huddle/mod.rs
++++ b/desktop/src-tauri/src/huddle/mod.rs
+@@ -77,8 +77,8 @@ pub(super) fn drain_until_shutdown<T>(
+ // ── Re-exports ────────────────────────────────────────────────────────────────
+ 
+ pub use commands::{
+-    add_agent_to_huddle, interrupt_huddle_speech, remove_agent_from_huddle,
+-    set_huddle_manual_mic_unmuted,
++    add_agent_to_huddle, interrupt_huddle_speech, invite_to_huddle, remove_agent_from_huddle,
++    ring_huddle_in_dm, set_huddle_manual_mic_unmuted,
+ };
+ pub use state::{HuddleJoinInfo, HuddlePhase, HuddleState, VoiceInputMode};
+ pub use transcription::{
+diff --git a/desktop/src-tauri/src/lib.rs b/desktop/src-tauri/src/lib.rs
+index 752538847..e8ca3f62a 100644
+--- a/desktop/src-tauri/src/lib.rs
++++ b/desktop/src-tauri/src/lib.rs
+@@ -72,11 +72,12 @@ use huddle::{
+     audio_output::{get_audio_output_device, list_audio_output_devices, set_audio_output_device},
+     check_pipeline_hotstart, close_huddle_companion, confirm_huddle_active, download_voice_models,
+     end_huddle, get_huddle_agent_pubkeys, get_huddle_state, get_model_status, get_voice_input_mode,
+-    interrupt_huddle_speech, join_huddle, leave_huddle, open_huddle_window, push_audio_pcm,
++    interrupt_huddle_speech, invite_to_huddle, join_huddle, leave_huddle, open_huddle_window,
++    push_audio_pcm,
+     reconnect::reconnect_huddle_audio,
+-    remove_agent_from_huddle, set_huddle_manual_mic_unmuted, set_huddle_stt_language,
+-    set_huddle_transcription_enabled, set_tts_enabled, set_voice_input_mode, speak_agent_message,
+-    start_huddle, start_stt_pipeline, HuddlePhase,
++    remove_agent_from_huddle, ring_huddle_in_dm, set_huddle_manual_mic_unmuted,
++    set_huddle_stt_language, set_huddle_transcription_enabled, set_tts_enabled,
++    set_voice_input_mode, speak_agent_message, start_huddle, start_stt_pipeline, HuddlePhase,
+ };
+ use initial_window::*;
+ use managed_agents::{
+@@ -826,6 +827,8 @@ pub fn run() {
+             speak_agent_message,
+             interrupt_huddle_speech,
+             add_agent_to_huddle,
++            invite_to_huddle,
++            ring_huddle_in_dm,
+             remove_agent_from_huddle,
+             huddle::agents::sync_agents_to_active_huddle,
+             check_pipeline_hotstart,
+diff --git a/desktop/src/features/huddle/components/HuddleBar.tsx b/desktop/src/features/huddle/components/HuddleBar.tsx
+index 568967e9c..d42ee8f69 100644
+--- a/desktop/src/features/huddle/components/HuddleBar.tsx
++++ b/desktop/src/features/huddle/components/HuddleBar.tsx
+@@ -8,6 +8,7 @@ import {
+   PictureInPicture,
+   PictureInPicture2,
+   SmilePlus,
++  UserPlus,
+ } from "lucide-react";
+ import * as React from "react";
+ 
+@@ -35,6 +36,7 @@ import {
+ } from "../lib/transcriptLanguage";
+ import { useHuddleParticipantRoster } from "../hooks/useHuddleParticipantRoster";
+ import { AddAgentDialog, type AgentAddResult } from "./AddAgentDialog";
++import { InvitePeopleDialog } from "./InvitePeopleDialog";
+ import type { HuddleAgentVoiceSettings } from "./AgentVoiceMenu";
+ import { MicControls, SpeakerControls } from "./MicControls";
+ import { HuddleParticipantsControl } from "./ParticipantList";
+@@ -195,6 +197,7 @@ export function HuddleBar({
+   );
+   const [isLeaving, setIsLeaving] = React.useState(false);
+   const [showAddAgent, setShowAddAgent] = React.useState(false);
++  const [showInvitePeople, setShowInvitePeople] = React.useState(false);
+   const [agentAddError, setAgentAddError] = React.useState<string | null>(null);
+   const [isReactionPickerOpen, setIsReactionPickerOpen] = React.useState(false);
+   const [reactionError, setReactionError] = React.useState<string | null>(null);
+@@ -676,6 +679,20 @@ export function HuddleBar({
+           open={showAddAgent}
+         />
+ 
++        <InvitePeopleDialog
++          isCreator={barState.is_creator}
++          onClose={() => setShowInvitePeople(false)}
++          open={showInvitePeople}
++          parentChannelId={barState.parent_channel_id}
++          participantPubkeys={barState.participants}
++          selfName={
++            profileQuery.data?.displayName?.trim() ||
++            identityQuery.data?.displayName?.trim() ||
++            ""
++          }
++          selfPubkey={currentPubkey}
++        />
++
+         <div className="flex shrink-0 items-center gap-2">
+           <MicControls
+             isMuted={isMuted}
+@@ -846,6 +863,24 @@ export function HuddleBar({
+             </TooltipContent>
+           </Tooltip>
+ 
++          <Tooltip>
++            <TooltipTrigger asChild>
++              <Button
++                aria-label="Invite people to huddle"
++                className="buzz-huddle-control-button h-12 w-12 shrink-0 rounded-md"
++                onClick={() => setShowInvitePeople(true)}
++                size="icon"
++                type="button"
++                variant="secondary"
++              >
++                <UserPlus className="h-4 w-4" />
++              </Button>
++            </TooltipTrigger>
++            <TooltipContent className="buzz-huddle-tooltip" side="top">
++              Invite people
++            </TooltipContent>
++          </Tooltip>
++
+           <Tooltip>
+             <TooltipTrigger asChild>
+               <Button
+diff --git a/desktop/src/features/huddle/components/InvitePeopleDialog.tsx b/desktop/src/features/huddle/components/InvitePeopleDialog.tsx
+new file mode 100644
+index 000000000..4767d753b
+--- /dev/null
++++ b/desktop/src/features/huddle/components/InvitePeopleDialog.tsx
+@@ -0,0 +1,224 @@
++import { invoke } from "@tauri-apps/api/core";
++import { Check, LoaderCircle } from "lucide-react";
++import * as React from "react";
++
++import { useChannelsQuery } from "@/features/channels/hooks";
++import { buildHuddleInviteContent } from "@/features/messages/lib/huddleInviteMessage";
++import { useUserSearchQuery } from "@/features/profile/hooks";
++import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
++import { openDm, sendChannelMessage } from "@/shared/api/tauri";
++import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
++import { Dialog } from "@/shared/ui/dialog";
++import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
++
++// Mirrors HumanInviteResult in src-tauri/src/huddle/agents.rs.
++type HumanInviteResult = {
++  parent_channel_id: string;
++  ephemeral_channel_id: string;
++  huddle_event_id: string | null;
++  parent_added: boolean;
++  parent_error: string | null;
++};
++
++type InvitePeopleDialogProps = {
++  open: boolean;
++  onClose: () => void;
++  selfPubkey: string | null;
++  selfName: string;
++  participantPubkeys: string[];
++  parentChannelId: string | null;
++  /** Only the huddle's creator can ring with a real huddle card. */
++  isCreator: boolean;
++};
++
++/**
++ * Discord-style "invite to call": admit a person to the running huddle and
++ * ring them with a join card in their DM. Optionally add them to the channel.
++ */
++export function InvitePeopleDialog({
++  open,
++  onClose,
++  selfPubkey,
++  selfName,
++  participantPubkeys,
++  parentChannelId,
++  isCreator,
++}: InvitePeopleDialogProps) {
++  const [query, setQuery] = React.useState("");
++  const [addToChannel, setAddToChannel] = React.useState(false);
++  const [busy, setBusy] = React.useState<string | null>(null);
++  const [invited, setInvited] = React.useState<Set<string>>(new Set());
++  const [error, setError] = React.useState<string | null>(null);
++  const [notice, setNotice] = React.useState<string | null>(null);
++
++  React.useEffect(() => {
++    if (!open) return;
++    setQuery("");
++    setBusy(null);
++    setInvited(new Set());
++    setError(null);
++    setNotice(null);
++  }, [open]);
++
++  const deferredQuery = React.useDeferredValue(query.trim());
++  const searchQuery = useUserSearchQuery(deferredQuery, {
++    enabled: open && deferredQuery.length > 0,
++    limit: 12,
++  });
++  const channelsQuery = useChannelsQuery({ enabled: open });
++  const parentChannel = channelsQuery.data?.find(
++    (c) => c.id === parentChannelId,
++  );
++  // A DM huddle has no meaningful channel name ("DM") to show.
++  const channelName =
++    parentChannel && parentChannel.channelType !== "dm"
++      ? parentChannel.name
++      : null;
++
++  const excluded = React.useMemo(() => {
++    const set = new Set(participantPubkeys.map(normalizePubkey));
++    if (selfPubkey) set.add(normalizePubkey(selfPubkey));
++    return set;
++  }, [participantPubkeys, selfPubkey]);
++
++  const people = (searchQuery.data ?? []).filter(
++    (user) => !user.isAgent && !excluded.has(normalizePubkey(user.pubkey)),
++  );
++
++  async function handleInvite(pubkey: string, label: string) {
++    if (busy) return;
++    setBusy(pubkey);
++    setError(null);
++    setNotice(null);
++    try {
++      const result = await invoke<HumanInviteResult>("invite_to_huddle", {
++        pubkey,
++        addToParent: addToChannel,
++      });
++      const dm = await openDm({ pubkeys: [pubkey] });
++      if (isCreator) {
++        // A real huddle card in their DM: every Buzz client shows it with a
++        // Join button and a call notification, patched or not.
++        await invoke<string>("ring_huddle_in_dm", { dmChannelId: dm.id });
++      } else {
++        await sendChannelMessage(
++          dm.id,
++          buildHuddleInviteContent({
++            inviterName: selfName,
++            parentChannelId: result.parent_channel_id,
++            ephemeralChannelId: result.ephemeral_channel_id,
++            huddleEventId: result.huddle_event_id,
++            channelName,
++          }),
++        );
++      }
++      setInvited((prev) => new Set(prev).add(pubkey));
++      if (addToChannel && result.parent_error) {
++        setNotice(
++          `${label}님을 불렀지만 채널 추가는 실패했어요: ${result.parent_error}`,
++        );
++      }
++    } catch (e: unknown) {
++      const msg = e instanceof Error ? e.message : String(e);
++      setError(`${label}님을 부르지 못했어요: ${msg}`);
++    } finally {
++      setBusy(null);
++    }
++  }
++
++  return (
++    <Dialog
++      onOpenChange={(next) => {
++        if (!next) onClose();
++      }}
++      open={open}
++    >
++      <ChooserDialogContent
++        className="max-w-xl"
++        data-no-translate
++        data-testid="invite-huddle-people-dialog"
++        headerSubtitle="부르면 바로 이 통화에 들어올 수 있고, DM으로 참여 카드가 가요."
++        scrollAreaClassName="space-y-4"
++        title="통화에 사람 부르기"
++      >
++        <input
++          autoFocus
++          className="w-full rounded-lg border bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
++          onChange={(event) => setQuery(event.target.value)}
++          placeholder="이름으로 검색"
++          value={query}
++        />
++        <label className="flex items-center gap-2 text-sm text-muted-foreground">
++          <input
++            checked={addToChannel}
++            onChange={(event) => setAddToChannel(event.target.checked)}
++            type="checkbox"
++          />
++          {channelName ? `#${channelName} 채널에도 추가` : "채널에도 추가"}
++        </label>
++
++        {error ? (
++          <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
++            {error}
++          </p>
++        ) : null}
++        {notice ? (
++          <p className="rounded-lg border border-warning/30 bg-warning-bg px-4 py-3 text-sm text-warning">
++            {notice}
++          </p>
++        ) : null}
++
++        {deferredQuery.length === 0 ? (
++          <p className="py-4 text-center text-sm text-muted-foreground">
++            부를 사람 이름을 입력하세요.
++          </p>
++        ) : searchQuery.isLoading ? (
++          <p className="py-4 text-center text-sm text-muted-foreground">
++            찾는 중…
++          </p>
++        ) : people.length === 0 ? (
++          <p className="py-4 text-center text-sm text-muted-foreground">
++            부를 수 있는 사람이 없어요.
++          </p>
++        ) : (
++          <ul className="flex flex-col gap-1">
++            {people.map((user) => {
++              const label =
++                user.displayName?.trim() || truncateNpub(user.pubkey);
++              const isBusy = busy === user.pubkey;
++              const isInvited = invited.has(user.pubkey);
++              return (
++                <li
++                  className="flex items-center gap-3 rounded-lg px-3 py-2"
++                  key={user.pubkey}
++                >
++                  <ProfileAvatar
++                    avatarUrl={user.avatarUrl}
++                    className="h-9 w-9 shrink-0 text-xs"
++                    label={label}
++                  />
++                  <span className="min-w-0 flex-1 truncate text-sm font-medium">
++                    {label}
++                  </span>
++                  <button
++                    className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-accent disabled:opacity-50"
++                    disabled={busy !== null || isInvited}
++                    onClick={() => void handleInvite(user.pubkey, label)}
++                    type="button"
++                  >
++                    {isBusy ? (
++                      <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
++                    ) : isInvited ? (
++                      <Check className="h-3.5 w-3.5" />
++                    ) : null}
++                    {isInvited ? "불렀어요" : "부르기"}
++                  </button>
++                </li>
++              );
++            })}
++          </ul>
++        )}
++      </ChooserDialogContent>
++    </Dialog>
++  );
++}
+diff --git a/desktop/src/features/messages/lib/huddleInviteMessage.test.mjs b/desktop/src/features/messages/lib/huddleInviteMessage.test.mjs
+new file mode 100644
+index 000000000..06f7abae2
+--- /dev/null
++++ b/desktop/src/features/messages/lib/huddleInviteMessage.test.mjs
+@@ -0,0 +1,43 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import {
++  buildHuddleInviteContent,
++  parseHuddleInviteContent,
++} from "./huddleInviteMessage.ts";
++
++test("invite content round-trips", () => {
++  const content = buildHuddleInviteContent({
++    inviterName: "구윤",
++    parentChannelId: "p-1",
++    ephemeralChannelId: "e-1",
++    huddleEventId: "ev",
++    channelName: "제작부",
++  });
++  assert.ok(content.endsWith("📞 구윤님이 #제작부 통화에 초대했어요."));
++  assert.deepEqual(parseHuddleInviteContent(content), {
++    parentChannelId: "p-1",
++    ephemeralChannelId: "e-1",
++    huddleEventId: "ev",
++    channelName: "제작부",
++    fallbackText: "📞 구윤님이 #제작부 통화에 초대했어요.",
++  });
++});
++
++test("a channel name with -- cannot close the marker early", () => {
++  const content = buildHuddleInviteContent({
++    inviterName: "a",
++    parentChannelId: "p",
++    ephemeralChannelId: "e",
++    channelName: "x-->y",
++  });
++  assert.equal(parseHuddleInviteContent(content)?.channelName, "x-->y");
++});
++
++test("plain messages are not invites", () => {
++  assert.equal(parseHuddleInviteContent("hello"), null);
++  assert.equal(
++    parseHuddleInviteContent("<!-- buzz:huddle-invite:v1 {bad} -->"),
++    null,
++  );
++});
+diff --git a/desktop/src/features/messages/lib/huddleInviteMessage.ts b/desktop/src/features/messages/lib/huddleInviteMessage.ts
+new file mode 100644
+index 000000000..5f91345c7
+--- /dev/null
++++ b/desktop/src/features/messages/lib/huddleInviteMessage.ts
+@@ -0,0 +1,59 @@
++/**
++ * Discord-style huddle invite sent to a person's DM. The payload rides in an
++ * HTML comment so clients without the invite card still show the plain line.
++ */
++const MARKER_PREFIX = "<!-- buzz:huddle-invite:v1 ";
++const MARKER_SUFFIX = " -->";
++
++export type HuddleInvite = {
++  parentChannelId: string;
++  ephemeralChannelId: string;
++  huddleEventId: string | null;
++  channelName: string | null;
++  fallbackText: string;
++};
++
++export function buildHuddleInviteContent(opts: {
++  inviterName: string;
++  parentChannelId: string;
++  ephemeralChannelId: string;
++  huddleEventId?: string | null;
++  channelName?: string | null;
++}): string {
++  const channelName = opts.channelName?.trim() || null;
++  const payload = JSON.stringify({
++    parent: opts.parentChannelId,
++    eph: opts.ephemeralChannelId,
++    event: opts.huddleEventId ?? null,
++    channel: channelName,
++  }).replace(/--/g, "-\\u002d"); // never close the comment early
++  const where = channelName ? `#${channelName} ` : "";
++  const name = opts.inviterName.trim() || "누군가";
++  return `${MARKER_PREFIX}${payload}${MARKER_SUFFIX}\n📞 ${name}님이 ${where}통화에 초대했어요.`;
++}
++
++export function parseHuddleInviteContent(content: string): HuddleInvite | null {
++  const trimmed = content.trimStart();
++  if (!trimmed.startsWith(MARKER_PREFIX)) return null;
++  const end = trimmed.indexOf(MARKER_SUFFIX, MARKER_PREFIX.length);
++  if (end < 0) return null;
++  try {
++    const data = JSON.parse(trimmed.slice(MARKER_PREFIX.length, end)) as Record<
++      string,
++      unknown
++    >;
++    if (typeof data.parent !== "string" || typeof data.eph !== "string") {
++      return null;
++    }
++    return {
++      parentChannelId: data.parent,
++      ephemeralChannelId: data.eph,
++      huddleEventId: typeof data.event === "string" ? data.event : null,
++      channelName: typeof data.channel === "string" ? data.channel : null,
++      fallbackText:
++        trimmed.slice(end + MARKER_SUFFIX.length).trim() || "통화 초대",
++    };
++  } catch {
++    return null;
++  }
++}
+diff --git a/desktop/src/features/messages/ui/HuddleInviteAttachment.tsx b/desktop/src/features/messages/ui/HuddleInviteAttachment.tsx
+new file mode 100644
+index 000000000..2c911161a
+--- /dev/null
++++ b/desktop/src/features/messages/ui/HuddleInviteAttachment.tsx
+@@ -0,0 +1,71 @@
++import * as React from "react";
++import { toast } from "sonner";
++
++import { useHuddle } from "@/features/huddle";
++import { formatHuddleActionError } from "@/features/huddle/lib/huddleError";
++import type { HuddleInvite } from "@/features/messages/lib/huddleInviteMessage";
++import {
++  Attachment,
++  AttachmentAction,
++  AttachmentActions,
++  AttachmentContent,
++  AttachmentDescription,
++  AttachmentMedia,
++  AttachmentTitle,
++} from "@/shared/ui/attachment";
++
++/** DM card for a Discord-style huddle invite: one click joins the call. */
++export function HuddleInviteAttachment({ invite }: { invite: HuddleInvite }) {
++  const { activeEphemeralChannelId, isStarting, joinHuddle } = useHuddle();
++  const alreadyIn = activeEphemeralChannelId === invite.ephemeralChannelId;
++
++  const handleJoin = React.useCallback(
++    async (event: React.MouseEvent<HTMLButtonElement>) => {
++      event.preventDefault();
++      event.stopPropagation();
++      if (alreadyIn || isStarting) return;
++      try {
++        await joinHuddle(
++          invite.parentChannelId,
++          invite.ephemeralChannelId,
++          invite.huddleEventId ?? undefined,
++        );
++      } catch (error) {
++        toast.error(formatHuddleActionError(error, "join"));
++      }
++    },
++    [alreadyIn, invite, isStarting, joinHuddle],
++  );
++
++  return (
++    <Attachment
++      className="mt-1 max-w-md"
++      data-testid="message-huddle-invite-attachment"
++      size="default"
++    >
++      <AttachmentMedia aria-hidden="true" className="text-lg">
++        📞
++      </AttachmentMedia>
++      <AttachmentContent>
++        <AttachmentTitle data-no-translate>
++          {invite.fallbackText}
++        </AttachmentTitle>
++        <AttachmentDescription>
++          {alreadyIn
++            ? "통화에 참여 중이에요."
++            : "통화가 끝났으면 참여할 수 없어요."}
++        </AttachmentDescription>
++      </AttachmentContent>
++      <AttachmentActions>
++        <AttachmentAction
++          disabled={alreadyIn || isStarting}
++          onClick={handleJoin}
++          size="xs"
++          type="button"
++        >
++          참여하기
++        </AttachmentAction>
++      </AttachmentActions>
++    </Attachment>
++  );
++}
+diff --git a/desktop/src/features/messages/ui/MessageRow.tsx b/desktop/src/features/messages/ui/MessageRow.tsx
+index 75b7d0d33..519ae05ab 100644
+--- a/desktop/src/features/messages/ui/MessageRow.tsx
++++ b/desktop/src/features/messages/ui/MessageRow.tsx
+@@ -40,6 +40,7 @@ import { UserAvatar } from "@/shared/ui/UserAvatar";
+ import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext";
+ import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
+ import { useMessageEmoji } from "@/features/messages/lib/useMessageEmoji";
++import { parseHuddleInviteContent } from "@/features/messages/lib/huddleInviteMessage";
+ import { parseWaveMessageContent } from "@/features/messages/lib/waveMessage";
+ import { resolveSnapshotSharedBy } from "@/features/messages/lib/snapshotSharedBy";
+ import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
+@@ -57,6 +58,7 @@ import {
+ } from "./MessageHeader";
+ import { MessageTimestamp } from "./MessageTimestamp";
+ import { SentFromThreadLine } from "./SentFromThreadLine";
++import { HuddleInviteAttachment } from "./HuddleInviteAttachment";
+ import { WaveMessageAttachment } from "./WaveMessageAttachment";
+ import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
+ import { useMessageAgentAddressPrefix } from "./MessageAgentAddressPrefix";
+@@ -415,6 +417,10 @@ export const MessageRow = React.memo(
+             />
+           );
+         default: {
++          const huddleInvite = parseHuddleInviteContent(message.body);
++          if (huddleInvite) {
++            return <HuddleInviteAttachment invite={huddleInvite} />;
++          }
+           const waveMessage = parseWaveMessageContent(message.body);
+           if (waveMessage) {
+             return (
