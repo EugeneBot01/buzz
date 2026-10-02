@@ -1,8 +1,8 @@
 diff --git a/desktop/src-tauri/src/huddle/agents.rs b/desktop/src-tauri/src/huddle/agents.rs
-index 2bdf05442..d12195ea9 100644
+index 2bdf05442..e63d16400 100644
 --- a/desktop/src-tauri/src/huddle/agents.rs
 +++ b/desktop/src-tauri/src/huddle/agents.rs
-@@ -139,6 +139,52 @@ pub async fn add_agent_to_huddle(
+@@ -139,6 +139,63 @@ pub async fn add_agent_to_huddle(
      })
  }
  
@@ -39,7 +39,18 @@ index 2bdf05442..d12195ea9 100644
 +    let already_in_parent = fetch_channel_members_with_roles(&parent_id, state)
 +        .await
 +        .is_ok_and(|members| contains_member(&members, pubkey));
-+    if already_in_parent || !add_to_parent {
++    // Never grow a DM: its member set is who the conversation is with, and
++    // the relay does not reject the add.
++    let parent_is_dm = crate::relay::query_relay(
++        state,
++        &[serde_json::json!({ "kinds": [39000], "#d": [parent_id], "limit": 1 })],
++    )
++    .await
++    .ok()
++    .and_then(|events| events.into_iter().next())
++    .and_then(|event| crate::nostr_convert::channel_detail_from_event(&event).ok())
++    .is_some_and(|detail| detail.channel_type == "dm");
++    if already_in_parent || !add_to_parent || parent_is_dm {
 +        return Ok((already_in_parent, None));
 +    }
 +    let add_parent = events::build_add_member(parent_channel_id, pubkey, Some("member"))?;
@@ -251,17 +262,20 @@ index 568967e9c..d42ee8f69 100644
                <Button
 diff --git a/desktop/src/features/huddle/components/InvitePeopleDialog.tsx b/desktop/src/features/huddle/components/InvitePeopleDialog.tsx
 new file mode 100644
-index 000000000..4767d753b
+index 000000000..19b594961
 --- /dev/null
 +++ b/desktop/src/features/huddle/components/InvitePeopleDialog.tsx
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,280 @@
 +import { invoke } from "@tauri-apps/api/core";
 +import { Check, LoaderCircle } from "lucide-react";
 +import * as React from "react";
 +
 +import { useChannelsQuery } from "@/features/channels/hooks";
 +import { buildHuddleInviteContent } from "@/features/messages/lib/huddleInviteMessage";
-+import { useUserSearchQuery } from "@/features/profile/hooks";
++import {
++  useUserSearchQuery,
++  useUsersBatchQuery,
++} from "@/features/profile/hooks";
 +import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 +import { openDm, sendChannelMessage } from "@/shared/api/tauri";
 +import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
@@ -327,10 +341,8 @@ index 000000000..4767d753b
 +    (c) => c.id === parentChannelId,
 +  );
 +  // A DM huddle has no meaningful channel name ("DM") to show.
-+  const channelName =
-+    parentChannel && parentChannel.channelType !== "dm"
-+      ? parentChannel.name
-+      : null;
++  const parentIsDm = parentChannel?.channelType === "dm";
++  const channelName = parentChannel && !parentIsDm ? parentChannel.name : null;
 +
 +  const excluded = React.useMemo(() => {
 +    const set = new Set(participantPubkeys.map(normalizePubkey));
@@ -338,9 +350,38 @@ index 000000000..4767d753b
 +    return set;
 +  }, [participantPubkeys, selfPubkey]);
 +
-+  const people = (searchQuery.data ?? []).filter(
-+    (user) => !user.isAgent && !excluded.has(normalizePubkey(user.pubkey)),
-+  );
++  // Discord-style "ring again": people from this channel/DM who are not in
++  // the call yet, shown before any search.
++  const absentPubkeys = React.useMemo(() => {
++    const source = parentIsDm
++      ? (parentChannel?.participantPubkeys ?? [])
++      : (parentChannel?.memberPubkeys ?? []);
++    return [...new Set(source.map(normalizePubkey))].filter(
++      (pubkey) => !excluded.has(pubkey),
++    );
++  }, [excluded, parentChannel, parentIsDm]);
++  const absentProfiles = useUsersBatchQuery(absentPubkeys, {
++    enabled: open && absentPubkeys.length > 0,
++  });
++  const suggestions = absentPubkeys
++    .map((pubkey) => {
++      const profile = absentProfiles.data?.profiles[pubkey];
++      return {
++        pubkey,
++        displayName: profile?.displayName ?? null,
++        avatarUrl: profile?.avatarUrl ?? null,
++        isAgent: profile?.isAgent ?? false,
++      };
++    })
++    .filter((user) => !user.isAgent);
++
++  const people =
++    deferredQuery.length === 0
++      ? suggestions
++      : (searchQuery.data ?? []).filter(
++          (user) =>
++            !user.isAgent && !excluded.has(normalizePubkey(user.pubkey)),
++        );
 +
 +  async function handleInvite(pubkey: string, label: string) {
 +    if (busy) return;
@@ -350,9 +391,28 @@ index 000000000..4767d753b
 +    try {
 +      const result = await invoke<HumanInviteResult>("invite_to_huddle", {
 +        pubkey,
-+        addToParent: addToChannel,
++        // A DM's membership is its identity — never add people to it.
++        addToParent: addToChannel && !parentIsDm,
 +      });
-+      const dm = await openDm({ pubkeys: [pubkey] });
++      // In a DM call, Discord-style: keep the DM as it is and continue the call
++      // in a group DM of everyone in it plus the new person.
++      const dmPubkeys = parentIsDm
++        ? [
++            ...new Set(
++              [...(parentChannel?.participantPubkeys ?? []), pubkey]
++                .map(normalizePubkey)
++                .filter(
++                  (p) => !selfPubkey || p !== normalizePubkey(selfPubkey),
++                ),
++            ),
++          ]
++        : [pubkey];
++      const dm = await openDm({ pubkeys: dmPubkeys });
++      if (parentIsDm) {
++        setNotice(
++          `${label}님을 포함한 새 그룹 DM에서 통화를 이어 가요. 사이드바에서 확인하세요.`,
++        );
++      }
 +      if (isCreator) {
 +        // A real huddle card in their DM: every Buzz client shows it with a
 +        // Join button and a call notification, patched or not.
@@ -405,14 +465,16 @@ index 000000000..4767d753b
 +          placeholder="이름으로 검색"
 +          value={query}
 +        />
-+        <label className="flex items-center gap-2 text-sm text-muted-foreground">
-+          <input
-+            checked={addToChannel}
-+            onChange={(event) => setAddToChannel(event.target.checked)}
-+            type="checkbox"
-+          />
-+          {channelName ? `#${channelName} 채널에도 추가` : "채널에도 추가"}
-+        </label>
++        {parentIsDm ? null : (
++          <label className="flex items-center gap-2 text-sm text-muted-foreground">
++            <input
++              checked={addToChannel}
++              onChange={(event) => setAddToChannel(event.target.checked)}
++              type="checkbox"
++            />
++            {channelName ? `#${channelName} 채널에도 추가` : "채널에도 추가"}
++          </label>
++        )}
 +
 +        {error ? (
 +          <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
@@ -425,11 +487,16 @@ index 000000000..4767d753b
 +          </p>
 +        ) : null}
 +
-+        {deferredQuery.length === 0 ? (
++        {deferredQuery.length === 0 && people.length > 0 ? (
++          <p className="text-xs font-medium text-muted-foreground">
++            통화에 없는 멤버
++          </p>
++        ) : null}
++        {deferredQuery.length === 0 && people.length === 0 ? (
 +          <p className="py-4 text-center text-sm text-muted-foreground">
 +            부를 사람 이름을 입력하세요.
 +          </p>
-+        ) : searchQuery.isLoading ? (
++        ) : deferredQuery.length > 0 && searchQuery.isLoading ? (
 +          <p className="py-4 text-center text-sm text-muted-foreground">
 +            찾는 중…
 +          </p>
