@@ -1,0 +1,1247 @@
+diff --git a/desktop/src-tauri/src/huddle/korean_spacing.rs b/desktop/src-tauri/src/huddle/korean_spacing.rs
+new file mode 100644
+index 000000000..f9c816839
+--- /dev/null
++++ b/desktop/src-tauri/src/huddle/korean_spacing.rs
+@@ -0,0 +1,154 @@
++//! Spacing cleanup for Korean SenseVoice transcripts.
++//!
++//! SenseVoice emits Korean as sub-word tokens and joins them with spaces, so
++//! particles and endings land as separate words ("확정 을", "했 습니다").
++//! This re-attaches a token from the list below to the previous word when
++//! that word ends in Hangul or a digit. It is a readability fix for live
++//! captions, not a full Korean word-spacing model.
++
++/// Particles and endings SenseVoice tends to split off as their own token.
++const ATTACH: &[&str] = &[
++    "습니다",
++    "니다",
++    "겠습니다",
++    "어요",
++    "아요",
++    "에요",
++    "예요",
++    "해요",
++    "죠",
++    "요",
++    "은",
++    "는",
++    "이",
++    "가",
++    "을",
++    "를",
++    "에",
++    "에서",
++    "에게",
++    "께",
++    "로",
++    "으로",
++    "의",
++    "도",
++    "만",
++    "까지",
++    "부터",
++    "와",
++    "과",
++    "이라고",
++    "라고",
++    "이나",
++    "나",
++    "랑",
++    "이랑",
++    "님",
++    "들",
++    "께서",
++    "처럼",
++    "보다",
++    "마다",
++    "씩",
++    "째",
++    "차",
++    "시는",
++    "시고",
++    "시면",
++    "셔서",
++    "세요",
++    "주세요",
++    "던",
++    "는데",
++    "은데",
++    "인데",
++    "고",
++    "며",
++    "면",
++    "서",
++    "니까",
++    "지만",
++    "거나",
++    "기로",
++    "게",
++    "겠",
++    "었",
++    "았",
++    "였",
++    "어",
++    "아",
++    "여",
++    "일",
++    "월",
++    "시",
++    "분",
++];
++
++fn ends_in_hangul_or_digit(word: &str) -> bool {
++    word.chars()
++        .last()
++        .is_some_and(|c| c.is_ascii_digit() || ('가'..='힣').contains(&c))
++}
++
++fn ends_in_digit(word: &str) -> bool {
++    word.chars().last().is_some_and(|c| c.is_ascii_digit())
++}
++
++/// Counter words that follow a number without a space (일, 월, 시, 분 …).
++fn starts_with_counter(token: &str) -> bool {
++    token
++        .chars()
++        .next()
++        .is_some_and(|c| "일월시분초차번년주개명회층".contains(c))
++}
++
++fn is_attachable(token: &str) -> bool {
++    let core = token.trim_end_matches(['.', ',', '?', '!']);
++    ATTACH.contains(&core)
++}
++
++/// Re-attach split-off particles/endings to the preceding word.
++pub fn fix_korean_spacing(text: &str) -> String {
++    let mut words: Vec<String> = Vec::new();
++    for token in text.split_whitespace() {
++        match words.last_mut() {
++            Some(prev) if ends_in_hangul_or_digit(prev) && is_attachable(token) => {
++                prev.push_str(token);
++            }
++            // "14 일로" → "14일로": ITN digits followed by a counter word.
++            Some(prev) if ends_in_digit(prev) && starts_with_counter(token) => {
++                prev.push_str(token);
++            }
++            _ => words.push(token.to_string()),
++        }
++    }
++    words.join(" ")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::fix_korean_spacing;
++
++    #[test]
++    fn reattaches_particles_and_endings() {
++        assert_eq!(
++            fix_korean_spacing("안무 기획 간 확정 을 다음 주 수요 일로 미루 기로 했 습니다."),
++            "안무 기획 간 확정을 다음 주 수요 일로 미루기로 했습니다."
++        );
++        assert_eq!(
++            fix_korean_spacing("배우 사이즈 실측 은 배우 일정 때문에 14 일로 연기 됐 어요."),
++            "배우 사이즈 실측은 배우 일정 때문에 14일로 연기 됐어요."
++        );
++        assert_eq!(
++            fix_korean_spacing("로케이션 공 문은 월요일 에 피디 님 이 발송 하 시는 걸로 하 죠."),
++            "로케이션 공 문은 월요일에 피디님이 발송 하시는 걸로 하죠."
++        );
++    }
++
++    #[test]
++    fn leaves_english_and_leading_tokens_alone() {
++        assert_eq!(fix_korean_spacing("PPM 전에 QC 한 번"), "PPM 전에 QC 한 번");
++        assert_eq!(fix_korean_spacing("은 그렇고"), "은 그렇고");
++        assert_eq!(fix_korean_spacing(""), "");
++    }
++}
+diff --git a/desktop/src-tauri/src/huddle/latency_bench.rs b/desktop/src-tauri/src/huddle/latency_bench.rs
+index f928ddbce..bf5128b5a 100644
+--- a/desktop/src-tauri/src/huddle/latency_bench.rs
++++ b/desktop/src-tauri/src/huddle/latency_bench.rs
+@@ -82,13 +82,13 @@ fn last_voiced_sample(samples: &[f32], threshold: f32) -> usize {
+ /// Poll a tokio mpsc receiver from sync context for up to `timeout`.
+ /// 1 ms poll keeps timestamp error negligible against ~100 ms scales.
+ fn tokio_recv_with_timeout(
+-    rx: &mut tokio::sync::mpsc::Receiver<String>,
++    rx: &mut tokio::sync::mpsc::Receiver<super::stt::SttTranscript>,
+     timeout: Duration,
+ ) -> Option<String> {
+     let deadline = Instant::now() + timeout;
+     loop {
+         if let Ok(t) = rx.try_recv() {
+-            return Some(t);
++            return Some(t.text);
+         }
+         if Instant::now() >= deadline {
+             return None;
+@@ -232,13 +232,14 @@ fn baseline_stt_fake_llm_tts_first_audio() {
+         // every segment immediately) and is excluded from all timings.
+         let mut transcript = text_rx
+             .blocking_recv()
+-            .expect("stt channel closed before transcript");
++            .expect("stt channel closed before transcript")
++            .text;
+         let mut t_transcript = Instant::now();
+         let mut segments = 1usize;
+         loop {
+             match text_rx.try_recv() {
+                 Ok(t) => {
+-                    transcript = t;
++                    transcript = t.text;
+                     t_transcript = Instant::now();
+                     segments += 1;
+                 }
+diff --git a/desktop/src-tauri/src/huddle/mod.rs b/desktop/src-tauri/src/huddle/mod.rs
+index e219b2f75..5cb8cc70b 100644
+--- a/desktop/src-tauri/src/huddle/mod.rs
++++ b/desktop/src-tauri/src/huddle/mod.rs
+@@ -31,6 +31,7 @@ pub mod audio_output;
+ mod commands;
+ mod human_floor;
+ pub mod jitter;
++pub mod korean_spacing;
+ #[cfg(test)]
+ mod latency_bench;
+ mod local_barge_in;
+@@ -80,7 +81,9 @@ pub use commands::{
+     set_huddle_manual_mic_unmuted,
+ };
+ pub use state::{HuddleJoinInfo, HuddlePhase, HuddleState, VoiceInputMode};
+-pub use transcription::{set_huddle_transcription_enabled, start_stt_pipeline};
++pub use transcription::{
++    set_huddle_stt_language, set_huddle_transcription_enabled, start_stt_pipeline,
++};
+ pub use tts_settings::set_tts_enabled;
+ pub use window::{close_huddle_companion, open_huddle_window};
+ 
+diff --git a/desktop/src-tauri/src/huddle/models.rs b/desktop/src-tauri/src/huddle/models.rs
+index 09154d523..5769a529a 100644
+--- a/desktop/src-tauri/src/huddle/models.rs
++++ b/desktop/src-tauri/src/huddle/models.rs
+@@ -18,7 +18,7 @@
+ //! harmless and can be removed by hand.
+ 
+ use std::path::{Path, PathBuf};
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+ use std::sync::{Arc, Mutex, OnceLock};
+ 
+ use serde::{Deserialize, Serialize};
+@@ -156,6 +156,105 @@ Provided \"AS IS\", without warranty of any kind, express or implied. See the
+ license text for full warranty disclaimer.
+ ";
+ 
++// ── Korean STT model (SenseVoice) ────────────────────────────────────────────
++
++/// SenseVoice Small (zh/en/ja/ko/yue, int8) — packaged for sherpa-onnx by
++/// k2-fsa. Used when the huddle transcript language is Korean: it handles
++/// Korean with English loanwords/acronyms and writes numbers as digits.
++/// Pinned to the 2024-07-17 build — the 2025-09-09 re-release decodes Korean
++/// as garbage (verified on its own bundled `ko.wav`).
++/// License: FunASR Model Open Source License 1.1 (attribution required).
++const KO_STT_DOWNLOAD_URL: &str =
++    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/\
++     sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2";
++const KO_STT_ARCHIVE_SHA256: &str =
++    "7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e";
++const KO_STT_ARCHIVE_SUBDIR: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17";
++pub(crate) const KO_STT_MODEL_DIR_NAME: &str = "sense-voice-ko-2024-07-17";
++const KO_STT_MODEL_VERSION: &str = "1";
++const KO_STT_EXPECTED_FILES: &[&str] = &["model.int8.onnx", "tokens.txt", STT_LICENSE_FILE_NAME];
++const KO_STT_LICENSE_TEXT: &str = "\
++SenseVoice Small (zh/en/ja/ko/yue)
++Copyright (C) 2023-2028 Alibaba Group. All rights reserved.
++
++Licensed under the FunASR Model Open Source License Agreement v1.1:
++https://github.com/modelscope/FunASR/blob/main/MODEL_LICENSE
++
++Original model: https://github.com/FunAudioLLM/SenseVoice
++Converted to ONNX with int8 quantization by the sherpa-onnx project
++(https://github.com/k2-fsa/sherpa-onnx); Buzz ships this conversion
++unmodified.
++
++Provided for reference and learning purposes, without warranty of any kind.
++";
++
++/// One downloadable STT archive: where it comes from and where it lands.
++struct SttAsset {
++    url: &'static str,
++    sha256: &'static str,
++    archive_subdir: &'static str,
++    dir_name: &'static str,
++    license_text: &'static str,
++}
++
++const EN_STT_ASSET: SttAsset = SttAsset {
++    url: STT_DOWNLOAD_URL,
++    sha256: STT_ARCHIVE_SHA256,
++    archive_subdir: STT_ARCHIVE_SUBDIR,
++    dir_name: STT_MODEL_DIR_NAME,
++    license_text: STT_LICENSE_TEXT,
++};
++
++const KO_STT_ASSET: SttAsset = SttAsset {
++    url: KO_STT_DOWNLOAD_URL,
++    sha256: KO_STT_ARCHIVE_SHA256,
++    archive_subdir: KO_STT_ARCHIVE_SUBDIR,
++    dir_name: KO_STT_MODEL_DIR_NAME,
++    license_text: KO_STT_LICENSE_TEXT,
++};
++
++/// Language the huddle transcript is recognised in. Selects which STT model
++/// slot every `stt_*` accessor reports, downloads, and loads.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum SttLanguage {
++    English,
++    Korean,
++}
++
++impl SttLanguage {
++    pub fn parse(code: &str) -> Option<Self> {
++        match code.trim().to_ascii_lowercase().as_str() {
++            "en" => Some(Self::English),
++            "ko" => Some(Self::Korean),
++            _ => None,
++        }
++    }
++}
++
++static STT_LANGUAGE: AtomicU8 = AtomicU8::new(0);
++
++/// Current transcript language (English until the frontend says otherwise).
++pub fn stt_language() -> SttLanguage {
++    match STT_LANGUAGE.load(Ordering::Acquire) {
++        1 => SttLanguage::Korean,
++        _ => SttLanguage::English,
++    }
++}
++
++/// Switch the transcript language. Returns `true` when it changed.
++pub fn set_stt_language(language: SttLanguage) -> bool {
++    let next = match language {
++        SttLanguage::English => 0,
++        SttLanguage::Korean => 1,
++    };
++    STT_LANGUAGE.swap(next, Ordering::AcqRel) != next
++}
++
++/// `true` when `model_dir` holds the Korean SenseVoice model.
++pub fn is_sense_voice_dir(model_dir: &Path) -> bool {
++    model_dir.file_name().and_then(|n| n.to_str()) == Some(KO_STT_MODEL_DIR_NAME)
++}
++
+ // ── Pocket TTS model ──────────────────────────────────────────────────────────
+ 
+ /// Final directory name under `~/.buzz/models/`.
+@@ -601,6 +700,7 @@ pub struct ModelManager {
+     /// Model storage under the selected build's nest.
+     models_dir: PathBuf,
+     stt: ModelSlot,
++    stt_ko: ModelSlot,
+     tts: ModelSlot,
+ }
+ 
+@@ -613,6 +713,11 @@ impl ModelManager {
+         let manager = Self {
+             models_dir,
+             stt: ModelSlot::new(STT_MODEL_DIR_NAME, STT_EXPECTED_FILES, STT_MODEL_VERSION),
++            stt_ko: ModelSlot::new(
++                KO_STT_MODEL_DIR_NAME,
++                KO_STT_EXPECTED_FILES,
++                KO_STT_MODEL_VERSION,
++            ),
+             tts: tts_model_slot(),
+         };
+         manager.tts.recover_interrupted_install(&manager.models_dir);
+@@ -620,22 +725,32 @@ impl ModelManager {
+     }
+ 
+     // ── STT accessors ────────────────────────────────────────────────────────
++    //
++    // Every accessor reports the slot for the current transcript language, so
++    // callers (pipeline hot-start, model status for the UI) stay unchanged.
++
++    fn active_stt(&self) -> (&ModelSlot, &'static SttAsset) {
++        match stt_language() {
++            SttLanguage::English => (&self.stt, &EN_STT_ASSET),
++            SttLanguage::Korean => (&self.stt_ko, &KO_STT_ASSET),
++        }
++    }
+ 
+     /// Path to the STT model directory, or `None` if not ready.
+     pub fn stt_model_dir(&self) -> Option<PathBuf> {
+-        self.stt.dir_if_ready(&self.models_dir)
++        self.active_stt().0.dir_if_ready(&self.models_dir)
+     }
+     /// `true` if all STT files are present and the manifest version matches.
+     pub fn is_stt_ready(&self) -> bool {
+-        self.stt.is_ready(&self.models_dir)
++        self.active_stt().0.is_ready(&self.models_dir)
+     }
+     /// Current STT download status.
+     pub fn stt_status(&self) -> ModelStatus {
+-        self.stt.status()
++        self.active_stt().0.status()
+     }
+     /// Returns `true` once when the STT model just became ready. Resets the flag.
+     pub fn take_stt_ready(&self) -> bool {
+-        self.stt.take_ready()
++        self.active_stt().0.take_ready()
+     }
+ 
+     // ── TTS accessors ─────────────────────────────────────────────────────────
+@@ -672,11 +787,13 @@ impl ModelManager {
+     /// `download_stt_model` handles cleanup once the new install reaches Ready.
+     pub fn start_stt_download(&self, http_client: reqwest::Client) {
+         let manager = self.clone();
+-        self.stt.start_download(
++        let korean = stt_language() == SttLanguage::Korean;
++        let (slot, _) = self.active_stt();
++        slot.start_download(
+             &self.models_dir,
+             http_client,
+             "stt",
+-            move |client| async move { manager.download_stt_model(client).await },
++            move |client| async move { manager.download_stt_model(client, korean).await },
+         );
+         if self.stt.is_ready(&self.models_dir) {
+             // Detached cleanup task — must not block startup. Gated above on
+@@ -706,22 +823,29 @@ impl ModelManager {
+     // ── Private download implementations ─────────────────────────────────────
+ 
+     /// Download, extract, and verify the STT model archive.
+-    async fn download_stt_model(&self, http_client: reqwest::Client) -> Result<(), String> {
++    async fn download_stt_model(
++        &self,
++        http_client: reqwest::Client,
++        korean: bool,
++    ) -> Result<(), String> {
++        let (stt_slot, asset) = if korean {
++            (&self.stt_ko, &KO_STT_ASSET)
++        } else {
++            (&self.stt, &EN_STT_ASSET)
++        };
+         tokio::fs::create_dir_all(&self.models_dir)
+             .await
+             .map_err(|e| format!("create models dir: {e}"))?;
+ 
+         // Temp filenames derive from the final directory name to avoid colliding
+         // with leftovers from any previous STT model (e.g. moonshine-tiny.*).
+-        let archive_path = self
+-            .models_dir
+-            .join(format!("{STT_MODEL_DIR_NAME}.tar.bz2"));
+-        let temp_dir = self.models_dir.join(format!("{STT_MODEL_DIR_NAME}.tmp"));
++        let archive_path = self.models_dir.join(format!("{}.tar.bz2", asset.dir_name));
++        let temp_dir = self.models_dir.join(format!("{}.tmp", asset.dir_name));
+ 
+-        eprintln!("buzz-desktop: downloading STT model from {STT_DOWNLOAD_URL}");
+-        let response = fetch_url(&http_client, STT_DOWNLOAD_URL, "stt archive").await?;
++        eprintln!("buzz-desktop: downloading STT model from {}", asset.url);
++        let response = fetch_url(&http_client, asset.url, "stt archive").await?;
+ 
+-        let slot = self.stt.clone();
++        let slot = stt_slot.clone();
+         let bytes = download_file(
+             response,
+             &archive_path,
+@@ -742,14 +866,15 @@ impl ModelManager {
+ 
+         // Verify archive integrity before extraction.
+         let hash = sha256_file(&archive_path).await?;
+-        if hash != STT_ARCHIVE_SHA256 {
++        if hash != asset.sha256 {
+             let _ = tokio::fs::remove_file(&archive_path).await;
+             return Err(format!(
+-                "STT archive integrity check failed: expected {STT_ARCHIVE_SHA256}, got {hash}"
++                "STT archive integrity check failed: expected {}, got {hash}",
++                asset.sha256
+             ));
+         }
+ 
+-        self.stt.set_status(ModelStatus::Downloading {
++        stt_slot.set_status(ModelStatus::Downloading {
+             progress_percent: 90,
+         });
+         fresh_temp_dir(&temp_dir).await?;
+@@ -760,11 +885,12 @@ impl ModelManager {
+             .await
+             .map_err(|e| format!("tar task panicked: {e}"))??;
+ 
+-        let extracted_subdir = temp_dir.join(STT_ARCHIVE_SUBDIR);
++        let extracted_subdir = temp_dir.join(asset.archive_subdir);
+         if !extracted_subdir.is_dir() {
+             let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+             return Err(format!(
+-                "expected subdir '{STT_ARCHIVE_SUBDIR}' not found after extraction"
++                "expected subdir '{}' not found after extraction",
++                asset.archive_subdir
+             ));
+         }
+ 
+@@ -773,15 +899,14 @@ impl ModelManager {
+         // upstream tarball ships no LICENSE/NOTICE, so we provide it ourselves
+         // per §3(a)(1) (license must travel with Shared material).
+         let license_path = extracted_subdir.join(STT_LICENSE_FILE_NAME);
+-        if let Err(e) = tokio::fs::write(&license_path, STT_LICENSE_TEXT).await {
++        if let Err(e) = tokio::fs::write(&license_path, asset.license_text).await {
+             let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+             let _ = tokio::fs::remove_file(&archive_path).await;
+             return Err(format!("write model license sidecar: {e}"));
+         }
+ 
+         // verify_and_install takes the subdir (actual model files); temp_cleanup removes outer dir.
+-        if let Err(e) = self
+-            .stt
++        if let Err(e) = stt_slot
+             .verify_and_install(&self.models_dir, &extracted_subdir, Some(&temp_dir))
+             .await
+         {
+@@ -800,7 +925,7 @@ impl ModelManager {
+ 
+         eprintln!(
+             "buzz-desktop: STT model ready at {}",
+-            self.stt.model_dir(&self.models_dir).display()
++            stt_slot.model_dir(&self.models_dir).display()
+         );
+         Ok(())
+     }
+diff --git a/desktop/src-tauri/src/huddle/pipeline.rs b/desktop/src-tauri/src/huddle/pipeline.rs
+index 47d4aeb43..b673b40c5 100644
+--- a/desktop/src-tauri/src/huddle/pipeline.rs
++++ b/desktop/src-tauri/src/huddle/pipeline.rs
+@@ -628,7 +628,7 @@ pub(crate) fn sign_and_guard_stt_body(
+ /// Fix 4: `text_rx` is a `tokio::sync::mpsc::Receiver` — fully async `.recv().await`
+ ///        never blocks a Tokio worker thread (unlike std `recv_timeout`).
+ pub(crate) fn spawn_transcription_task(
+-    mut text_rx: tokio::sync::mpsc::Receiver<String>,
++    mut text_rx: tokio::sync::mpsc::Receiver<super::stt::SttTranscript>,
+     channel_uuid: Uuid,
+     agent_pubkeys_arc: Arc<Mutex<Vec<String>>>,
+     session_generation: Arc<AtomicU64>,
+@@ -647,10 +647,26 @@ pub(crate) fn spawn_transcription_task(
+     tauri::async_runtime::spawn(async move {
+         // recv().await yields (not blocks) until text arrives or sender is dropped.
+         // When the STT worker exits and drops its Sender, recv() returns None → loop ends.
+-        while let Some(t) = text_rx.recv().await {
+-            if t.is_empty() {
++        let mut speaker_names: std::collections::HashMap<String, String> =
++            std::collections::HashMap::new();
++        while let Some(transcript) = text_rx.recv().await {
++            if transcript.text.is_empty() {
+                 continue;
+             }
++            // Remote speech is posted by this device, so name the speaker in
++            // the text; the local user's own speech is already attributed.
++            let t = match transcript.speaker.as_deref() {
++                None => transcript.text,
++                Some(pubkey) => {
++                    if !speaker_names.contains_key(pubkey) {
++                        let name = fetch_display_name(&http_client, &keys, &relay_base_url, pubkey)
++                            .await
++                            .unwrap_or_else(|| short_pubkey(pubkey));
++                        speaker_names.insert(pubkey.to_string(), name);
++                    }
++                    format!("**{}**: {}", speaker_names[pubkey], transcript.text)
++                }
++            };
+ 
+             // Session guard: if the generation has changed, this task is stale.
+             // Drop the transcript silently — the huddle has ended or been replaced.
+@@ -735,6 +751,52 @@ pub(crate) fn spawn_transcription_task(
+     });
+ }
+ 
++fn short_pubkey(pubkey: &str) -> String {
++    format!("{}…", &pubkey[..pubkey.len().min(8)])
++}
++
++/// Kind-0 display name for a transcript speaker (best-effort, one query).
++async fn fetch_display_name(
++    http_client: &reqwest::Client,
++    keys: &nostr::Keys,
++    relay_base_url: &str,
++    pubkey: &str,
++) -> Option<String> {
++    let url = format!("{relay_base_url}/query");
++    let body = serde_json::to_vec(&[serde_json::json!({
++        "kinds": [0],
++        "authors": [pubkey],
++        "limit": 1,
++    })])
++    .ok()?;
++    let auth =
++        crate::relay::build_nip98_auth_header_for_keys(keys, &reqwest::Method::POST, &url, &body)
++            .ok()?;
++    let events: Vec<nostr::Event> = http_client
++        .post(&url)
++        .header("Authorization", auth)
++        .header("Content-Type", "application/json")
++        .body(body)
++        .timeout(std::time::Duration::from_secs(5))
++        .send()
++        .await
++        .ok()?
++        .json()
++        .await
++        .ok()?;
++    let profile: serde_json::Value = serde_json::from_str(&events.first()?.content).ok()?;
++    ["display_name", "displayName", "name"]
++        .iter()
++        .find_map(|key| {
++            profile
++                .get(*key)?
++                .as_str()
++                .map(str::trim)
++                .filter(|v| !v.is_empty())
++        })
++        .map(str::to_string)
++}
++
+ #[cfg(test)]
+ mod tts_start_race_tests {
+     use std::sync::{
+diff --git a/desktop/src-tauri/src/huddle/playout.rs b/desktop/src-tauri/src/huddle/playout.rs
+index 66c80f5d6..05ba09a21 100644
+--- a/desktop/src-tauri/src/huddle/playout.rs
++++ b/desktop/src-tauri/src/huddle/playout.rs
+@@ -183,15 +183,6 @@ fn same_occupancy(
+         && index_to_epoch.get(&peer_idx) == Some(&epoch)
+ }
+ 
+-fn mix_remote_stt_samples(mix: &mut Vec<f32>, samples: &[f32]) {
+-    if mix.len() < samples.len() {
+-        mix.resize(samples.len(), 0.0);
+-    }
+-    for (mixed, sample) in mix.iter_mut().zip(samples) {
+-        *mixed = (*mixed + *sample).clamp(-1.0, 1.0);
+-    }
+-}
+-
+ fn f32_samples_to_le_bytes(samples: &[f32]) -> Vec<u8> {
+     let mut bytes = Vec::with_capacity(std::mem::size_of_val(samples));
+     for sample in samples {
+@@ -338,7 +329,8 @@ pub(crate) async fn run_playout_recv_loop(
+                 // per idle peer into rodio forever. `is_active` is a 500 ms
+                 // grace past the last received packet, far longer than typical
+                 // DTX comfort-noise cadence.
+-                let mut remote_stt_mix = Vec::new();
++                // Per-speaker frames so transcripts can name who spoke.
++                let mut remote_stt_frames: Vec<(String, Vec<f32>)> = Vec::new();
+                 for (peer_idx, slot) in peers.iter_mut() {
+                     if !slot.is_active() {
+                         // Still drain the frame to keep NetEq's internal clock
+@@ -368,7 +360,9 @@ pub(crate) async fn run_playout_recv_loop(
+                                     is_agent_peer(*peer_idx, &index_to_pubkey, &agents)
+                                 };
+                                 if !remote_agent {
+-                                    mix_remote_stt_samples(&mut remote_stt_mix, &samples);
++                                    if let Some(pubkey) = index_to_pubkey.get(peer_idx) {
++                                        remote_stt_frames.push((pubkey.clone(), samples.clone()));
++                                    }
+                                 }
+                             }
+                             slot.player.append(SamplesBuffer::new(channels, rate, samples));
+@@ -380,16 +374,17 @@ pub(crate) async fn run_playout_recv_loop(
+                         }
+                     }
+                 }
+-                if !remote_stt_mix.is_empty() {
++                if !remote_stt_frames.is_empty() {
+                     let pipeline = remote_stt_pipeline
+                         .lock()
+                         .unwrap_or_else(|error| error.into_inner())
+                         .as_ref()
+                         .and_then(std::sync::Weak::upgrade);
+                     if let Some(pipeline) = pipeline {
+-                        let _ = pipeline.push_remote_audio(f32_samples_to_le_bytes(
+-                            &remote_stt_mix,
+-                        ));
++                        for (pubkey, samples) in remote_stt_frames {
++                            let _ = pipeline
++                                .push_remote_audio(pubkey, f32_samples_to_le_bytes(&samples));
++                        }
+                     }
+                 }
+             }
+@@ -814,14 +809,10 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn remote_human_stt_mix_sums_and_clamps_concurrent_speakers() {
+-        let mut mix = Vec::new();
+-        mix_remote_stt_samples(&mut mix, &[0.4, -0.7, 0.2]);
+-        mix_remote_stt_samples(&mut mix, &[0.8, -0.6, -0.1]);
+-
+-        assert_eq!(mix, vec![1.0, -1.0, 0.1]);
+-        let bytes = f32_samples_to_le_bytes(&mix);
+-        assert_eq!(bytes.len(), std::mem::size_of_val(mix.as_slice()));
++    fn remote_stt_frames_serialize_as_f32_le() {
++        let samples = [1.0_f32, -1.0, 0.1];
++        let bytes = f32_samples_to_le_bytes(&samples);
++        assert_eq!(bytes.len(), std::mem::size_of_val(samples.as_slice()));
+         assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1.0);
+     }
+ }
+diff --git a/desktop/src-tauri/src/huddle/stt.rs b/desktop/src-tauri/src/huddle/stt.rs
+index c27bf38b6..06e60bd60 100644
+--- a/desktop/src-tauri/src/huddle/stt.rs
++++ b/desktop/src-tauri/src/huddle/stt.rs
+@@ -67,10 +67,26 @@ struct SttAudioInput {
+     origin: SttAudioOrigin,
+ }
+ 
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[derive(Clone, Debug, PartialEq, Eq)]
+ enum SttAudioOrigin {
+     Local,
+-    RemoteHuman,
++    /// A remote participant, by pubkey — each gets its own VAD stream so
++    /// their transcripts can be attributed to them.
++    RemoteHuman(String),
++}
++
++/// One recognised utterance. `speaker` is the remote participant's pubkey,
++/// or `None` for this device's own microphone.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct SttTranscript {
++    pub text: String,
++    pub speaker: Option<String>,
++}
++
++/// Where a stream's finished utterances go, tagged with its speaker.
++struct TranscriptSink<'a> {
++    tx: &'a tokio_mpsc::Sender<SttTranscript>,
++    speaker: Option<&'a str>,
+ }
+ 
+ impl SttPipeline {
+@@ -101,9 +117,9 @@ impl SttPipeline {
+         manual_mic_unmuted: Option<Arc<AtomicBool>>,
+         human_floor: HumanFloor,
+         output_device: Option<String>,
+-    ) -> Result<(Self, tokio_mpsc::Receiver<String>), String> {
++    ) -> Result<(Self, tokio_mpsc::Receiver<SttTranscript>), String> {
+         let (audio_tx, audio_rx) = mpsc::sync_channel::<SttAudioInput>(AUDIO_QUEUE_DEPTH);
+-        let (text_tx, text_rx) = tokio_mpsc::channel::<String>(64);
++        let (text_tx, text_rx) = tokio_mpsc::channel::<SttTranscript>(64);
+         let shutdown = Arc::new(AtomicBool::new(false));
+ 
+         let shutdown_worker = Arc::clone(&shutdown);
+@@ -156,8 +172,8 @@ impl SttPipeline {
+     /// microphone path, this is not gated by the desktop PTT or mute state: the
+     /// remote participant already made their transmission choice on their own
+     /// device before the relay delivered these samples.
+-    pub fn push_remote_audio(&self, pcm_bytes: Vec<u8>) -> Result<(), String> {
+-        self.push_audio_from(pcm_bytes, SttAudioOrigin::RemoteHuman)
++    pub fn push_remote_audio(&self, speaker: String, pcm_bytes: Vec<u8>) -> Result<(), String> {
++        self.push_audio_from(pcm_bytes, SttAudioOrigin::RemoteHuman(speaker))
+     }
+ 
+     fn push_audio_from(&self, pcm_bytes: Vec<u8>, origin: SttAudioOrigin) -> Result<(), String> {
+@@ -444,7 +460,7 @@ fn run_stt_receive_loop(
+ fn stt_worker(
+     model_dir: PathBuf,
+     audio_rx: Receiver<SttAudioInput>,
+-    text_tx: tokio_mpsc::Sender<String>,
++    text_tx: tokio_mpsc::Sender<SttTranscript>,
+     shutdown: Arc<AtomicBool>,
+     ptt_active: Option<Arc<AtomicBool>>,
+     manual_mic_unmuted: Option<Arc<AtomicBool>>,
+@@ -458,7 +474,7 @@ fn stt_worker(
+     // has a `model` path set, so we don't need to set `model_type` explicitly.
+     // (See rust-api-examples/parakeet_tdt_ctc_simulate_streaming_microphone.rs
+     // in k2-fsa/sherpa-onnx.)
+-    use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
++    use sherpa_onnx::OfflineRecognizer;
+ 
+     let tokens_path = model_dir.join("tokens.txt");
+     let model_path = model_dir.join("model.int8.onnx");
+@@ -471,14 +487,8 @@ fn stt_worker(
+         return;
+     }
+ 
+-    let mut cfg = OfflineRecognizerConfig::default();
+-    cfg.model_config.nemo_ctc.model = Some(model_path.to_string_lossy().into_owned());
+-    cfg.model_config.tokens = Some(tokens_path.to_string_lossy().into_owned());
+-    cfg.model_config.num_threads = stt_num_threads();
+-    // Explicit — defaults are not part of the API contract, and noisy debug
+-    // logging in release builds would be expensive on every VAD chunk.
+-    cfg.model_config.debug = false;
+-
++    let (cfg, korean) = recognizer_config(&model_dir, &model_path, &tokens_path);
++    KOREAN_SPACING.with(|flag| flag.set(korean));
+     let recognizer = match OfflineRecognizer::create(&cfg) {
+         Some(r) => r,
+         None => {
+@@ -498,12 +508,11 @@ fn stt_worker(
+             return;
+         }
+     };
+-    let mut remote_stream = match SttStreamState::new() {
+-        Ok(stream) => stream,
+-        Err(error) => {
+-            eprintln!("buzz-desktop: {error}");
+-            return;
+-        }
++    let mut remote_streams: std::collections::HashMap<String, SttStreamState> =
++        std::collections::HashMap::new();
++    let local_sink = TranscriptSink {
++        tx: &text_tx,
++        speaker: None,
+     };
+     let speculative_enabled = stt_speculative_decode();
+     let mut transmit_was_active = ptt_active
+@@ -536,7 +545,7 @@ fn stt_worker(
+                             &local_stream.endpoint.speech_buf,
+                             local_stream.endpoint.voiced_frames,
+                             &recognizer,
+-                            &text_tx,
++                            &local_sink,
+                         );
+                         local_stream.endpoint.reset_segment();
+                         local_stream.speculative.take();
+@@ -547,21 +556,43 @@ fn stt_worker(
+             }
+             SttLoopInput::Batch(batch) => {
+                 for input in batch {
+-                    let (stream, ptt_gate, manual_gate, track_local_floor) = match input.origin {
+-                        SttAudioOrigin::Local => (
+-                            &mut local_stream,
+-                            ptt_active.as_ref(),
+-                            manual_mic_unmuted.as_ref(),
+-                            true,
+-                        ),
+-                        SttAudioOrigin::RemoteHuman => (&mut remote_stream, None, None, false),
++                    let (stream, ptt_gate, manual_gate, track_local_floor, speaker) =
++                        match &input.origin {
++                            SttAudioOrigin::Local => (
++                                &mut local_stream,
++                                ptt_active.as_ref(),
++                                manual_mic_unmuted.as_ref(),
++                                true,
++                                None,
++                            ),
++                            SttAudioOrigin::RemoteHuman(pubkey) => {
++                                if !remote_streams.contains_key(pubkey) {
++                                    match SttStreamState::new() {
++                                        Ok(stream) => {
++                                            remote_streams.insert(pubkey.clone(), stream);
++                                        }
++                                        Err(error) => {
++                                            eprintln!("buzz-desktop: {error}");
++                                            continue;
++                                        }
++                                    }
++                                }
++                                let Some(stream) = remote_streams.get_mut(pubkey) else {
++                                    continue;
++                                };
++                                (stream, None, None, false, Some(pubkey.as_str()))
++                            }
++                        };
++                    let sink = TranscriptSink {
++                        tx: &text_tx,
++                        speaker,
+                     };
+                     process_stt_input(
+                         stream,
+                         &input.pcm_bytes,
+                         speculative_enabled,
+                         &recognizer,
+-                        &text_tx,
++                        &sink,
+                         ptt_gate,
+                         manual_gate,
+                         &human_floor,
+@@ -585,7 +616,7 @@ fn process_stt_input(
+     pcm_bytes: &[u8],
+     speculative_enabled: bool,
+     recognizer: &sherpa_onnx::OfflineRecognizer,
+-    text_tx: &tokio_mpsc::Sender<String>,
++    text_tx: &TranscriptSink<'_>,
+     ptt_active: Option<&Arc<AtomicBool>>,
+     manual_mic_unmuted: Option<&Arc<AtomicBool>>,
+     human_floor: &HumanFloor,
+@@ -665,7 +696,7 @@ fn process_16k_samples(
+     flush_frames: usize,
+     speculative: (bool, &mut Option<(String, usize)>),
+     recognizer: &sherpa_onnx::OfflineRecognizer,
+-    text_tx: &tokio_mpsc::Sender<String>,
++    text_tx: &TranscriptSink<'_>,
+     ptt_active: Option<&Arc<AtomicBool>>,
+     manual_mic_unmuted: Option<&Arc<AtomicBool>>,
+     human_floor: &HumanFloor,
+@@ -775,7 +806,7 @@ fn flush_to_stt(
+     speech_buf: &[f32],
+     voiced_frames: usize,
+     recognizer: &sherpa_onnx::OfflineRecognizer,
+-    text_tx: &tokio_mpsc::Sender<String>,
++    text_tx: &TranscriptSink<'_>,
+ ) {
+     if speech_buf.is_empty() {
+         return;
+@@ -789,21 +820,65 @@ fn flush_to_stt(
+     send_transcript(decode_speech(recognizer, speech_buf), text_tx);
+ }
+ 
+-/// Run the Parakeet decode on a speech buffer and return the trimmed text.
++/// Recognizer config for the model in `model_dir`; the flag is `true` for the
++/// Korean SenseVoice model.
++pub(super) fn recognizer_config(
++    model_dir: &std::path::Path,
++    model_path: &std::path::Path,
++    tokens_path: &std::path::Path,
++) -> (sherpa_onnx::OfflineRecognizerConfig, bool) {
++    // Korean uses SenseVoice (selected by the transcript-language setting);
++    // English keeps Parakeet's CTC head. Both ship `model.int8.onnx`.
++    let korean = super::models::is_sense_voice_dir(model_dir);
++    let mut cfg = sherpa_onnx::OfflineRecognizerConfig::default();
++    if korean {
++        cfg.model_config.sense_voice.model = Some(model_path.to_string_lossy().into_owned());
++        // Pin "ko" rather than "auto": VAD chunks are 1–3 s, short enough for
++        // auto-detect to drift into zh/ja. English loanwords still come out.
++        cfg.model_config.sense_voice.language = Some("ko".to_string());
++        cfg.model_config.sense_voice.use_itn = true;
++    } else {
++        cfg.model_config.nemo_ctc.model = Some(model_path.to_string_lossy().into_owned());
++    }
++    cfg.model_config.tokens = Some(tokens_path.to_string_lossy().into_owned());
++    cfg.model_config.num_threads = stt_num_threads();
++    // Explicit — defaults are not part of the API contract, and noisy debug
++    // logging in release builds would be expensive on every VAD chunk.
++    cfg.model_config.debug = false;
++    (cfg, korean)
++}
++
++thread_local! {
++    /// Set once by `stt_worker` for its own thread: the loaded model is the
++    /// Korean SenseVoice one, whose output needs particle re-spacing.
++    static KOREAN_SPACING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// Decode a speech buffer and return the trimmed text (Korean output is
++/// re-spaced, see `korean_spacing`).
+ fn decode_speech(recognizer: &sherpa_onnx::OfflineRecognizer, speech_buf: &[f32]) -> String {
+     let stream = recognizer.create_stream();
+     stream.accept_waveform(16_000, speech_buf);
+     recognizer.decode(&stream);
+ 
+-    stream
++    let text = stream
+         .get_result()
+         .map(|r| r.text.trim().to_string())
+-        .unwrap_or_default()
++        .unwrap_or_default();
++    if KOREAN_SPACING.with(|flag| flag.get()) {
++        super::korean_spacing::fix_korean_spacing(&text)
++    } else {
++        text
++    }
+ }
+ 
+-fn send_transcript(text: String, text_tx: &tokio_mpsc::Sender<String>) {
++fn send_transcript(text: String, sink: &TranscriptSink<'_>) {
+     if !text.is_empty() {
+-        if let Err(e) = text_tx.blocking_send(text) {
++        let transcript = SttTranscript {
++            text,
++            speaker: sink.speaker.map(str::to_string),
++        };
++        if let Err(e) = sink.tx.blocking_send(transcript) {
+             eprintln!("buzz-desktop: STT text channel closed: {e}");
+         }
+     }
+diff --git a/desktop/src-tauri/src/huddle/stt_tests.rs b/desktop/src-tauri/src/huddle/stt_tests.rs
+index d7425970c..cf309bd8c 100644
+--- a/desktop/src-tauri/src/huddle/stt_tests.rs
++++ b/desktop/src-tauri/src/huddle/stt_tests.rs
+@@ -1,8 +1,9 @@
+ use std::sync::{atomic::AtomicBool, mpsc, Arc, Barrier};
+ 
+ use super::{
+-    has_enough_voiced_audio, run_stt_receive_loop, vad_flush_allowed, HumanFloor, SttAudioInput,
+-    SttAudioOrigin, SttLoopInput, VadEndpoint, VadFrameAction, MIN_VOICED_FRAMES,
++    decode_speech, has_enough_voiced_audio, recognizer_config, run_stt_receive_loop,
++    send_transcript, vad_flush_allowed, HumanFloor, SttAudioInput, SttAudioOrigin, SttLoopInput,
++    SttTranscript, TranscriptSink, VadEndpoint, VadFrameAction, KOREAN_SPACING, MIN_VOICED_FRAMES,
+     SILENCE_FLUSH_FRAMES, VAD_FRAME_SAMPLES, VAD_ONSET_FRAMES, VAD_PRE_ROLL_FRAMES,
+ };
+ 
+@@ -258,3 +259,52 @@ fn held_push_to_talk_never_silence_flushes() {
+     // Manually open mic with the shortcut up: normal VAD behavior.
+     assert!(vad_flush_allowed(true, true, false));
+ }
++
++/// Loads the Korean SenseVoice model exactly as `stt_worker` does and decodes
++/// a 16 kHz mono f32le clip. Run with:
++/// BUZZ_KO_MODEL_DIR=<…/sense-voice-ko-2024-07-17> BUZZ_KO_PCM=<clip.f32> \
++///   cargo test korean_sense_voice_decodes -- --ignored --nocapture
++#[test]
++#[ignore = "needs the SenseVoice model on disk"]
++fn korean_sense_voice_decodes() {
++    let dir =
++        std::path::PathBuf::from(std::env::var("BUZZ_KO_MODEL_DIR").expect("BUZZ_KO_MODEL_DIR"));
++    let pcm = std::fs::read(std::env::var("BUZZ_KO_PCM").expect("BUZZ_KO_PCM")).expect("read pcm");
++    let samples: Vec<f32> = pcm
++        .chunks_exact(4)
++        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
++        .collect();
++    let (cfg, korean) =
++        recognizer_config(&dir, &dir.join("model.int8.onnx"), &dir.join("tokens.txt"));
++    assert!(korean, "directory name must select the SenseVoice path");
++    let recognizer = sherpa_onnx::OfflineRecognizer::create(&cfg).expect("create recognizer");
++    KOREAN_SPACING.with(|flag| flag.set(true));
++    let text = decode_speech(&recognizer, &samples);
++    eprintln!("transcript: {text}");
++    assert!(text.contains("확정을"), "unexpected transcript: {text}");
++}
++
++#[test]
++fn remote_transcripts_carry_their_speaker() {
++    let (tx, mut rx) = tokio::sync::mpsc::channel::<SttTranscript>(4);
++    let remote = TranscriptSink {
++        tx: &tx,
++        speaker: Some("abcd"),
++    };
++    let local = TranscriptSink {
++        tx: &tx,
++        speaker: None,
++    };
++    send_transcript("안녕하세요".to_string(), &remote);
++    send_transcript("hello".to_string(), &local);
++    send_transcript(String::new(), &remote);
++    assert_eq!(
++        rx.try_recv().unwrap(),
++        SttTranscript {
++            text: "안녕하세요".to_string(),
++            speaker: Some("abcd".to_string()),
++        }
++    );
++    assert_eq!(rx.try_recv().unwrap().speaker, None);
++    assert!(rx.try_recv().is_err(), "empty text is not sent");
++}
+diff --git a/desktop/src-tauri/src/huddle/transcription.rs b/desktop/src-tauri/src/huddle/transcription.rs
+index 4825d4b8f..0185edaaa 100644
+--- a/desktop/src-tauri/src/huddle/transcription.rs
++++ b/desktop/src-tauri/src/huddle/transcription.rs
+@@ -72,3 +72,46 @@ pub async fn set_huddle_transcription_enabled(
+     state.emit_huddle_state_changed();
+     Ok(())
+ }
++
++/// Set the huddle transcript language (`"en"` or `"ko"`).
++///
++/// Starts downloading that language's STT model if needed. When a transcript
++/// is running, the pipeline is restarted on the new model; if that model is
++/// not downloaded yet, the hot-start loop picks it up once it is ready.
++#[tauri::command]
++pub async fn set_huddle_stt_language(
++    language: String,
++    state: State<'_, AppState>,
++) -> Result<(), String> {
++    let language = models::SttLanguage::parse(&language)
++        .ok_or_else(|| format!("unsupported transcript language: {language}"))?;
++    if !models::set_stt_language(language) {
++        return Ok(());
++    }
++    if let Some(manager) = models::global_model_manager() {
++        manager.start_stt_download(state.http_client.clone());
++    }
++
++    let restart = {
++        let mut hs = state.huddle()?;
++        match hs.ephemeral_channel_id.clone() {
++            Some(channel_id) if hs.transcription_enabled => {
++                hs.invalidate_transcription_pipeline();
++                Some((channel_id, hs.take_stt_pipeline()))
++            }
++            _ => None,
++        }
++    };
++    if let Some((channel_id, old_stt)) = restart {
++        if let Some(ref pipeline) = old_stt {
++            pipeline.shutdown();
++        }
++        drop(old_stt);
++        if let Err(e) = maybe_start_stt_pipeline(&state, &channel_id).await {
++            eprintln!("buzz-desktop: STT restart after language change failed: {e}");
++        }
++    }
++
++    state.emit_huddle_state_changed();
++    Ok(())
++}
+diff --git a/desktop/src-tauri/src/lib.rs b/desktop/src-tauri/src/lib.rs
+index a37d9c536..752538847 100644
+--- a/desktop/src-tauri/src/lib.rs
++++ b/desktop/src-tauri/src/lib.rs
+@@ -74,9 +74,9 @@ use huddle::{
+     end_huddle, get_huddle_agent_pubkeys, get_huddle_state, get_model_status, get_voice_input_mode,
+     interrupt_huddle_speech, join_huddle, leave_huddle, open_huddle_window, push_audio_pcm,
+     reconnect::reconnect_huddle_audio,
+-    remove_agent_from_huddle, set_huddle_manual_mic_unmuted, set_huddle_transcription_enabled,
+-    set_tts_enabled, set_voice_input_mode, speak_agent_message, start_huddle, start_stt_pipeline,
+-    HuddlePhase,
++    remove_agent_from_huddle, set_huddle_manual_mic_unmuted, set_huddle_stt_language,
++    set_huddle_transcription_enabled, set_tts_enabled, set_voice_input_mode, speak_agent_message,
++    start_huddle, start_stt_pipeline, HuddlePhase,
+ };
+ use initial_window::*;
+ use managed_agents::{
+@@ -810,6 +810,7 @@ pub fn run() {
+             reconnect_huddle_audio,
+             start_stt_pipeline,
+             set_huddle_transcription_enabled,
++            set_huddle_stt_language,
+             download_voice_models,
+             get_model_status,
+             set_tts_enabled,
+diff --git a/desktop/src/features/huddle/HuddleContext.tsx b/desktop/src/features/huddle/HuddleContext.tsx
+index 8e6ccbbd8..78cf950b2 100644
+--- a/desktop/src/features/huddle/HuddleContext.tsx
++++ b/desktop/src/features/huddle/HuddleContext.tsx
+@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
+ import { emit, listen } from "@tauri-apps/api/event";
+ import * as React from "react";
+ 
++import { applyTranscriptLanguage } from "./lib/transcriptLanguage";
+ import { setupAudioWorklet, type AudioWorkletHandle } from "./lib/audioWorklet";
+ import { type AudioInputDevice, useAudioDevices } from "./lib/useAudioDevices";
+ import { usePipelineHotstart } from "./lib/usePipelineHotstart";
+@@ -189,6 +190,14 @@ export function HuddleProvider({
+     });
+   }, []);
+ 
++  // The backend starts in English; push the saved / system transcript
++  // language at launch so the right STT model downloads before a huddle.
++  React.useEffect(() => {
++    void applyTranscriptLanguage().catch(() => {
++      /* best-effort */
++    });
++  }, []);
++
+   // Fetch output devices on mount and when system devices change.
+   React.useEffect(() => {
+     function refreshOutputDevices() {
+diff --git a/desktop/src/features/huddle/components/HuddleBar.tsx b/desktop/src/features/huddle/components/HuddleBar.tsx
+index 4c01ca68a..568967e9c 100644
+--- a/desktop/src/features/huddle/components/HuddleBar.tsx
++++ b/desktop/src/features/huddle/components/HuddleBar.tsx
+@@ -28,6 +28,11 @@ import { useEmojiBurst } from "@/shared/ui/EmojiBurstProvider";
+ import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
+ import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
+ import { useHuddle, useHuddleLevels } from "../HuddleContext";
++import {
++  applyTranscriptLanguage,
++  readTranscriptLanguage,
++  type TranscriptLanguage,
++} from "../lib/transcriptLanguage";
+ import { useHuddleParticipantRoster } from "../hooks/useHuddleParticipantRoster";
+ import { AddAgentDialog, type AgentAddResult } from "./AddAgentDialog";
+ import type { HuddleAgentVoiceSettings } from "./AgentVoiceMenu";
+@@ -193,6 +198,8 @@ export function HuddleBar({
+   const [agentAddError, setAgentAddError] = React.useState<string | null>(null);
+   const [isReactionPickerOpen, setIsReactionPickerOpen] = React.useState(false);
+   const [reactionError, setReactionError] = React.useState<string | null>(null);
++  const [transcriptLanguage, setTranscriptLanguage] =
++    React.useState<TranscriptLanguage>(readTranscriptLanguage);
+   const [transcriptError, setTranscriptError] = React.useState<string | null>(
+     null,
+   );
+@@ -538,6 +545,17 @@ export function HuddleBar({
+     }
+   }
+ 
++  async function handleToggleTranscriptLanguage() {
++    setTranscriptError(null);
++    const next: TranscriptLanguage = transcriptLanguage === "ko" ? "en" : "ko";
++    try {
++      setTranscriptLanguage(await applyTranscriptLanguage(next));
++    } catch (e) {
++      const message = e instanceof Error ? e.message : String(e);
++      setTranscriptError(`Transcript language failed: ${message}`);
++    }
++  }
++
+   async function handleToggleTranscript() {
+     setTranscriptError(null);
+     try {
+@@ -803,6 +821,31 @@ export function HuddleBar({
+             </TooltipContent>
+           </Tooltip>
+ 
++          <Tooltip>
++            <TooltipTrigger asChild>
++              <Button
++                aria-label={
++                  transcriptLanguage === "ko"
++                    ? "Transcript language: Korean"
++                    : "Transcript language: English"
++                }
++                className="buzz-huddle-control-button h-12 w-9 shrink-0 rounded-md text-xs font-semibold"
++                data-no-translate
++                onClick={() => void handleToggleTranscriptLanguage()}
++                size="icon"
++                type="button"
++                variant="ghost"
++              >
++                {transcriptLanguage === "ko" ? "한" : "EN"}
++              </Button>
++            </TooltipTrigger>
++            <TooltipContent className="buzz-huddle-tooltip" side="top">
++              {transcriptLanguage === "ko"
++                ? "Transcript language: Korean (click for English)"
++                : "Transcript language: English (click for Korean)"}
++            </TooltipContent>
++          </Tooltip>
++
+           <Tooltip>
+             <TooltipTrigger asChild>
+               <Button
+diff --git a/desktop/src/features/huddle/lib/transcriptLanguage.ts b/desktop/src/features/huddle/lib/transcriptLanguage.ts
+new file mode 100644
+index 000000000..e5824973f
+--- /dev/null
++++ b/desktop/src/features/huddle/lib/transcriptLanguage.ts
+@@ -0,0 +1,37 @@
++import { invoke } from "@tauri-apps/api/core";
++
++/** Huddle transcript language: Korean uses SenseVoice, English uses Parakeet. */
++export type TranscriptLanguage = "ko" | "en";
++
++const STORAGE_KEY = "buzz-huddle-transcript-language";
++
++/** Saved choice, else Korean on a Korean system and English elsewhere. */
++export function readTranscriptLanguage(): TranscriptLanguage {
++  try {
++    const saved = window.localStorage.getItem(STORAGE_KEY);
++    if (saved === "ko" || saved === "en") return saved;
++  } catch {
++    // Storage unavailable — fall back to the system language.
++  }
++  try {
++    return navigator.language?.toLowerCase().startsWith("ko") ? "ko" : "en";
++  } catch {
++    return "en";
++  }
++}
++
++/**
++ * Tell the backend which STT model to use (and to download it if needed).
++ * Pass `language` to change and remember the choice; omit it to re-sync.
++ */
++export async function applyTranscriptLanguage(
++  language: TranscriptLanguage = readTranscriptLanguage(),
++): Promise<TranscriptLanguage> {
++  try {
++    window.localStorage.setItem(STORAGE_KEY, language);
++  } catch {
++    // Best effort — the backend still switches for this session.
++  }
++  await invoke("set_huddle_stt_language", { language });
++  return language;
++}
