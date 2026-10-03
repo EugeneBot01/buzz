@@ -1,9 +1,9 @@
 diff --git a/desktop/src/features/sidebar/lib/teamSectionsSync.test.mjs b/desktop/src/features/sidebar/lib/teamSectionsSync.test.mjs
 new file mode 100644
-index 0000000..3779490
+index 0000000..a24db05
 --- /dev/null
 +++ b/desktop/src/features/sidebar/lib/teamSectionsSync.test.mjs
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,319 @@
 +import assert from "node:assert/strict";
 +import test, { beforeEach, mock } from "node:test";
 +
@@ -15,6 +15,7 @@ index 0000000..3779490
 +  TEAM_SECTIONS_LANE,
 +  TeamSectionsReconciler,
 +  shouldSeedTeamSections,
++  teamSectionsDTag,
 +} from "./teamSectionsSync.ts";
 +
 +const ALICE = "a".repeat(64);
@@ -260,12 +261,74 @@ index 0000000..3779490
 +  );
 +  assert.equal(shouldSeedTeamSections({ ...ok, alreadySeeded: true }), false);
 +});
++
++test("a community only merges events published under its own d tag", async () => {
++  const here = teamSectionsDTag("wss://a.example.com/");
++  const there = teamSectionsDTag("wss://b.example.com");
++  assert.notEqual(here, there);
++  assert.equal(here, teamSectionsDTag("WSS://A.example.com"));
++
++  let tree = {};
++  const store = {
++    get: () => tree,
++    merge: (remote) => {
++      tree = mergeTrees(tree, remote);
++    },
++  };
++  const doc = (id, name) =>
++    canonical(encodeDoc(TEAM_SECTIONS_LANE, addSection(id, name)({})));
++  const rec = new TeamSectionsReconciler(
++    store,
++    ALICE,
++    { fetch: async () => [], publish: async () => {} },
++    here,
++  );
++  // Another community's layout, and a pre-scoping (bare d tag) event.
++  rec.ingest(ev(BOB, doc("s1", "Theirs"), 10, there));
++  rec.ingest(ev(BOB, doc("s2", "Legacy"), 11));
++  assert.deepEqual(projectSections(tree).sections, []);
++  rec.ingest(ev(BOB, doc("s3", "Ours"), 12, here));
++  assert.deepEqual(
++    projectSections(tree).sections.map((s) => s.name),
++    ["Ours"],
++  );
++});
++
++test("a publish in flight when the scope is torn down is told it is stale", async () => {
++  let tree = {};
++  const store = {
++    get: () => tree,
++    merge: (remote) => {
++      tree = mergeTrees(tree, remote);
++    },
++  };
++  let current = null;
++  let release = () => {};
++  const rec = new TeamSectionsReconciler(store, ALICE, {
++    fetch: async () => [],
++    publish: (_content, _createdAt, isCurrent) => {
++      current = isCurrent;
++      return new Promise((resolve) => {
++        release = resolve;
++      });
++    },
++  });
++  await rec.read();
++  tree = addSection("s1", "Work")(tree);
++  rec.defer();
++  await settle();
++  assert.equal(current(), true);
++  rec.destroy();
++  assert.equal(current(), false, "a community switch cancels the send");
++  release();
++  await settle();
++});
 diff --git a/desktop/src/features/sidebar/lib/teamSectionsSync.ts b/desktop/src/features/sidebar/lib/teamSectionsSync.ts
 new file mode 100644
-index 0000000..f6d6019
+index 0000000..f7a771a
 --- /dev/null
 +++ b/desktop/src/features/sidebar/lib/teamSectionsSync.ts
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,254 @@
 +import type { RelayEvent } from "@/shared/api/types";
 +import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
 +import { SECTIONS_LANE } from "./channelSectionsSync";
@@ -287,6 +350,14 @@ index 0000000..f6d6019
 + */
 +export const TEAM_SECTIONS_D_TAG = "team-channel-sections";
 +
++/**
++ * The `d` tag for one community. Communities on a shared host can serve the
++ * same member's events, so the coordinate itself names the community: a
++ * layout published in one can never be read (or overwritten) from another.
++ */
++export const teamSectionsDTag = (relayUrl: string) =>
++  `${TEAM_SECTIONS_D_TAG}:${normalizeRelayUrl(relayUrl)}`;
++
 +/** Relay event size ceiling shared by every sidebar blob. */
 +const MAX_CONTENT_BYTES = 65_535;
 +/** Most member events merged per read; a community larger than this is out of scope. */
@@ -294,7 +365,8 @@ index 0000000..f6d6019
 +const DEBOUNCE_MS = 2_000;
 +const BACKOFF_MS = [5_000, 10_000, 30_000, 60_000, 60_000];
 +
-+const TEAM_STORAGE_KEY_PREFIX = "buzz-team-sections.v1";
++// v2: v1 caches could hold another community's layout (unscoped `d` tag).
++const TEAM_STORAGE_KEY_PREFIX = "buzz-team-sections.v2";
 +
 +/** Same register shape as personal sections, in its own relay-scoped cache. */
 +export const TEAM_SECTIONS_LANE: LaneCodec & {
@@ -318,8 +390,16 @@ index 0000000..f6d6019
 +export type TeamSectionsTransport = {
 +  /** Every member's current team-sections event. Throws on transport failure. */
 +  fetch: () => Promise<RelayEvent[]>;
-+  /** Signs and publishes this member's event. Throws on failure. */
-+  publish: (content: string, createdAt: number) => Promise<void>;
++  /**
++   * Signs and publishes this member's event. Throws on failure. `isCurrent`
++   * is checked right before the send, so a publish that outlives its scope
++   * (a community switch mid-flight) is dropped instead of sent.
++   */
++  publish: (
++    content: string,
++    createdAt: number,
++    isCurrent: () => boolean,
++  ) => Promise<void>;
 +};
 +
 +type Seen = { id: string; createdAt: number; tree: Tree };
@@ -344,22 +424,25 @@ index 0000000..f6d6019
 +  private readonly store: TeamSectionsStore;
 +  private readonly pubkey: string;
 +  private readonly transport: TeamSectionsTransport;
++  private readonly dTag: string;
 +
 +  constructor(
 +    store: TeamSectionsStore,
 +    pubkey: string,
 +    transport: TeamSectionsTransport,
++    dTag: string = TEAM_SECTIONS_D_TAG,
 +  ) {
 +    this.store = store;
 +    this.pubkey = pubkey;
 +    this.transport = transport;
++    this.dTag = dTag;
 +  }
 +
 +  /** Merges one member's event if it is their newest readable one. */
 +  ingest(event: RelayEvent): void {
 +    if (this.destroyed) return;
 +    const d = event.tags.filter((tag) => tag[0] === "d");
-+    if (d.length !== 1 || d[0]?.[1] !== TEAM_SECTIONS_D_TAG) return;
++    if (d.length !== 1 || d[0]?.[1] !== this.dTag) return;
 +    if (byteLength(event.content) > MAX_CONTENT_BYTES) return;
 +    const prev = this.seen.get(event.pubkey);
 +    // The relay's replaceable winner: later `created_at`, then lower id.
@@ -446,12 +529,18 @@ index 0000000..f6d6019
 +    );
 +    this.publishing = true;
 +    try {
-+      await this.transport.publish(content, createdAt);
++      await this.transport.publish(
++        content,
++        createdAt,
++        () => !this.destroyed,
++      );
++      if (this.destroyed) return;
 +      this.failures = 0;
 +      // Our own event now carries `tree`; the live echo (same `created_at`,
 +      // any id) never beats this entry, so it is not merged twice.
 +      this.seen.set(this.pubkey, { id: "", createdAt, tree });
 +    } catch (error) {
++      if (this.destroyed) return;
 +      console.warn(`[${TEAM_SECTIONS_D_TAG}] publish failed:`, error);
 +      this.notBefore =
 +        Date.now() +
@@ -496,10 +585,10 @@ index 0000000..f6d6019
 +}
 diff --git a/desktop/src/features/sidebar/lib/useTeamChannelSections.ts b/desktop/src/features/sidebar/lib/useTeamChannelSections.ts
 new file mode 100644
-index 0000000..7825255
+index 0000000..831bac7
 --- /dev/null
 +++ b/desktop/src/features/sidebar/lib/useTeamChannelSections.ts
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,387 @@
 +import * as React from "react";
 +
 +import { relayClient } from "@/shared/api/relayClient";
@@ -518,6 +607,7 @@ index 0000000..7825255
 +  MAX_TEAM_SECTION_AUTHORS,
 +  TEAM_SECTIONS_D_TAG,
 +  TEAM_SECTIONS_LANE,
++  teamSectionsDTag,
 +  TeamSectionsReconciler,
 +  shouldSeedTeamSections,
 +  type TeamSectionsTransport,
@@ -526,39 +616,39 @@ index 0000000..7825255
 +const EMPTY: Tree = Object.freeze({}) as Tree;
 +const REFRESH_MS = 5 * 60 * 1_000;
 +
-+const TEAM_FILTER = {
-+  kinds: [KIND_CHANNEL_SECTIONS],
-+  "#d": [TEAM_SECTIONS_D_TAG],
-+};
-+
-+const relayTransport: TeamSectionsTransport = {
-+  fetch: () =>
-+    relayClient.fetchEvents({
-+      ...TEAM_FILTER,
-+      limit: MAX_TEAM_SECTION_AUTHORS,
-+    }),
-+  async publish(content, createdAt) {
-+    const event = await signRelayEvent({
-+      kind: KIND_CHANNEL_SECTIONS,
-+      content,
-+      createdAt,
-+      tags: [
-+        ["d", TEAM_SECTIONS_D_TAG],
-+        ["t", TEAM_SECTIONS_D_TAG],
-+      ],
-+    });
-+    try {
-+      await relayClient.publishEvent(
-+        event,
-+        `Timed out publishing ${TEAM_SECTIONS_D_TAG}.`,
-+        `Failed to publish ${TEAM_SECTIONS_D_TAG}.`,
-+      );
-+    } catch (error) {
-+      if (!String((error as Error)?.message).startsWith("duplicate:"))
-+        throw error;
-+    }
-+  },
-+};
++/** Relay reads and writes for one community's team layout (see `teamSectionsDTag`). */
++function relayTransport(dTag: string): TeamSectionsTransport & {
++  filter: { kinds: number[]; "#d": string[] };
++} {
++  const filter = { kinds: [KIND_CHANNEL_SECTIONS], "#d": [dTag] };
++  return {
++    filter,
++    fetch: () =>
++      relayClient.fetchEvents({ ...filter, limit: MAX_TEAM_SECTION_AUTHORS }),
++    async publish(content, createdAt, isCurrent) {
++      const event = await signRelayEvent({
++        kind: KIND_CHANNEL_SECTIONS,
++        content,
++        createdAt,
++        tags: [
++          ["d", dTag],
++          ["t", TEAM_SECTIONS_D_TAG],
++        ],
++      });
++      try {
++        await relayClient.publishEvent(
++          event,
++          `Timed out publishing ${TEAM_SECTIONS_D_TAG}.`,
++          `Failed to publish ${TEAM_SECTIONS_D_TAG}.`,
++          isCurrent, // checked again right before each socket send
++        );
++      } catch (error) {
++        if (!String((error as Error)?.message).startsWith("duplicate:"))
++          throw error;
++      }
++    },
++  };
++}
 +
 +/** Same whole-list reorder as personal sections (`useChannelSections`). */
 +function writeOrder(tree: Tree, requested: string[]) {
@@ -602,8 +692,10 @@ index 0000000..7825255
 +  );
 +
 +  React.useEffect(() => {
-+    if (!store || !pubkey) return;
-+    const rec = new TeamSectionsReconciler(store, pubkey, relayTransport);
++    if (!store || !pubkey || !relayUrl) return;
++    const dTag = teamSectionsDTag(relayUrl);
++    const transport = relayTransport(dTag);
++    const rec = new TeamSectionsReconciler(store, pubkey, transport, dTag);
 +    reconcilerRef.current = rec;
 +    let disposed = false;
 +    let unsubLive: (() => Promise<void>) | null = null;
@@ -617,7 +709,7 @@ index 0000000..7825255
 +    const detachTabs = store.attachCrossTab();
 +    const unsubReconnect = relayClient.subscribeToReconnects(read);
 +    void relayClient
-+      .subscribeLive({ ...TEAM_FILTER, limit: 0 }, (event) => {
++      .subscribeLive({ ...transport.filter, limit: 0 }, (event) => {
 +        if (!disposed) rec.ingest(event);
 +      })
 +      .then((dispose) => {
@@ -637,7 +729,7 @@ index 0000000..7825255
 +      unsubReconnect();
 +      if (unsubLive) void unsubLive();
 +    };
-+  }, [store, pubkey]);
++  }, [store, pubkey, relayUrl]);
 +
 +  const edit = React.useCallback(
 +    (fn: (tree: Tree) => Tree) => {
@@ -777,7 +869,7 @@ index 0000000..7825255
 +}
 +
 +const seededKey = (pubkey: string, relayUrl: string) =>
-+  `buzz-team-sections-seeded.v1:${pubkey}:${encodeURIComponent(normalizeRelayUrl(relayUrl))}`;
++  `buzz-team-sections-seeded.v2:${pubkey}:${encodeURIComponent(normalizeRelayUrl(relayUrl))}`;
 +
 +/**
 + * Makes the community owner's personal layout the team's starting layout: the
