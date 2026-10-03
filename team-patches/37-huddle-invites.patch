@@ -1,8 +1,8 @@
 diff --git a/desktop/src-tauri/src/huddle/agents.rs b/desktop/src-tauri/src/huddle/agents.rs
-index 2bdf05442..e63d16400 100644
+index 2bdf05442..a10869f66 100644
 --- a/desktop/src-tauri/src/huddle/agents.rs
 +++ b/desktop/src-tauri/src/huddle/agents.rs
-@@ -139,6 +139,63 @@ pub async fn add_agent_to_huddle(
+@@ -139,6 +139,70 @@ pub async fn add_agent_to_huddle(
      })
  }
  
@@ -21,19 +21,26 @@ index 2bdf05442..e63d16400 100644
 +
 +/// Let a person into the huddle (Discord-style "invite to call").
 +///
-+/// Adds them to the private ephemeral huddle channel as `member` — the relay
-+/// admits explicit ephemeral members even if they are not in the parent
-+/// channel. With `add_to_parent`, also adds them to the parent channel
++/// With `admit`, adds them to the private ephemeral huddle channel as
++/// `member` — the relay admits explicit ephemeral members even if they are
++/// not in the parent channel. A creator's ring needs no admit: joining via
++/// the DM card auto-adds parent (DM) members. With `add_to_parent`, also adds them to the parent channel
 +/// (best-effort, existing membership and role are left untouched).
 +pub async fn add_human_to_huddle(
 +    ephemeral_channel_id: Uuid,
 +    parent_channel_id: Uuid,
 +    pubkey: &str,
++    admit: bool,
 +    add_to_parent: bool,
 +    state: &AppState,
 +) -> Result<(bool, Option<String>), String> {
-+    let add_eph = events::build_add_member(ephemeral_channel_id, pubkey, Some("member"))?;
-+    submit_event(add_eph, state).await?;
++    // Only pre-admit when the person cannot join through a parent they are in
++    // (a non-creator's invite). Pre-admitted rooms show up in their sidebar
++    // as stray channels, since their device never joined them.
++    if admit {
++        let add_eph = events::build_add_member(ephemeral_channel_id, pubkey, Some("member"))?;
++        submit_event(add_eph, state).await?;
++    }
 +
 +    let parent_id = parent_channel_id.to_string();
 +    let already_in_parent = fetch_channel_members_with_roles(&parent_id, state)
@@ -67,10 +74,10 @@ index 2bdf05442..e63d16400 100644
  ///
  /// The source channel may be either the Huddle's parent or its ephemeral chat.
 diff --git a/desktop/src-tauri/src/huddle/commands.rs b/desktop/src-tauri/src/huddle/commands.rs
-index e4f25a93f..ca91ca58f 100644
+index e4f25a93f..98330b1ed 100644
 --- a/desktop/src-tauri/src/huddle/commands.rs
 +++ b/desktop/src-tauri/src/huddle/commands.rs
-@@ -214,3 +214,70 @@ pub async fn add_agent_to_huddle(
+@@ -214,3 +214,72 @@ pub async fn add_agent_to_huddle(
  
      Ok(result)
  }
@@ -81,6 +88,7 @@ index e4f25a93f..ca91ca58f 100644
 +#[tauri::command]
 +pub async fn invite_to_huddle(
 +    pubkey: String,
++    admit: bool,
 +    add_to_parent: bool,
 +    state: State<'_, AppState>,
 +) -> Result<agents::HumanInviteResult, String> {
@@ -102,7 +110,8 @@ index e4f25a93f..ca91ca58f 100644
 +    let parent_uuid = Uuid::parse_str(&parent_id).map_err(|e| e.to_string())?;
 +
 +    let (parent_added, parent_error) =
-+        agents::add_human_to_huddle(eph_uuid, parent_uuid, &pubkey, add_to_parent, &state).await?;
++        agents::add_human_to_huddle(eph_uuid, parent_uuid, &pubkey, admit, add_to_parent, &state)
++            .await?;
 +
 +    Ok(agents::HumanInviteResult {
 +        parent_channel_id: parent_id,
@@ -262,10 +271,10 @@ index 568967e9c..d42ee8f69 100644
                <Button
 diff --git a/desktop/src/features/huddle/components/InvitePeopleDialog.tsx b/desktop/src/features/huddle/components/InvitePeopleDialog.tsx
 new file mode 100644
-index 000000000..19b594961
+index 000000000..a5c3a5cd5
 --- /dev/null
 +++ b/desktop/src/features/huddle/components/InvitePeopleDialog.tsx
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,283 @@
 +import { invoke } from "@tauri-apps/api/core";
 +import { Check, LoaderCircle } from "lucide-react";
 +import * as React from "react";
@@ -391,6 +400,9 @@ index 000000000..19b594961
 +    try {
 +      const result = await invoke<HumanInviteResult>("invite_to_huddle", {
 +        pubkey,
++        // A creator rings with a DM huddle card; joining through it admits
++        // them, so only pre-admit for a non-creator's invite message.
++        admit: !isCreator,
 +        // A DM's membership is its identity — never add people to it.
 +        addToParent: addToChannel && !parentIsDm,
 +      });
