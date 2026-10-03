@@ -1,0 +1,278 @@
+diff --git a/desktop/src/app/useAppShellDesktopNotifications.ts b/desktop/src/app/useAppShellDesktopNotifications.ts
+index bdf14d0fa..e83d6444c 100644
+--- a/desktop/src/app/useAppShellDesktopNotifications.ts
++++ b/desktop/src/app/useAppShellDesktopNotifications.ts
+@@ -98,6 +98,7 @@ export function useAppShellDesktopNotifications({
+       senderName: resolveSenderName(event.pubkey),
+       channelName,
+       content: event.content,
++      kind: event.kind,
+     });
+     void sendDesktopNotification({
+       title,
+@@ -142,6 +143,7 @@ export function useAppShellDesktopNotifications({
+         senderName: resolveSenderName(event.pubkey),
+         channelName,
+         content: event.content,
++        kind: event.kind,
+       });
+ 
+       void sendDesktopNotification({
+@@ -185,6 +187,7 @@ export function useAppShellDesktopNotifications({
+         senderName: resolveSenderName(event.pubkey),
+         channelName,
+         content: event.content,
++        kind: event.kind,
+       });
+ 
+       void sendDesktopNotification({
+diff --git a/desktop/src/features/notifications/lib/feed.ts b/desktop/src/features/notifications/lib/feed.ts
+index 4c87cb99d..5d6db5de0 100644
+--- a/desktop/src/features/notifications/lib/feed.ts
++++ b/desktop/src/features/notifications/lib/feed.ts
+@@ -41,6 +41,7 @@ export function formatFeedNotification(item: FeedItem, senderName?: string) {
+     senderName,
+     channelName: item.channelType !== "dm" ? item.channelName : null,
+     content: item.content,
++    kind: item.kind,
+   });
+ }
+ 
+diff --git a/desktop/src/features/notifications/lib/inactiveCommunityAlerts.ts b/desktop/src/features/notifications/lib/inactiveCommunityAlerts.ts
+index 5cc1508d4..c1c98dde1 100644
+--- a/desktop/src/features/notifications/lib/inactiveCommunityAlerts.ts
++++ b/desktop/src/features/notifications/lib/inactiveCommunityAlerts.ts
+@@ -304,6 +304,7 @@ export function useInactiveCommunityNotifications({
+               senderName: names.get(alert.event.pubkey) ?? null,
+               channelName: alert.channelName,
+               content: alert.event.content,
++              kind: alert.event.kind,
+             });
+             const didSend = await sendDesktopNotification({
+               title: `${title} · ${community.name}`,
+diff --git a/desktop/src/features/notifications/lib/notificationFormat.test.mjs b/desktop/src/features/notifications/lib/notificationFormat.test.mjs
+index 162cb6a43..11e3f3b84 100644
+--- a/desktop/src/features/notifications/lib/notificationFormat.test.mjs
++++ b/desktop/src/features/notifications/lib/notificationFormat.test.mjs
+@@ -161,3 +161,30 @@ test("senderNameFromSummary prefers displayName, then NIP-05, never a pubkey", (
+   assert.equal(senderNameFromSummary(null), null);
+   assert.equal(senderNameFromSummary(undefined), null);
+ });
++
++test("a DM huddle start reads as an incoming call, not raw JSON", () => {
++  const content = JSON.stringify({ ephemeral_channel_id: "8a7f0c1e-0000-4000-8000-000000000000" });
++  const en = formatMessageNotification({ source: "dm", senderName: "Alice", content, kind: 48100, locale: "en" });
++  assert.equal(en.title, "📞 Alice is calling you");
++  assert.equal(en.body, "Click to join the call.");
++  const ko = formatMessageNotification({ source: "dm", senderName: "성태엄마", content, kind: 48100, locale: "ko" });
++  assert.equal(ko.title, "📞 성태엄마님의 전화");
++  assert.equal(ko.body, "눌러서 통화에 참여하세요.");
++});
++
++test("a wave drops its protocol marker", () => {
++  const content = "<!-- buzz:wave:v1 -->\nAlice waved at you.";
++  const ko = formatMessageNotification({ source: "dm", senderName: "Alice", content, locale: "ko" });
++  assert.equal(ko.body, "👋 Alice님이 손을 흔들었어요.");
++  assert.ok(!ko.body.includes("<!--"));
++});
++
++test("JSON payloads fall back to neutral copy instead of leaking", () => {
++  const { body } = formatMessageNotification({ source: "channel_message", senderName: "Bot", channelName: "general", content: '{"type":"status","ok":true}', locale: "ko" });
++  assert.equal(body, "새 메시지");
++});
++
++test("Korean copy localizes mention titles", () => {
++  const { title } = formatMessageNotification({ source: "mention", senderName: "구윤", channelName: "제작부", content: "확인 부탁", locale: "ko" });
++  assert.equal(title, "구윤님이 회원님을 언급했어요 · #제작부");
++});
+diff --git a/desktop/src/features/notifications/lib/notificationFormat.ts b/desktop/src/features/notifications/lib/notificationFormat.ts
+index d5e79fe92..f3ae8b579 100644
+--- a/desktop/src/features/notifications/lib/notificationFormat.ts
++++ b/desktop/src/features/notifications/lib/notificationFormat.ts
+@@ -56,14 +56,100 @@ export type MessageNotificationSource =
+   | "thread_reply"
+   | "channel_message";
+ 
+-const MESSAGE_BODY_FALLBACKS: Record<MessageNotificationSource, string> = {
+-  mention: "Something in Buzz needs your attention.",
+-  approval: "A workflow is waiting for your approval.",
+-  needs_action: "Something in Buzz needs your attention.",
+-  dm: "New message",
+-  thread_reply: "New reply",
+-  channel_message: "New message",
+-};
++/** kind:48100 — a huddle (voice call) start; in a DM this is the call invite. */
++const KIND_HUDDLE_STARTED = 48100;
++const WAVE_MARKER = "<!-- buzz:wave:v1 -->";
++
++type NotificationLocale = "ko" | "en";
++
++/**
++ * Notification copy follows the OS language (Korean on a Korean Mac) unless
++ * the user switched the Buzz UI to English. Kept independent of the DOM
++ * translation layer: OS notifications never pass through the DOM.
++ */
++export function resolveNotificationLocale(): NotificationLocale {
++  try {
++    if (window.localStorage.getItem("buzz-ui-locale") === "en") return "en";
++  } catch {
++    // Storage unavailable — fall through to the OS language.
++  }
++  try {
++    return navigator.language?.toLowerCase().startsWith("ko") ? "ko" : "en";
++  } catch {
++    return "en";
++  }
++}
++
++const COPY = {
++  en: {
++    fallback: {
++      mention: "Something in Buzz needs your attention.",
++      approval: "A workflow is waiting for your approval.",
++      needs_action: "Something in Buzz needs your attention.",
++      dm: "New message",
++      thread_reply: "New reply",
++      channel_message: "New message",
++    } as Record<MessageNotificationSource, string>,
++    directMessage: "Direct message",
++    mentioned: (n: string) => `${n} mentioned you`,
++    mentionAnon: "@Mention",
++    approval: (n: string) => `${n} requested approval`,
++    approvalAnon: "Approval Requested",
++    replied: (n: string) => `${n} replied`,
++    replyAnon: "Reply",
++    newMessage: "New message",
++    needsAction: "Needs Action",
++    inChannel: (prefix: string, ch: string) => `${prefix} in ${ch}`,
++    callTitle: (n: string | null) => (n ? `📞 ${n} is calling you` : "📞 Incoming call"),
++    callChannelTitle: (n: string | null, ch: string) =>
++      `📞 ${n ?? "Someone"} started a call in ${ch}`,
++    callBody: "Click to join the call.",
++    wave: (n: string | null) => `👋 ${n ?? "Someone"} waved at you.`,
++  },
++  ko: {
++    fallback: {
++      mention: "확인할 알림이 있어요.",
++      approval: "승인을 기다리는 워크플로가 있어요.",
++      needs_action: "확인할 알림이 있어요.",
++      dm: "새 메시지",
++      thread_reply: "새 답글",
++      channel_message: "새 메시지",
++    } as Record<MessageNotificationSource, string>,
++    directMessage: "개인 메시지",
++    mentioned: (n: string) => `${n}님이 회원님을 언급했어요`,
++    mentionAnon: "@멘션",
++    approval: (n: string) => `${n}님이 승인을 요청했어요`,
++    approvalAnon: "승인 요청",
++    replied: (n: string) => `${n}님이 답글을 남겼어요`,
++    replyAnon: "답글",
++    newMessage: "새 메시지",
++    needsAction: "확인 필요",
++    inChannel: (prefix: string, ch: string) => `${prefix} · ${ch}`,
++    callTitle: (n: string | null) => (n ? `📞 ${n}님의 전화` : "📞 전화가 왔어요"),
++    callChannelTitle: (n: string | null, ch: string) =>
++      `📞 ${n ? `${n}님이` : "누군가"} ${ch}에서 통화를 시작했어요`,
++    callBody: "눌러서 통화에 참여하세요.",
++    wave: (n: string | null) => `👋 ${n ? `${n}님이` : "누군가"} 손을 흔들었어요.`,
++  },
++} as const;
++
++/**
++ * Turn protocol payloads into readable text. Huddle starts carry JSON
++ * (`{"ephemeral_channel_id": ...}`) and waves carry an HTML-comment marker;
++ * neither is meant to be shown raw.
++ */
++function readableContent(content: string): string {
++  const withoutComments = content.replace(/<!--[\s\S]*?-->/g, "").trim();
++  if (/^[{[]/.test(withoutComments)) {
++    try {
++      JSON.parse(withoutComments);
++      return "";
++    } catch {
++      // Not JSON — show as written.
++    }
++  }
++  return withoutComments;
++}
+ 
+ /**
+  * Canonical copy for every message-shaped desktop notification (home-feed
+@@ -74,43 +160,61 @@ const MESSAGE_BODY_FALLBACKS: Record<MessageNotificationSource, string> = {
+  *
+  * `senderName` must already be a real human label (see
+  * `senderNameFromSummary`); `channelName` is the raw channel name without
+- * a `#` prefix.
++ * a `#` prefix. Pass `kind` so calls (huddle starts) and waves read as such
++ * instead of leaking their protocol payload.
+  */
+ export function formatMessageNotification(opts: {
+   source: MessageNotificationSource;
+   senderName?: string | null;
+   channelName?: string | null;
+   content: string;
++  kind?: number;
++  locale?: NotificationLocale;
+ }): { title: string; body: string } {
+   const { source, content } = opts;
++  const t = COPY[opts.locale ?? resolveNotificationLocale()];
+   const senderName = opts.senderName?.trim() || null;
+   const channelName = opts.channelName?.trim() || null;
+-  const body = truncateNotificationBody(
+-    content,
+-    MESSAGE_BODY_FALLBACKS[source],
+-  );
++  const channelLabel = channelName ? `#${channelName}` : null;
++
++  if (opts.kind === KIND_HUDDLE_STARTED) {
++    return {
++      title:
++        source === "dm" || !channelLabel
++          ? t.callTitle(senderName)
++          : t.callChannelTitle(senderName, channelLabel),
++      body: t.callBody,
++    };
++  }
++
++  const isWave = content.trimStart().startsWith(WAVE_MARKER);
++  const body = isWave
++    ? t.wave(senderName)
++    : truncateNotificationBody(readableContent(content), t.fallback[source]);
+ 
+   if (source === "dm") {
+-    return { title: senderName ?? channelName ?? "Direct message", body };
++    return { title: senderName ?? channelName ?? t.directMessage, body };
+   }
+ 
+-  const channelLabel = channelName ? `#${channelName}` : null;
+   const prefix =
+     source === "mention"
+       ? senderName
+-        ? `${senderName} mentioned you`
+-        : "@Mention"
++        ? t.mentioned(senderName)
++        : t.mentionAnon
+       : source === "approval"
+         ? senderName
+-          ? `${senderName} requested approval`
+-          : "Approval Requested"
++          ? t.approval(senderName)
++          : t.approvalAnon
+         : source === "thread_reply"
+           ? senderName
+-            ? `${senderName} replied`
+-            : "Reply"
++            ? t.replied(senderName)
++            : t.replyAnon
+           : source === "channel_message"
+-            ? (senderName ?? "New message")
+-            : (senderName ?? "Needs Action");
++            ? (senderName ?? t.newMessage)
++            : (senderName ?? t.needsAction);
+ 
+-  return { title: formatNotificationTitle({ prefix, channelLabel }), body };
++  return {
++    title: channelLabel ? t.inChannel(prefix, channelLabel) : prefix,
++    body,
++  };
+ }
