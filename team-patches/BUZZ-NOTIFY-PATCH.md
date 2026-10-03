@@ -1430,3 +1430,18 @@ rm -rf "$REPO/desktop/src-tauri/target"   # 수 GB — 저장공간 확보
 echo "installed patched $version"
 notify "Buzz $version 로컬 패치 적용 완료 — 키체인 창이 뜨면 '항상 허용'"
 ````
+
+## 5. 35-call-notifications.patch — 통화·손 흔들기 알림을 읽을 수 있게
+
+**문제**: 누가 DM으로 통화(허들)를 걸면 알림 본문에 `{"ephemeral_channel_id":"8a7f…"}` 같은 내부 데이터가 그대로 떴다. 손 흔들기는 `<!-- buzz:wave:v1 --> … waved at you.`처럼 코드 표시가 섞였다. 알림 제목·기본 문구도 전부 영어였다.
+
+**수정** (`notificationFormat.ts` 한 곳 + 호출부 4곳에 `kind` 전달):
+- 통화 시작(kind 48100): 제목 `📞 ○○님의 전화`(채널이면 `📞 ○○님이 #채널에서 통화를 시작했어요`), 본문 `눌러서 통화에 참여하세요.`
+- 손 흔들기: `👋 ○○님이 손을 흔들었어요.`
+- 그 밖에 본문이 JSON이거나 HTML 주석이 섞이면 원문 대신 기본 문구(`새 메시지` 등)
+- 알림 문구 언어: 맥 언어가 한국어면 한국어, Buzz UI를 영어로 바꿨으면(`buzz-ui-locale=en`) 영어. 한국어 UI 패치(40)와 독립.
+
+**의도 (충돌 시 재구현 기준)**: 알림 본문에 프로토콜 데이터가 나가지 않게 한다. 형식 결정은 `formatMessageNotification` 한 곳에서만 한다.
+
+**검증**: notifications·app 단위 테스트 116개 통과(통화/손 흔들기/JSON/한국어 제목 테스트 4개 추가), `tsc` 통과. `desktop-v0.5.26` + 10·20·30 위에 `git apply --3way` 확인.
+
