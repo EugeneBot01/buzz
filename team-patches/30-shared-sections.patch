@@ -348,10 +348,10 @@ index 0000000..c2c5270
 +});
 diff --git a/desktop/src/features/sidebar/lib/teamSectionsSync.ts b/desktop/src/features/sidebar/lib/teamSectionsSync.ts
 new file mode 100644
-index 0000000..801f746
+index 0000000..0a51286
 --- /dev/null
 +++ b/desktop/src/features/sidebar/lib/teamSectionsSync.ts
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,279 @@
 +import type { RelayEvent } from "@/shared/api/types";
 +import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
 +import { SECTIONS_LANE, type SectionsView } from "./channelSectionsSync";
@@ -631,7 +631,6 @@ index 0000000..801f746
 +  const sections = legacy.sections.filter((section) => used.has(section.id));
 +  return sections.length > 0 ? { sections, assignments } : null;
 +}
-+
 diff --git a/desktop/src/features/sidebar/lib/useTeamChannelSections.ts b/desktop/src/features/sidebar/lib/useTeamChannelSections.ts
 new file mode 100644
 index 0000000..1956037
