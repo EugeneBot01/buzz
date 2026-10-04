@@ -1,5 +1,5 @@
 diff --git a/desktop/src/features/settings/ui/AppearanceSettingsControls.tsx b/desktop/src/features/settings/ui/AppearanceSettingsControls.tsx
-index 003e2894..92c344cc 100644
+index 003e289..92c344c 100644
 --- a/desktop/src/features/settings/ui/AppearanceSettingsControls.tsx
 +++ b/desktop/src/features/settings/ui/AppearanceSettingsControls.tsx
 @@ -1,3 +1,4 @@
@@ -46,7 +46,7 @@ index 003e2894..92c344cc 100644
    const { prominentActiveTab, setProminentActiveTab } = useTheme();
  
 diff --git a/desktop/src/features/settings/ui/SettingsPanels.tsx b/desktop/src/features/settings/ui/SettingsPanels.tsx
-index 18b7e938..183232de 100644
+index 18b7e93..183232d 100644
 --- a/desktop/src/features/settings/ui/SettingsPanels.tsx
 +++ b/desktop/src/features/settings/ui/SettingsPanels.tsx
 @@ -59,6 +59,7 @@ import {
@@ -66,7 +66,7 @@ index 18b7e938..183232de 100644
            {buzzThemeSelected ? <ProminentActiveTabSetting /> : null}
          </SettingsOptionGroup>
 diff --git a/desktop/src/main.tsx b/desktop/src/main.tsx
-index 0866ee05..790bd65a 100644
+index 0866ee0..790bd65 100644
 --- a/desktop/src/main.tsx
 +++ b/desktop/src/main.tsx
 @@ -23,6 +23,7 @@ import { recoverLocalStorageQuotaOnStartup } from "@/shared/lib/localStorageQuot
@@ -96,10 +96,10 @@ index 0866ee05..790bd65a 100644
        {/* block/buzz#5078 — catch any uncaught render error so a WebKit
 diff --git a/desktop/src/shared/i18n/domTranslator.test.mjs b/desktop/src/shared/i18n/domTranslator.test.mjs
 new file mode 100644
-index 00000000..b38c8415
+index 0000000..6c31f55
 --- /dev/null
 +++ b/desktop/src/shared/i18n/domTranslator.test.mjs
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,125 @@
 +import assert from "node:assert/strict";
 +import test from "node:test";
 +
@@ -127,6 +127,37 @@ index 00000000..b38c8415
 +  );
 +  assert.equal(translate("3 new messages"), "새 메시지 3개");
 +  assert.equal(translate("Move #a to Work"), "#a을(를) Work(으)로 이동");
++});
++
++test("one-word patterns leave multi-word user text alone unless it is known UI", () => {
++  const t = createTranslator({
++    exact: {},
++    patterns: [
++      ["Edit {0}", "{0} 편집"],
++      ["New {0}", "새 {0}"],
++      ["{0} only", "{0}만"],
++      ["Members ({0})", "멤버 ({0})"],
++      ["Move {0} to {1}", "{0}을(를) {1}(으)로 이동"],
++    ],
++  });
++  // UI copy with a single-token value still translates.
++  assert.equal(t("Edit design-review"), "design-review 편집");
++  assert.equal(t("Members (12)"), "멤버 (12)");
++  // Ordinary user text (channel names, preview lines) is left alone.
++  assert.equal(t("Edit the doc"), null);
++  assert.equal(t("New York trip"), null);
++  assert.equal(t("Team members only"), null);
++  // Known UI (JSX sentence, aria-label) may capture a multi-word value.
++  assert.equal(t("Edit My Agent", { ui: true }), "My Agent 편집");
++  // App copy missing from the dictionary stays English rather than garbled.
++  assert.equal(
++    createTranslator({ exact: {}, patterns: [["Search {0}", "{0} 검색"]] })(
++      "Search or create a channel",
++    ),
++    null,
++  );
++  // Patterns with two or more literal words are unaffected.
++  assert.equal(t("Move My Channel to Work"), "My Channel을(를) Work(으)로 이동");
 +});
 +
 +test("unknown text and non-letters are left alone", () => {
@@ -196,10 +227,10 @@ index 00000000..b38c8415
 +});
 diff --git a/desktop/src/shared/i18n/domTranslator.ts b/desktop/src/shared/i18n/domTranslator.ts
 new file mode 100644
-index 00000000..d5997edd
+index 0000000..ee29d92
 --- /dev/null
 +++ b/desktop/src/shared/i18n/domTranslator.ts
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,288 @@
 +/**
 + * Display-layer UI translation (team patch). The app renders English; this
 + * swaps exact UI strings for their translation right after React commits, so
@@ -248,7 +279,24 @@ index 00000000..d5997edd
 +  }
 +}
 +
-+type CompiledPattern = { regex: RegExp; template: string };
++type CompiledPattern = {
++  regex: RegExp;
++  template: string;
++  /**
++   * The source has at most one literal word (`Edit {0}`, `{0} only`). Such a
++   * pattern also matches ordinary user text ("Edit the doc" as a channel name
++   * or a preview line), so it only applies when every captured value is a
++   * single token, unless the caller knows the string is UI (see `translate`).
++   */
++  generic: boolean;
++};
++
++const literalWords = (source: string) =>
++  source
++    .replace(/\{\d+\}/g, " ")
++    .replace(/[^A-Za-z ]/g, " ")
++    .split(" ")
++    .filter(Boolean).length;
 +
 +function escapeRegex(value: string) {
 +  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -278,7 +326,11 @@ index 00000000..d5997edd
 +            `$${groupIndex + 1}`,
 +          );
 +        });
-+        return { regex: new RegExp(`^${body}$`, "s"), template: rewritten };
++        return {
++          regex: new RegExp(`^${body}$`, "s"),
++          template: rewritten,
++          generic: literalWords(source) <= 1,
++        };
 +      })
 +      // Longer literal sources first so specific patterns win.
 +      .sort((a, b) => b.regex.source.length - a.regex.source.length)
@@ -289,17 +341,31 @@ index 00000000..d5997edd
 +  const exact = new Map(Object.entries(table.exact));
 +  const patterns = compilePatterns(table.patterns);
 +
-+  return function translate(value: string): string | null {
++  /**
++   * `ui: true` when the string is known to be app copy rather than user
++   * content (a JSX sentence split across text nodes, an `aria-label`), which
++   * lets one-word patterns capture multi-word values.
++   */
++  return function translate(
++    value: string,
++    options?: { ui?: boolean },
++  ): string | null {
 +    const trimmed = value.trim();
 +    if (trimmed.length < 2 || !/[A-Za-z]/.test(trimmed)) return null;
 +    const normalized = trimmed.replace(/\s+/g, " ");
 +    let hit = exact.get(normalized) ?? null;
 +    if (hit === null) {
-+      for (const { regex, template } of patterns) {
-+        if (regex.test(normalized)) {
-+          hit = normalized.replace(regex, template);
-+          break;
-+        }
++      for (const { regex, template, generic } of patterns) {
++        const match = regex.exec(normalized);
++        if (!match) continue;
++        if (
++          generic &&
++          !options?.ui &&
++          match.slice(1).some((captured) => /\s/.test(captured))
++        )
++          continue;
++        hit = normalized.replace(regex, template);
++        break;
 +      }
 +    }
 +    if (hit === null) return null;
@@ -357,7 +423,8 @@ index 00000000..d5997edd
 +  const translateSentence = (parent: Element) => {
 +    const nodes = Array.from(parent.childNodes) as Text[];
 +    const sources = nodes.map(sourceOf);
-+    const whole = translate(sources.join(""));
++    // Adjacent text nodes are a JSX template (`Edit {name}`), never user text.
++    const whole = translate(sources.join(""), { ui: true });
 +    if (whole === null) {
 +      nodes.forEach(translateSingle);
 +      return;
@@ -386,7 +453,10 @@ index 00000000..d5997edd
 +      if (!current) continue;
 +      const saved = originalAttrs.get(element);
 +      if (saved?.get(`${name}:out`) === current) continue;
-+      const next = translate(current);
++      // A `title` tooltip can be user text (a channel or file name), and a
++      // visible `placeholder` not in the dictionary would come out garbled
++      // ("Search or create a channel" → "or create a channel 검색").
++      const next = translate(current, { ui: name === "aria-label" });
 +      if (next === null || next === current) continue;
 +      const map = saved ?? new Map<string, string>();
 +      map.set(name, current);
@@ -451,7 +521,7 @@ index 00000000..d5997edd
 +}
 diff --git a/desktop/src/shared/i18n/ko.generated.ts b/desktop/src/shared/i18n/ko.generated.ts
 new file mode 100644
-index 00000000..228f984b
+index 0000000..228f984
 --- /dev/null
 +++ b/desktop/src/shared/i18n/ko.generated.ts
 @@ -0,0 +1,3652 @@
