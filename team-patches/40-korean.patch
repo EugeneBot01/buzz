@@ -96,10 +96,10 @@ index 0866ee0..790bd65 100644
        {/* block/buzz#5078 — catch any uncaught render error so a WebKit
 diff --git a/desktop/src/shared/i18n/domTranslator.test.mjs b/desktop/src/shared/i18n/domTranslator.test.mjs
 new file mode 100644
-index 0000000..99fc807
+index 0000000..6c31f55
 --- /dev/null
 +++ b/desktop/src/shared/i18n/domTranslator.test.mjs
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,125 @@
 +import assert from "node:assert/strict";
 +import test from "node:test";
 +
@@ -149,6 +149,13 @@ index 0000000..99fc807
 +  assert.equal(t("Team members only"), null);
 +  // Known UI (JSX sentence, aria-label) may capture a multi-word value.
 +  assert.equal(t("Edit My Agent", { ui: true }), "My Agent 편집");
++  // App copy missing from the dictionary stays English rather than garbled.
++  assert.equal(
++    createTranslator({ exact: {}, patterns: [["Search {0}", "{0} 검색"]] })(
++      "Search or create a channel",
++    ),
++    null,
++  );
 +  // Patterns with two or more literal words are unaffected.
 +  assert.equal(t("Move My Channel to Work"), "My Channel을(를) Work(으)로 이동");
 +});
@@ -220,10 +227,10 @@ index 0000000..99fc807
 +});
 diff --git a/desktop/src/shared/i18n/domTranslator.ts b/desktop/src/shared/i18n/domTranslator.ts
 new file mode 100644
-index 0000000..32c10e4
+index 0000000..ee29d92
 --- /dev/null
 +++ b/desktop/src/shared/i18n/domTranslator.ts
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,288 @@
 +/**
 + * Display-layer UI translation (team patch). The app renders English; this
 + * swaps exact UI strings for their translation right after React commits, so
@@ -446,8 +453,10 @@ index 0000000..32c10e4
 +      if (!current) continue;
 +      const saved = originalAttrs.get(element);
 +      if (saved?.get(`${name}:out`) === current) continue;
-+      // A `title` tooltip can be user text (a channel or file name).
-+      const next = translate(current, { ui: name !== "title" });
++      // A `title` tooltip can be user text (a channel or file name), and a
++      // visible `placeholder` not in the dictionary would come out garbled
++      // ("Search or create a channel" → "or create a channel 검색").
++      const next = translate(current, { ui: name === "aria-label" });
 +      if (next === null || next === current) continue;
 +      const map = saved ?? new Map<string, string>();
 +      map.set(name, current);

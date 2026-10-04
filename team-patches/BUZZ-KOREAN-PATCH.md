@@ -44,7 +44,7 @@
 
 **원인.** `Edit {0}`, `New {0}`, `{0} only`처럼 원문에 고정 단어가 하나뿐인 패턴(321개 중 92개)은 평범한 문장에도 맞는다.
 
-**수정 (`domTranslator.ts`).** 고정 단어가 하나 이하인 패턴은, 캡처한 값이 전부 공백 없는 한 덩어리일 때만 적용한다. 다만 UI 문구가 확실한 경우에는 예전처럼 여러 단어도 받는다: JSX가 인접 텍스트 노드로 쪼갠 문장(`Edit {name}`), `aria-label`, `placeholder`. `title`은 채널·파일 이름이 들어갈 수 있어 엄격하게 본다.
+**수정 (`domTranslator.ts`).** 고정 단어가 하나 이하인 패턴은, 캡처한 값이 전부 공백 없는 한 덩어리일 때만 적용한다. 다만 UI 문구가 확실한 경우에는 예전처럼 여러 단어도 받는다: JSX가 인접 텍스트 노드로 쪼갠 문장(`Edit {name}`), `aria-label`. `title`은 채널·파일 이름이 들어갈 수 있어서, `placeholder`는 사전에 없는 문구가 어색하게 번역돼 보여서("Search or create a channel" → "or create a channel 검색") 엄격하게 본다.
 
 **남는 한계.** 두 단어짜리 사용자 글자("Share plans" → "plans 공유", "Alice's card" → "Alice 카드")는 여전히 번역된다. 반대로 한 텍스트 노드로 그려진 UI 문구에 공백 있는 이름이 들어가면("Edit My Agent") 영어로 남는다.
 
