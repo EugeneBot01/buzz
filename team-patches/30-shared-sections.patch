@@ -1,9 +1,9 @@
 diff --git a/desktop/src/features/sidebar/lib/teamSectionsSync.test.mjs b/desktop/src/features/sidebar/lib/teamSectionsSync.test.mjs
 new file mode 100644
-index 0000000..c2c5270
+index 0000000..7afd3ad
 --- /dev/null
 +++ b/desktop/src/features/sidebar/lib/teamSectionsSync.test.mjs
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,372 @@
 +import assert from "node:assert/strict";
 +import test, { beforeEach, mock } from "node:test";
 +
@@ -325,7 +325,7 @@ index 0000000..c2c5270
 +  await settle();
 +});
 +
-+test("carry-over keeps only sections that hold this community's channels", () => {
++test("carry-over adds only this community's sections the team layout lacks", () => {
 +  const legacy = {
 +    sections: [
 +      { id: "s1", name: "Work", order: 0 },
@@ -335,23 +335,53 @@ index 0000000..c2c5270
 +    ],
 +    assignments: { "c-1": "s1", "c-2": "s1", "x-1": "s2", "c-3": "s4" },
 +  };
-+  assert.deepEqual(carryOverTeamSections(legacy, ["c-1", "c-3", "c-9"]), {
-+    sections: [
-+      { id: "s1", name: "Work", order: 0 },
-+      { id: "s4", name: "Play", order: 3 },
-+    ],
-+    assignments: { "c-1": "s1", "c-3": "s4" },
-+  });
++  const empty = { sections: [], assignments: {} };
++  assert.deepEqual(
++    carryOverTeamSections(legacy, empty, ["c-1", "c-3", "c-9"]),
++    {
++      sections: [
++        { id: "s1", name: "Work", order: 0 },
++        { id: "s4", name: "Play", order: 3 },
++      ],
++      assignments: { "c-1": "s1", "c-3": "s4" },
++    },
++  );
 +  // Another community's layout: no channel matches, nothing is carried.
-+  assert.equal(carryOverTeamSections(legacy, ["y-1", "y-2"]), null);
-+  assert.equal(carryOverTeamSections(legacy, []), null);
++  assert.equal(carryOverTeamSections(legacy, empty, ["y-1", "y-2"]), null);
++  assert.equal(carryOverTeamSections(legacy, empty, []), null);
++
++  // A second member, who also sees the private channel c-2, adds only what
++  // the first member's carry-over left out and never re-assigns c-1.
++  const afterFirst = {
++    sections: [{ id: "s1", name: "Renamed", order: 0 }],
++    assignments: { "c-1": "s9" },
++  };
++  assert.deepEqual(
++    carryOverTeamSections(legacy, afterFirst, ["c-1", "c-2", "c-3"]),
++    {
++      sections: [{ id: "s4", name: "Play", order: 3 }],
++      assignments: { "c-2": "s1", "c-3": "s4" },
++    },
++  );
++  // Nothing left to add.
++  assert.equal(
++    carryOverTeamSections(
++      legacy,
++      {
++        sections: legacy.sections,
++        assignments: { "c-1": "s1", "c-2": "s1", "c-3": "s4" },
++      },
++      ["c-1", "c-2", "c-3"],
++    ),
++    null,
++  );
 +});
 diff --git a/desktop/src/features/sidebar/lib/teamSectionsSync.ts b/desktop/src/features/sidebar/lib/teamSectionsSync.ts
 new file mode 100644
-index 0000000..0a51286
+index 0000000..5dc35ad
 --- /dev/null
 +++ b/desktop/src/features/sidebar/lib/teamSectionsSync.ts
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,291 @@
 +import type { RelayEvent } from "@/shared/api/types";
 +import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
 +import { SECTIONS_LANE, type SectionsView } from "./channelSectionsSync";
@@ -610,33 +640,45 @@ index 0000000..0a51286
 +}
 +
 +/**
-+ * The part of a pre-scoping (v1) cached layout that belongs to this
-+ * community: sections holding at least one channel that exists here, with
-+ * only those channels assigned. A v1 cache could hold another community's
-+ * layout, whose channel ids never match, so those sections drop out. `null`
-+ * when nothing belongs here.
++ * What one member's pre-scoping (v1) cached layout adds to the scoped team
++ * layout: the sections that hold at least one channel this member can see
++ * here and that the team layout does not have yet, plus those channels'
++ * assignments where the channel is still unassigned. Sections keep their
++ * original `order`, so members carrying over different (e.g. private)
++ * channels rebuild the same sequence between them.
++ *
++ * A v1 cache could hold another community's layout; its channel ids never
++ * match, so those sections drop out. `null` when there is nothing to add.
 + */
 +export function carryOverTeamSections(
 +  legacy: SectionsView,
++  current: SectionsView,
 +  channelIds: Iterable<string>,
 +): SectionsView | null {
 +  const here = new Set(channelIds);
++  const live = new Set(current.sections.map((section) => section.id));
++  const known = new Set(legacy.sections.map((section) => section.id));
 +  const assignments: Record<string, string> = {};
 +  const used = new Set<string>();
 +  for (const [channelId, sectionId] of Object.entries(legacy.assignments)) {
-+    if (!here.has(channelId)) continue;
-+    assignments[channelId] = sectionId;
++    if (!here.has(channelId) || !known.has(sectionId)) continue;
 +    used.add(sectionId);
++    if (!Object.hasOwn(current.assignments, channelId))
++      assignments[channelId] = sectionId;
 +  }
-+  const sections = legacy.sections.filter((section) => used.has(section.id));
-+  return sections.length > 0 ? { sections, assignments } : null;
++  const sections = legacy.sections.filter(
++    (section) => used.has(section.id) && !live.has(section.id),
++  );
++  return sections.length > 0 || Object.keys(assignments).length > 0
++    ? { sections, assignments }
++    : null;
 +}
 diff --git a/desktop/src/features/sidebar/lib/useTeamChannelSections.ts b/desktop/src/features/sidebar/lib/useTeamChannelSections.ts
 new file mode 100644
-index 0000000..1956037
+index 0000000..7aadeb4
 --- /dev/null
 +++ b/desktop/src/features/sidebar/lib/useTeamChannelSections.ts
-@@ -0,0 +1,471 @@
+@@ -0,0 +1,501 @@
 +import * as React from "react";
 +
 +import { relayClient } from "@/shared/api/relayClient";
@@ -899,9 +941,43 @@ index 0000000..1956037
 +    [edit],
 +  );
 +
++  /**
++   * Adds what `carryOverTeamSections` picked from a pre-scoping cache: the
++   * missing sections at their original order, and the missing assignments.
++   */
++  const carryOverSections = React.useCallback(
++    (legacy: SectionsView, channelIds: readonly string[]) =>
++      edit((prev) => {
++        const view = carryOverTeamSections(
++          legacy,
++          projectSections(prev),
++          channelIds,
++        );
++        if (!view) return prev;
++        return setRegs(prev, [
++          ...view.sections.flatMap(
++            (section): Array<[string[], unknown]> => [
++              [["s", section.id, "name"], section.name],
++              [["s", section.id, "icon"], section.icon ?? null],
++              [["s", section.id, "order"], section.order],
++              [["s", section.id, "live"], true],
++            ],
++          ),
++          ...Object.entries(view.assignments).map(
++            ([channelId, sectionId]): [string[], unknown] => [
++              ["a", channelId],
++              sectionId,
++            ],
++          ),
++        ]);
++      }),
++    [edit],
++  );
++
 +  return {
 +    sections,
 +    assignments,
++    carryOverSections,
 +    createSection,
 +    renameSection,
 +    deleteSection,
@@ -999,51 +1075,48 @@ index 0000000..1956037
 +/**
 + * Carries this community's own sections over from the pre-scoping (v1) cache
 + * into the scoped team layout, once per install, so scoping the events does
-+ * not make the team rebuild its layout. Only into a layout nobody has written
-+ * yet, and only the sections that hold channels of this community (see
-+ * `carryOverTeamSections`). Returns `true` once the decision is made; the
-+ * owner seed waits for it so the two never both fill an empty layout.
++ * not make the team rebuild its layout. Every member's install adds the
++ * sections holding channels that member can see (private channels differ per
++ * member) and that the team layout still lacks (see `carryOverTeamSections`).
++ * Returns `true` once the decision is made; the owner seed waits for it so
++ * the two never both fill an empty layout.
 + */
 +export function useCarryOverTeamSections(
 +  team: {
 +    synced: boolean;
-+    isEmpty: boolean;
-+    adoptSections: (view: SectionsView) => void;
++    carryOverSections: (
++      legacy: SectionsView,
++      channelIds: readonly string[],
++    ) => void;
 +  },
 +  channelIds: readonly string[],
 +  pubkey: string | undefined,
 +  relayUrl: string | undefined,
 +): boolean {
-+  const { synced, isEmpty, adoptSections } = team;
++  const { synced, carryOverSections } = team;
 +  const scope = pubkey && relayUrl ? scopeSuffix(pubkey, relayUrl) : null;
 +  const [settledScope, setSettledScope] = React.useState<string | null>(null);
 +  React.useEffect(() => {
 +    if (!scope || !pubkey || !relayUrl || !synced) return;
 +    if (settledScope === scope) return;
-+    const key = `buzz-team-sections-carried.v2:${scope}`;
++    const key = `buzz-team-sections-carried.v3:${scope}`;
 +    let done = true;
 +    try {
 +      done = window.localStorage.getItem(key) !== null;
 +    } catch {
 +      // Unreadable storage: never carry over, rather than on every launch.
 +    }
-+    const legacy = done ? null : readLegacyTeamSections(pubkey, relayUrl);
-+    if (!done && legacy && legacy.sections.length > 0 && isEmpty) {
++    if (!done) {
++      const legacy = readLegacyTeamSections(pubkey, relayUrl);
++      const pending = legacy !== null && legacy.sections.length > 0;
 +      // The channel list decides what belongs here; wait for it to load.
-+      if (channelIds.length === 0) return;
-+      const view = carryOverTeamSections(legacy, channelIds);
++      if (pending && channelIds.length === 0) return;
 +      try {
 +        window.localStorage.setItem(key, "1");
 +      } catch {
 +        return;
 +      }
-+      if (view) adoptSections(view);
-+    } else if (!done) {
-+      try {
-+        window.localStorage.setItem(key, "1");
-+      } catch {
-+        // Decided for this session only.
-+      }
++      if (pending) carryOverSections(legacy, channelIds);
 +    }
 +    setSettledScope(scope);
 +  }, [
@@ -1051,9 +1124,8 @@ index 0000000..1956037
 +    pubkey,
 +    relayUrl,
 +    synced,
-+    isEmpty,
 +    channelIds,
-+    adoptSections,
++    carryOverSections,
 +    settledScope,
 +  ]);
 +  return settledScope === scope && scope !== null;
