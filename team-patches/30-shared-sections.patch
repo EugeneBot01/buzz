@@ -1,9 +1,9 @@
 diff --git a/desktop/src/features/sidebar/lib/teamSectionsSync.test.mjs b/desktop/src/features/sidebar/lib/teamSectionsSync.test.mjs
 new file mode 100644
-index 0000000..a24db05
+index 0000000..c2c5270
 --- /dev/null
 +++ b/desktop/src/features/sidebar/lib/teamSectionsSync.test.mjs
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,342 @@
 +import assert from "node:assert/strict";
 +import test, { beforeEach, mock } from "node:test";
 +
@@ -14,6 +14,7 @@ index 0000000..a24db05
 +  TEAM_SECTIONS_D_TAG,
 +  TEAM_SECTIONS_LANE,
 +  TeamSectionsReconciler,
++  carryOverTeamSections,
 +  shouldSeedTeamSections,
 +  teamSectionsDTag,
 +} from "./teamSectionsSync.ts";
@@ -323,15 +324,37 @@ index 0000000..a24db05
 +  release();
 +  await settle();
 +});
++
++test("carry-over keeps only sections that hold this community's channels", () => {
++  const legacy = {
++    sections: [
++      { id: "s1", name: "Work", order: 0 },
++      { id: "s2", name: "Elsewhere", order: 1 },
++      { id: "s3", name: "Empty", order: 2 },
++      { id: "s4", name: "Play", order: 3 },
++    ],
++    assignments: { "c-1": "s1", "c-2": "s1", "x-1": "s2", "c-3": "s4" },
++  };
++  assert.deepEqual(carryOverTeamSections(legacy, ["c-1", "c-3", "c-9"]), {
++    sections: [
++      { id: "s1", name: "Work", order: 0 },
++      { id: "s4", name: "Play", order: 3 },
++    ],
++    assignments: { "c-1": "s1", "c-3": "s4" },
++  });
++  // Another community's layout: no channel matches, nothing is carried.
++  assert.equal(carryOverTeamSections(legacy, ["y-1", "y-2"]), null);
++  assert.equal(carryOverTeamSections(legacy, []), null);
++});
 diff --git a/desktop/src/features/sidebar/lib/teamSectionsSync.ts b/desktop/src/features/sidebar/lib/teamSectionsSync.ts
 new file mode 100644
-index 0000000..f7a771a
+index 0000000..801f746
 --- /dev/null
 +++ b/desktop/src/features/sidebar/lib/teamSectionsSync.ts
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,280 @@
 +import type { RelayEvent } from "@/shared/api/types";
 +import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
-+import { SECTIONS_LANE } from "./channelSectionsSync";
++import { SECTIONS_LANE, type SectionsView } from "./channelSectionsSync";
 +import { decodeDoc, encodeDoc, type LaneCodec } from "./sidebarLaneStore";
 +import { canonical, isEmptyTree, mergeTrees, type Tree } from "./sidebarLwwMap";
 +
@@ -367,6 +390,8 @@ index 0000000..f7a771a
 +
 +// v2: v1 caches could hold another community's layout (unscoped `d` tag).
 +const TEAM_STORAGE_KEY_PREFIX = "buzz-team-sections.v2";
++/** The pre-scoping cache, read once to carry a community's own layout over. */
++export const LEGACY_TEAM_STORAGE_KEY_PREFIX = "buzz-team-sections.v1";
 +
 +/** Same register shape as personal sections, in its own relay-scoped cache. */
 +export const TEAM_SECTIONS_LANE: LaneCodec & {
@@ -583,12 +608,36 @@ index 0000000..f7a771a
 +    !input.alreadySeeded
 +  );
 +}
++
++/**
++ * The part of a pre-scoping (v1) cached layout that belongs to this
++ * community: sections holding at least one channel that exists here, with
++ * only those channels assigned. A v1 cache could hold another community's
++ * layout, whose channel ids never match, so those sections drop out. `null`
++ * when nothing belongs here.
++ */
++export function carryOverTeamSections(
++  legacy: SectionsView,
++  channelIds: Iterable<string>,
++): SectionsView | null {
++  const here = new Set(channelIds);
++  const assignments: Record<string, string> = {};
++  const used = new Set<string>();
++  for (const [channelId, sectionId] of Object.entries(legacy.assignments)) {
++    if (!here.has(channelId)) continue;
++    assignments[channelId] = sectionId;
++    used.add(sectionId);
++  }
++  const sections = legacy.sections.filter((section) => used.has(section.id));
++  return sections.length > 0 ? { sections, assignments } : null;
++}
++
 diff --git a/desktop/src/features/sidebar/lib/useTeamChannelSections.ts b/desktop/src/features/sidebar/lib/useTeamChannelSections.ts
 new file mode 100644
-index 0000000..831bac7
+index 0000000..1956037
 --- /dev/null
 +++ b/desktop/src/features/sidebar/lib/useTeamChannelSections.ts
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,471 @@
 +import * as React from "react";
 +
 +import { relayClient } from "@/shared/api/relayClient";
@@ -601,9 +650,11 @@ index 0000000..831bac7
 +  projectSections,
 +  type SectionsView,
 +} from "./channelSectionsSync";
-+import { LaneStore } from "./sidebarLaneStore";
++import { decodeDoc, LaneStore } from "./sidebarLaneStore";
 +import { isEmptyTree, own, setRegs, type Tree } from "./sidebarLwwMap";
 +import {
++  carryOverTeamSections,
++  LEGACY_TEAM_STORAGE_KEY_PREFIX,
 +  MAX_TEAM_SECTION_AUTHORS,
 +  TEAM_SECTIONS_D_TAG,
 +  TEAM_SECTIONS_LANE,
@@ -927,6 +978,88 @@ index 0000000..831bac7
 +  ]);
 +}
 +
++const scopeSuffix = (pubkey: string, relayUrl: string) =>
++  `${pubkey}:${encodeURIComponent(normalizeRelayUrl(relayUrl))}`;
++
++/** This install's pre-scoping (v1) cached team layout, if it has one. */
++function readLegacyTeamSections(
++  pubkey: string,
++  relayUrl: string,
++): SectionsView | null {
++  try {
++    const raw = window.localStorage.getItem(
++      `${LEGACY_TEAM_STORAGE_KEY_PREFIX}:${scopeSuffix(pubkey, relayUrl)}`,
++    );
++    const doc = raw ? decodeDoc(TEAM_SECTIONS_LANE, JSON.parse(raw), 1) : null;
++    return doc ? projectSections(doc.tree) : null;
++  } catch {
++    return null;
++  }
++}
++
++/**
++ * Carries this community's own sections over from the pre-scoping (v1) cache
++ * into the scoped team layout, once per install, so scoping the events does
++ * not make the team rebuild its layout. Only into a layout nobody has written
++ * yet, and only the sections that hold channels of this community (see
++ * `carryOverTeamSections`). Returns `true` once the decision is made; the
++ * owner seed waits for it so the two never both fill an empty layout.
++ */
++export function useCarryOverTeamSections(
++  team: {
++    synced: boolean;
++    isEmpty: boolean;
++    adoptSections: (view: SectionsView) => void;
++  },
++  channelIds: readonly string[],
++  pubkey: string | undefined,
++  relayUrl: string | undefined,
++): boolean {
++  const { synced, isEmpty, adoptSections } = team;
++  const scope = pubkey && relayUrl ? scopeSuffix(pubkey, relayUrl) : null;
++  const [settledScope, setSettledScope] = React.useState<string | null>(null);
++  React.useEffect(() => {
++    if (!scope || !pubkey || !relayUrl || !synced) return;
++    if (settledScope === scope) return;
++    const key = `buzz-team-sections-carried.v2:${scope}`;
++    let done = true;
++    try {
++      done = window.localStorage.getItem(key) !== null;
++    } catch {
++      // Unreadable storage: never carry over, rather than on every launch.
++    }
++    const legacy = done ? null : readLegacyTeamSections(pubkey, relayUrl);
++    if (!done && legacy && legacy.sections.length > 0 && isEmpty) {
++      // The channel list decides what belongs here; wait for it to load.
++      if (channelIds.length === 0) return;
++      const view = carryOverTeamSections(legacy, channelIds);
++      try {
++        window.localStorage.setItem(key, "1");
++      } catch {
++        return;
++      }
++      if (view) adoptSections(view);
++    } else if (!done) {
++      try {
++        window.localStorage.setItem(key, "1");
++      } catch {
++        // Decided for this session only.
++      }
++    }
++    setSettledScope(scope);
++  }, [
++    scope,
++    pubkey,
++    relayUrl,
++    synced,
++    isEmpty,
++    channelIds,
++    adoptSections,
++    settledScope,
++  ]);
++  return settledScope === scope && scope !== null;
++}
++
 +type TeamSectionsPreference = "on" | "off" | null;
 +
 +const preferenceKey = (pubkey: string, relayUrl: string) =>
@@ -977,15 +1110,16 @@ index 0000000..831bac7
 +  return [current.value, set];
 +}
 diff --git a/desktop/src/features/sidebar/ui/AppSidebar.tsx b/desktop/src/features/sidebar/ui/AppSidebar.tsx
-index 0bc6186..98fa570 100644
+index 0bc6186..839a630 100644
 --- a/desktop/src/features/sidebar/ui/AppSidebar.tsx
 +++ b/desktop/src/features/sidebar/ui/AppSidebar.tsx
-@@ -10,6 +10,13 @@ import {
+@@ -10,6 +10,14 @@ import {
    useChannelSections,
    type ChannelSection,
  } from "@/features/sidebar/lib/useChannelSections";
 +import { useMyRelayMembershipLookupQuery } from "@/features/community-members/hooks";
 +import {
++  useCarryOverTeamSections,
 +  useSeedTeamSectionsFromOwner,
 +  useTeamChannelSections,
 +  useTeamSectionsPreference,
@@ -994,7 +1128,7 @@ index 0bc6186..98fa570 100644
  import { useActiveWorkingChannelsById } from "@/features/sidebar/lib/useActiveWorkingChannelsById";
  import { useDmSidebarMetadata } from "@/features/sidebar/useDmSidebarMetadata";
  import { sortDmChannelsForSidebar } from "@/features/sidebar/lib/dmSidebarSort";
-@@ -265,6 +272,21 @@ export function AppSidebar({
+@@ -265,6 +273,21 @@ export function AppSidebar({
      }));
    }, []);
  
@@ -1016,17 +1150,29 @@ index 0bc6186..98fa570 100644
    const {
      sections: channelSections,
      assignments: channelAssignments,
-@@ -276,7 +298,22 @@ export function AppSidebar({
+@@ -276,7 +299,34 @@ export function AppSidebar({
      reorderSections,
      assignChannel,
      unassignChannel,
 -  } = useChannelSections(currentPubkey, activeCommunity?.relayUrl);
 +  } = teamSectionsActive ? teamSections : personalSections;
++  // A layout cached before team events were scoped per community is carried
++  // over first; only then may the owner's personal layout seed an empty one.
++  const communityChannelIds = React.useMemo(
++    () => channels.map((channel) => channel.id),
++    [channels],
++  );
++  const teamCarryOverSettled = useCarryOverTeamSections(
++    teamSections,
++    communityChannelIds,
++    currentPubkey,
++    activeCommunity?.relayUrl,
++  );
 +  // The owner's personal layout becomes the team's starting layout, once.
 +  const myMembershipQuery = useMyRelayMembershipLookupQuery();
 +  useSeedTeamSectionsFromOwner(
 +    myMembershipQuery.data?.membership?.role === "owner",
-+    teamSections,
++    { ...teamSections, synced: teamSections.synced && teamCarryOverSettled },
 +    personalSections,
 +    currentPubkey,
 +    activeCommunity?.relayUrl,
