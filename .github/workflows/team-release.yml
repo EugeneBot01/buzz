@@ -20,9 +20,9 @@ on:
         description: "Official Buzz version to build on (e.g. 0.5.26)"
         required: true
       build_number:
-        description: "Team build number for this official version (1, 2, 3, ...)"
-        required: true
-        default: "1"
+        description: "Team build number for this official version (1, 2, 3, ...). Leave empty to use the next free number."
+        required: false
+        default: ""
       publish:
         description: "Send to team apps as an update. Leave OFF for a test build."
         type: boolean
@@ -53,11 +53,23 @@ jobs:
         env:
           UPSTREAM_VERSION: ${{ inputs.upstream_version }}
           BUILD_NUMBER: ${{ inputs.build_number }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           [[ "$UPSTREAM_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
             echo "::error::upstream_version must look like 0.5.26 (got '$UPSTREAM_VERSION')"; exit 1;
           }
+          # No number given (e.g. started from a chat workflow): take the one
+          # after the highest existing team release of this official version.
+          # Runs are serialized by the concurrency group, so two queued runs
+          # never pick the same number.
+          if [[ -z "$BUILD_NUMBER" ]]; then
+            prefix="team-v${UPSTREAM_VERSION}-team."
+            last=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName \
+              --jq "[.[].tagName | select(startswith(\"${prefix}\")) | ltrimstr(\"${prefix}\") | select(test(\"^[0-9]+$\")) | tonumber] | max // 0")
+            BUILD_NUMBER=$((last + 1))
+            echo "No build_number given; using ${BUILD_NUMBER} (highest existing: ${last})."
+          fi
           [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || {
             echo "::error::build_number must be 1, 2, 3, ... (got '$BUILD_NUMBER')"; exit 1;
           }
