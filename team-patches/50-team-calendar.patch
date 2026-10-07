@@ -3297,7 +3297,7 @@ index 0000000..203cbbc
 +}
 diff --git a/desktop/src/features/team-calendar/ui/EntryForm.tsx b/desktop/src/features/team-calendar/ui/EntryForm.tsx
 new file mode 100644
-index 0000000..d456450
+index 0000000..155f643
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/EntryForm.tsx
 @@ -0,0 +1,355 @@
@@ -3473,7 +3473,7 @@ index 0000000..d456450
 +
 +  return (
 +    <form
-+      className="flex max-h-[28rem] flex-col gap-2 overflow-y-auto pr-1"
++      className="flex max-h-[min(36rem,62vh)] flex-col gap-2 overflow-y-auto pr-1"
 +      data-testid="team-calendar-form"
 +      onSubmit={submit}
 +    >
@@ -3723,7 +3723,7 @@ index 0000000..d702c0e
 +}
 diff --git a/desktop/src/features/team-calendar/ui/PollsPanel.tsx b/desktop/src/features/team-calendar/ui/PollsPanel.tsx
 new file mode 100644
-index 0000000..09704a0
+index 0000000..5f2a565
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/PollsPanel.tsx
 @@ -0,0 +1,487 @@
@@ -3842,7 +3842,7 @@ index 0000000..09704a0
 +    const problem = validatePoll(inputOf(draft));
 +    return (
 +      <form
-+        className="flex max-w-md flex-col gap-2"
++        className="flex min-h-80 max-w-md flex-col gap-2"
 +        data-testid="team-poll-form"
 +        onSubmit={(event) => {
 +          event.preventDefault();
@@ -4000,7 +4000,7 @@ index 0000000..09704a0
 +    };
 +
 +    return (
-+      <div className="flex flex-col gap-3" data-testid="team-poll-detail">
++      <div className="flex min-h-80 flex-col gap-3" data-testid="team-poll-detail">
 +        <div className="flex items-center gap-2">
 +          <Button
 +            aria-label="투표 목록으로"
@@ -4148,7 +4148,7 @@ index 0000000..09704a0
 +
 +  const today = todayKey();
 +  return (
-+    <div className="flex flex-col gap-3" data-testid="team-poll-list">
++    <div className="flex min-h-80 flex-col gap-3" data-testid="team-poll-list">
 +      <div className="flex items-center justify-between gap-2">
 +        <p className="text-xs text-muted-foreground">
 +          모일 수 있는 날을 팀원들에게 물어보고, 가장 많이 되는 날을 찾습니다.
@@ -4216,7 +4216,7 @@ index 0000000..09704a0
 +}
 diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
 new file mode 100644
-index 0000000..5450593
+index 0000000..9298d09
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
 @@ -0,0 +1,626 @@
@@ -4520,7 +4520,7 @@ index 0000000..5450593
 +              >
 +                <ChevronRight className="h-4 w-4" />
 +              </Button>
-+              <label className="ml-auto flex items-center gap-1.5 text-xs">
++              <label className="ml-auto mr-2 flex items-center gap-1.5 text-xs">
 +                <Checkbox
 +                  checked={mineOnly}
 +                  data-testid="team-calendar-mine-only"
