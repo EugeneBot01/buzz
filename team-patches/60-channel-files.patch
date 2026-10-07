@@ -1,0 +1,775 @@
+diff --git a/desktop/src-tauri/src/commands/media_download.rs b/desktop/src-tauri/src/commands/media_download.rs
+index 47d7652..4e5e432 100644
+--- a/desktop/src-tauri/src/commands/media_download.rs
++++ b/desktop/src-tauri/src/commands/media_download.rs
+@@ -1,6 +1,7 @@
+ use futures_util::StreamExt;
+ use sha2::{Digest, Sha256};
+ use tauri::State;
++use tauri_plugin_dialog::DialogExt;
+ use tokio_util::sync::CancellationToken;
+ 
+ use crate::app_state::AppState;
+@@ -25,6 +26,17 @@ pub(super) const MAX_DOWNLOAD_BYTES: u64 = 50 * 1024 * 1024;
+ /// Download request timeout.
+ const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+ 
++/// Team patch: size cap for saving a file attachment to disk. The relay
++/// accepts generic files up to 100 MB and videos up to 500 MB, so the 50 MiB
++/// in-app cap above made larger uploads impossible to download again.
++pub(super) const MAX_FILE_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
++
++/// Team patch: request timeout for those larger file saves.
++const FILE_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
++
++/// Team patch: most files one bulk download may save.
++const MAX_BULK_DOWNLOAD_ITEMS: usize = 200;
++
+ /// Validate that a URL is a legitimate relay media URL.
+ ///
+ /// Ensures:
+@@ -129,7 +141,7 @@ pub async fn download_file(
+         .and_then(|e| e.to_str())
+         .map(|e| e.to_string());
+ 
+-    let bytes = fetch_blob_bytes(&url, &state).await?;
++    let bytes = fetch_blob_bytes_with_cap(&url, &state, MAX_FILE_DOWNLOAD_BYTES, None).await?;
+ 
+     // Reuse the upload-side allow/deny policy: rejects executables, HTML, and
+     // other types the relay would never have accepted, while permitting the
+@@ -263,7 +275,13 @@ pub(super) async fn fetch_blob_bytes_with_cap(
+     // A no-redirect client keeps the minted media auth token from being
+     // forwarded across origins by a relay-issued 3xx (redirect-hop SSRF); a
+     // 3xx is returned verbatim and rejected by the `is_success` check below.
+-    let mut req = state.media_fetch_client.get(url).timeout(DOWNLOAD_TIMEOUT);
++    // Larger caps are file saves; give them time to finish on a slow link.
++    let timeout = if cap > MAX_DOWNLOAD_BYTES {
++        FILE_DOWNLOAD_TIMEOUT
++    } else {
++        DOWNLOAD_TIMEOUT
++    };
++    let mut req = state.media_fetch_client.get(url).timeout(timeout);
+ 
+     // Every caller pre-validates `url` against the relay origin via
+     // `validate_download_url`, satisfying the mint_media_get_auth safety
+@@ -520,6 +538,125 @@ pub async fn fetch_snapshot_bytes(
+     Ok(tauri::ipc::Response::new(bytes))
+ }
+ 
++/// One file of a bulk download request (team patch).
++#[derive(serde::Deserialize)]
++pub struct BulkDownloadItem {
++    url: String,
++    filename: String,
++}
++
++/// A file a bulk download could not save, and why.
++#[derive(serde::Serialize)]
++pub struct BulkDownloadFailure {
++    filename: String,
++    error: String,
++}
++
++/// Outcome of [`download_files_to_folder`].
++#[derive(serde::Serialize)]
++pub struct BulkDownloadResult {
++    /// The user closed the folder dialog; nothing was downloaded.
++    cancelled: bool,
++    saved: usize,
++    failed: Vec<BulkDownloadFailure>,
++}
++
++/// A path in `folder` for `filename` that does not overwrite an existing
++/// file: `report.pdf`, then `report (2).pdf`, `report (3).pdf`, ...
++fn unique_destination(folder: &std::path::Path, filename: &str) -> std::path::PathBuf {
++    let candidate = folder.join(filename);
++    if !candidate.exists() {
++        return candidate;
++    }
++    let path = std::path::Path::new(filename);
++    let stem = path
++        .file_stem()
++        .and_then(|s| s.to_str())
++        .unwrap_or("file");
++    let ext = path.extension().and_then(|e| e.to_str());
++    for n in 2..10_000u32 {
++        let name = match ext {
++            Some(ext) => format!("{stem} ({n}).{ext}"),
++            None => format!("{stem} ({n})"),
++        };
++        let candidate = folder.join(name);
++        if !candidate.exists() {
++            return candidate;
++        }
++    }
++    candidate
++}
++
++/// Team patch: download several relay `/media/` files into one folder the
++/// user picks once, instead of one save dialog per file.
++///
++/// Every URL is validated against the relay origin before the folder dialog
++/// opens (same SSRF guard as `download_file`). The destination folder comes
++/// only from the native dialog, never from the frontend. A file that fails is
++/// reported and the rest continue; existing files are never overwritten.
++#[tauri::command]
++pub async fn download_files_to_folder(
++    items: Vec<BulkDownloadItem>,
++    app: tauri::AppHandle,
++    state: State<'_, AppState>,
++) -> Result<BulkDownloadResult, String> {
++    if items.is_empty() {
++        return Err("no files selected".to_string());
++    }
++    if items.len() > MAX_BULK_DOWNLOAD_ITEMS {
++        return Err(format!(
++            "too many files selected (max {MAX_BULK_DOWNLOAD_ITEMS})"
++        ));
++    }
++    let relay_base = relay_api_base_url_with_override(&state);
++    for item in &items {
++        validate_download_url(&item.url, &relay_base)?;
++    }
++
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    app.dialog().file().pick_folder(move |path| {
++        let _ = tx.send(path);
++    });
++    let selected = rx.await.map_err(|_| "dialog cancelled".to_string())?;
++    let folder = match selected {
++        Some(path) => path
++            .as_path()
++            .ok_or_else(|| "Folder dialog returned an invalid path".to_string())?
++            .to_path_buf(),
++        None => {
++            return Ok(BulkDownloadResult {
++                cancelled: true,
++                saved: 0,
++                failed: Vec::new(),
++            })
++        }
++    };
++
++    let mut saved = 0usize;
++    let mut failed = Vec::new();
++    for item in items {
++        let filename = sanitize_filename(&item.filename);
++        let outcome: Result<(), String> = async {
++            let bytes =
++                fetch_blob_bytes_with_cap(&item.url, &state, MAX_FILE_DOWNLOAD_BYTES, None).await?;
++            detect_and_validate_mime(&bytes)?;
++            let dest = unique_destination(&folder, &filename);
++            std::fs::write(&dest, &bytes).map_err(|e| format!("Failed to write file: {e}"))
++        }
++        .await;
++        match outcome {
++            Ok(()) => saved += 1,
++            Err(error) => failed.push(BulkDownloadFailure { filename, error }),
++        }
++    }
++
++    Ok(BulkDownloadResult {
++        cancelled: false,
++        saved,
++        failed,
++    })
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/desktop/src-tauri/src/lib.rs b/desktop/src-tauri/src/lib.rs
+index c681889..553b05c 100644
+--- a/desktop/src-tauri/src/lib.rs
++++ b/desktop/src-tauri/src/lib.rs
+@@ -685,6 +685,7 @@ pub fn run() {
+             download_image,
+             save_png_data_url,
+             download_file,
++            download_files_to_folder,
+             fetch_media_bytes,
+             cancel_media_fetch,
+             release_media_fetch,
+diff --git a/desktop/src/features/channel-files/lib/channelFiles.test.mjs b/desktop/src/features/channel-files/lib/channelFiles.test.mjs
+new file mode 100644
+index 0000000..543301b
+--- /dev/null
++++ b/desktop/src/features/channel-files/lib/channelFiles.test.mjs
+@@ -0,0 +1,84 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import {
++  collectChannelFiles,
++  fileKind,
++  formatFileSize,
++  totalSize,
++} from "./channelFiles.ts";
++
++const ALICE = "a".repeat(64);
++const BOB = "b".repeat(64);
++
++let seq = 0;
++const message = (pubkey, createdAt, ...imeta) => ({
++  id: `id-${String(++seq).padStart(4, "0")}`,
++  pubkey,
++  kind: 9,
++  content: "",
++  created_at: createdAt,
++  tags: [["h", "channel"], ...imeta],
++  sig: "s",
++});
++const imeta = (url, fields = {}) => [
++  "imeta",
++  `url ${url}`,
++  ...Object.entries(fields).map(([key, value]) => `${key} ${value}`),
++];
++
++test("attachments are listed newest first with their recorded name and size", () => {
++  const files = collectChannelFiles([
++    message(ALICE, 100, imeta("https://relay.example/media/aaa.pdf", {
++      filename: "plan v2.pdf",
++      size: 2048,
++      m: "application/pdf",
++    })),
++    message(BOB, 300, imeta("https://relay.example/media/bbb.png", { m: "image/png" })),
++    message(ALICE, 200, imeta("https://relay.example/media/ccc.mp4", { m: "video/mp4", size: "oops" })),
++    message(ALICE, 400),
++  ]);
++  assert.deepEqual(
++    files.map((file) => [file.filename, file.size, file.author, file.postedAt]),
++    [
++      ["bbb.png", undefined, BOB, 300],
++      ["ccc.mp4", undefined, ALICE, 200],
++      ["plan v2.pdf", 2048, ALICE, 100],
++    ],
++  );
++  assert.equal(totalSize(files), 2048);
++});
++
++test("a file posted twice is listed once, at its most recent post", () => {
++  const url = "https://relay.example/media/aaa.pdf";
++  const files = collectChannelFiles([
++    message(ALICE, 100, imeta(url, { filename: "first.pdf" })),
++    message(BOB, 500, imeta(url, { filename: "again.pdf" })),
++    message(ALICE, 300, imeta(url, { filename: "middle.pdf" })),
++  ]);
++  assert.equal(files.length, 1);
++  assert.deepEqual([files[0].filename, files[0].author, files[0].postedAt], ["again.pdf", BOB, 500]);
++});
++
++test("several attachments on one message are all listed", () => {
++  const files = collectChannelFiles([
++    message(ALICE, 100,
++      imeta("https://relay.example/media/b.zip", { filename: "b.zip" }),
++      imeta("https://relay.example/media/a.zip", { filename: "a.zip" }),
++    ),
++  ]);
++  assert.deepEqual(files.map((file) => file.filename), ["a.zip", "b.zip"]);
++});
++
++test("kinds and sizes are labelled", () => {
++  assert.equal(fileKind("image/png"), "image");
++  assert.equal(fileKind("video/mp4"), "video");
++  assert.equal(fileKind("audio/mpeg"), "audio");
++  assert.equal(fileKind("application/pdf"), "file");
++  assert.equal(fileKind(""), "file");
++  assert.equal(formatFileSize(820), "820 B");
++  assert.equal(formatFileSize(12_700), "12 KB");
++  assert.equal(formatFileSize(3_250_000), "3.1 MB");
++  assert.equal(formatFileSize(undefined), "");
++  assert.equal(formatFileSize(-1), "");
++});
+diff --git a/desktop/src/features/channel-files/lib/channelFiles.ts b/desktop/src/features/channel-files/lib/channelFiles.ts
+new file mode 100644
+index 0000000..17e1fee
+--- /dev/null
++++ b/desktop/src/features/channel-files/lib/channelFiles.ts
+@@ -0,0 +1,102 @@
++import type { RelayEvent } from "@/shared/api/types";
++import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
++
++/**
++ * Channel files (team patch): every attachment posted in a channel, listed in
++ * one place so several can be selected and saved to a folder at once.
++ */
++export type ChannelFile = {
++  /** Relay media URL; also the identity of the file in the list. */
++  url: string;
++  filename: string;
++  /** Bytes, when the message recorded it. */
++  size?: number;
++  mime: string;
++  /** Pubkey of the member who posted it. */
++  author: string;
++  /** Seconds since epoch of the message that carried it. */
++  postedAt: number;
++};
++
++export type ChannelFileKind = "image" | "video" | "audio" | "file";
++
++/** Most files one bulk download may request (matches the native command). */
++export const MAX_BULK_DOWNLOAD_FILES = 200;
++
++export function fileKind(mime: string): ChannelFileKind {
++  if (mime.startsWith("image/")) return "image";
++  if (mime.startsWith("video/")) return "video";
++  if (mime.startsWith("audio/")) return "audio";
++  return "file";
++}
++
++/** The name to save a file under: its recorded filename, else the URL's last segment. */
++function resolveFilename(url: string, filename: string | undefined): string {
++  const named = filename?.trim();
++  if (named) return named;
++  try {
++    const segment = new URL(url).pathname.split("/").filter(Boolean).pop();
++    if (segment) return decodeURIComponent(segment);
++  } catch {
++    // Not a URL: fall through to the generic name.
++  }
++  return "file";
++}
++
++/**
++ * The attachments carried by `events`, newest first. A file posted more than
++ * once (same URL) is listed once, at its most recent post.
++ */
++export function collectChannelFiles(events: RelayEvent[]): ChannelFile[] {
++  const byUrl = new Map<string, ChannelFile>();
++  for (const event of events) {
++    for (const entry of parseImetaTags(event.tags).values()) {
++      const current = byUrl.get(entry.url);
++      if (current && current.postedAt >= event.created_at) continue;
++      byUrl.set(entry.url, {
++        url: entry.url,
++        filename: resolveFilename(entry.url, entry.filename),
++        size:
++          typeof entry.size === "number" &&
++          Number.isFinite(entry.size) &&
++          entry.size >= 0
++            ? entry.size
++            : undefined,
++        mime: entry.m ?? "",
++        author: event.pubkey,
++        postedAt: event.created_at,
++      });
++    }
++  }
++  return [...byUrl.values()].sort(
++    (a, b) =>
++      b.postedAt - a.postedAt ||
++      a.filename.localeCompare(b.filename) ||
++      a.url.localeCompare(b.url),
++  );
++}
++
++/** Human-readable byte size: "820 B", "12.4 KB", "3.1 MB". */
++export function formatFileSize(bytes: number | undefined): string {
++  if (bytes === undefined || !Number.isFinite(bytes) || bytes < 0) return "";
++  if (bytes < 1024) return `${bytes} B`;
++  const units = ["KB", "MB", "GB", "TB"];
++  let size = bytes / 1024;
++  let unit = 0;
++  while (size >= 1024 && unit < units.length - 1) {
++    size /= 1024;
++    unit += 1;
++  }
++  return `${size < 10 ? size.toFixed(1) : Math.round(size)} ${units[unit]}`;
++}
++
++/** Total recorded size of `files` (files without a recorded size count as 0). */
++export function totalSize(files: ChannelFile[]): number {
++  return files.reduce((sum, file) => sum + (file.size ?? 0), 0);
++}
++
++/** `YYYY. M. D.` in local time for a seconds timestamp. */
++export function formatPostedDate(postedAt: number): string {
++  const date = new Date(postedAt * 1_000);
++  return `${date.getFullYear()}. ${date.getMonth() + 1}. ${date.getDate()}.`;
++}
+diff --git a/desktop/src/features/channel-files/ui/ChannelFilesButton.tsx b/desktop/src/features/channel-files/ui/ChannelFilesButton.tsx
+new file mode 100644
+index 0000000..0ee10ea
+--- /dev/null
++++ b/desktop/src/features/channel-files/ui/ChannelFilesButton.tsx
+@@ -0,0 +1,49 @@
++import { Files } from "lucide-react";
++import * as React from "react";
++
++import { Button } from "@/shared/ui/button";
++import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
++import { ChannelFilesDialog } from "./ChannelFilesDialog";
++
++/**
++ * Channel header button for the channel files dialog (team patch). The
++ * dialog is mounted only while open, so files are looked up only then.
++ */
++export function ChannelFilesButton({
++  channelId,
++  channelName,
++}: {
++  channelId: string;
++  channelName: string;
++}) {
++  const [open, setOpen] = React.useState(false);
++
++  return (
++    <span data-no-translate="">
++      <Tooltip disableHoverableContent>
++        <TooltipTrigger asChild>
++          <Button
++            aria-label="파일 모아보기"
++            data-testid="channel-files-trigger"
++            onClick={() => setOpen(true)}
++            size="icon"
++            type="button"
++            variant="outline"
++          >
++            <Files />
++          </Button>
++        </TooltipTrigger>
++        <TooltipContent>파일 모아보기</TooltipContent>
++      </Tooltip>
++      {open ? (
++        <ChannelFilesDialog
++          channelId={channelId}
++          channelName={channelName}
++          key={channelId}
++          onOpenChange={setOpen}
++          open={open}
++        />
++      ) : null}
++    </span>
++  );
++}
+diff --git a/desktop/src/features/channel-files/ui/ChannelFilesDialog.tsx b/desktop/src/features/channel-files/ui/ChannelFilesDialog.tsx
+new file mode 100644
+index 0000000..a9ad7fd
+--- /dev/null
++++ b/desktop/src/features/channel-files/ui/ChannelFilesDialog.tsx
+@@ -0,0 +1,304 @@
++import { FileText, Film, Image as ImageIcon, Music } from "lucide-react";
++import * as React from "react";
++import { toast } from "sonner";
++
++import {
++  type ChannelFile,
++  MAX_BULK_DOWNLOAD_FILES,
++  collectChannelFiles,
++  fileKind,
++  formatFileSize,
++  formatPostedDate,
++  totalSize,
++} from "@/features/channel-files/lib/channelFiles";
++import { relayClient } from "@/shared/api/relayClient";
++import { invokeTauri } from "@/shared/api/tauri";
++import type { RelayEvent } from "@/shared/api/types";
++import { CHANNEL_MESSAGE_EVENT_KINDS } from "@/shared/constants/kinds";
++import { Button } from "@/shared/ui/button";
++import { Checkbox } from "@/shared/ui/checkbox";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogHeader,
++  DialogTitle,
++} from "@/shared/ui/dialog";
++
++/** Messages read per page while looking for attachments. */
++const PAGE_SIZE = 500;
++
++type BulkDownloadResult = {
++  cancelled: boolean;
++  saved: number;
++  failed: Array<{ filename: string; error: string }>;
++};
++
++function KindIcon({ mime }: { mime: string }) {
++  const kind = fileKind(mime);
++  const Icon =
++    kind === "image"
++      ? ImageIcon
++      : kind === "video"
++        ? Film
++        : kind === "audio"
++          ? Music
++          : FileText;
++  return <Icon aria-hidden="true" className="h-4 w-4" />;
++}
++
++type ChannelFilesDialogProps = {
++  channelId: string;
++  channelName: string;
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++};
++
++/**
++ * Channel files (team patch): the attachments posted in one channel, with
++ * checkboxes to save several into a folder in one go.
++ */
++export function ChannelFilesDialog({
++  channelId,
++  channelName,
++  open,
++  onOpenChange,
++}: ChannelFilesDialogProps) {
++  const [events, setEvents] = React.useState<RelayEvent[]>([]);
++  const [status, setStatus] = React.useState<"loading" | "ready" | "error">(
++    "loading",
++  );
++  const [hasMore, setHasMore] = React.useState(false);
++  const [selected, setSelected] = React.useState<ReadonlySet<string>>(
++    () => new Set(),
++  );
++  const [downloading, setDownloading] = React.useState(false);
++  // Bumped whenever the channel changes or the dialog unmounts, so a page
++  // that arrives late is never added to another channel's list.
++  const generationRef = React.useRef(0);
++
++  const loadPage = React.useCallback(
++    async (until: number | undefined) => {
++      const generation = generationRef.current;
++      setStatus("loading");
++      try {
++        const page = await relayClient.fetchEvents({
++          kinds: [...CHANNEL_MESSAGE_EVENT_KINDS],
++          "#h": [channelId],
++          limit: PAGE_SIZE,
++          ...(until === undefined ? {} : { until }),
++        });
++        if (generationRef.current !== generation) return;
++        setEvents((current) => {
++          const known = new Set(current.map((event) => event.id));
++          const added = page.filter((event) => !known.has(event.id));
++          return added.length > 0 ? [...current, ...added] : current;
++        });
++        setHasMore(page.length >= PAGE_SIZE);
++        setStatus("ready");
++      } catch {
++        if (generationRef.current !== generation) return;
++        setStatus("error");
++      }
++    },
++    [channelId],
++  );
++
++  React.useEffect(() => {
++    generationRef.current += 1;
++    setEvents([]);
++    setSelected(new Set());
++    setHasMore(false);
++    void loadPage(undefined);
++    return () => {
++      generationRef.current += 1;
++    };
++  }, [loadPage]);
++
++  const files = React.useMemo(() => collectChannelFiles(events), [events]);
++  const selectedFiles = React.useMemo(
++    () => files.filter((file) => selected.has(file.url)),
++    [files, selected],
++  );
++  const allSelected = files.length > 0 && selectedFiles.length === files.length;
++  const tooMany = selectedFiles.length > MAX_BULK_DOWNLOAD_FILES;
++
++  const toggle = (file: ChannelFile) => {
++    setSelected((current) => {
++      const next = new Set(current);
++      if (next.has(file.url)) next.delete(file.url);
++      else next.add(file.url);
++      return next;
++    });
++  };
++
++  const loadOlder = () => {
++    const oldest = events.reduce(
++      (min, event) => Math.min(min, event.created_at),
++      Number.POSITIVE_INFINITY,
++    );
++    if (Number.isFinite(oldest)) void loadPage(oldest);
++  };
++
++  const download = async () => {
++    if (downloading || selectedFiles.length === 0 || tooMany) return;
++    setDownloading(true);
++    try {
++      const result = await invokeTauri<BulkDownloadResult>(
++        "download_files_to_folder",
++        {
++          items: selectedFiles.map((file) => ({
++            url: file.url,
++            filename: file.filename,
++          })),
++        },
++      );
++      if (result.cancelled) return;
++      if (result.saved > 0) {
++        toast.success(`파일 ${result.saved}개를 저장했습니다.`);
++      }
++      if (result.failed.length > 0) {
++        const first = result.failed[0];
++        toast.error(
++          `파일 ${result.failed.length}개를 받지 못했습니다. ${first ? `${first.filename}: ${first.error}` : ""}`,
++        );
++      } else {
++        setSelected(new Set());
++      }
++    } catch (error) {
++      toast.error(
++        error instanceof Error && error.message
++          ? error.message
++          : "파일을 받지 못했습니다.",
++      );
++    } finally {
++      setDownloading(false);
++    }
++  };
++
++  const selectedSize = formatFileSize(totalSize(selectedFiles));
++
++  return (
++    <Dialog onOpenChange={onOpenChange} open={open}>
++      <DialogContent
++        className="max-w-2xl"
++        data-no-translate=""
++        data-testid="channel-files-dialog"
++      >
++        <DialogHeader>
++          <DialogTitle>파일 모아보기</DialogTitle>
++          <DialogDescription>
++            #{channelName} 채널에 올라온 파일입니다. 여러 개를 골라 폴더
++            하나에 한꺼번에 저장할 수 있습니다.
++          </DialogDescription>
++        </DialogHeader>
++
++        <div className="flex flex-wrap items-center gap-3">
++          <label className="flex items-center gap-2 text-sm">
++            <Checkbox
++              checked={allSelected}
++              data-testid="channel-files-select-all"
++              disabled={files.length === 0 || downloading}
++              onCheckedChange={(checked) =>
++                setSelected(
++                  checked === true
++                    ? new Set(files.map((file) => file.url))
++                    : new Set(),
++                )
++              }
++            />
++            전체 선택
++          </label>
++          <span aria-live="polite" className="text-xs text-muted-foreground">
++            {files.length}개 중 {selectedFiles.length}개 선택
++            {selectedFiles.length > 0 && selectedSize
++              ? ` · ${selectedSize}`
++              : ""}
++          </span>
++          <Button
++            className="ml-auto"
++            data-testid="channel-files-download"
++            disabled={downloading || selectedFiles.length === 0 || tooMany}
++            onClick={() => void download()}
++            size="sm"
++            type="button"
++          >
++            {downloading ? "받는 중…" : "선택한 파일 받기"}
++          </Button>
++        </div>
++        {tooMany ? (
++          <p className="text-xs text-destructive">
++            한 번에 {MAX_BULK_DOWNLOAD_FILES}개까지 받을 수 있습니다.
++          </p>
++        ) : null}
++
++        <ul
++          aria-label="파일 목록"
++          className="flex max-h-96 flex-col divide-y divide-border/60 overflow-y-auto rounded-lg border border-border/60"
++        >
++          {files.map((file) => {
++            const checked = selected.has(file.url);
++            const size = formatFileSize(file.size);
++            return (
++              <li key={file.url}>
++                <label
++                  className="flex cursor-pointer items-center gap-3 px-3 py-2 hover:bg-muted/60"
++                  data-testid="channel-files-row"
++                >
++                  <Checkbox
++                    aria-label={`${file.filename} 선택`}
++                    checked={checked}
++                    disabled={downloading}
++                    onCheckedChange={() => toggle(file)}
++                  />
++                  <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
++                    <KindIcon mime={file.mime} />
++                  </span>
++                  <span className="min-w-0 flex-1">
++                    <span className="block truncate text-sm font-medium">
++                      {file.filename}
++                    </span>
++                    <span className="block text-xs text-muted-foreground">
++                      {[size, formatPostedDate(file.postedAt)]
++                        .filter(Boolean)
++                        .join(" · ")}
++                    </span>
++                  </span>
++                </label>
++              </li>
++            );
++          })}
++          {files.length === 0 && status === "ready" ? (
++            <li className="px-3 py-6 text-center text-sm text-muted-foreground">
++              이 채널에는 아직 올라온 파일이 없습니다.
++            </li>
++          ) : null}
++        </ul>
++
++        <div className="flex min-h-8 items-center gap-3 text-xs text-muted-foreground">
++          <span aria-live="polite">
++            {status === "loading" ? "파일을 찾는 중…" : null}
++            {status === "error"
++              ? "파일 목록을 불러오지 못했습니다. 연결을 확인해 주세요."
++              : null}
++          </span>
++          {status !== "loading" && (hasMore || status === "error") ? (
++            <Button
++              className="ml-auto"
++              onClick={() =>
++                status === "error" && events.length === 0
++                  ? void loadPage(undefined)
++                  : loadOlder()
++              }
++              size="sm"
++              type="button"
++              variant="outline"
++            >
++              {status === "error" ? "다시 시도" : "이전 메시지에서 더 찾기"}
++            </Button>
++          ) : null}
++        </div>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/desktop/src/features/channels/ui/ChannelMembersBar.tsx b/desktop/src/features/channels/ui/ChannelMembersBar.tsx
+index 5eda936..3363002 100644
+--- a/desktop/src/features/channels/ui/ChannelMembersBar.tsx
++++ b/desktop/src/features/channels/ui/ChannelMembersBar.tsx
+@@ -30,6 +30,7 @@ import {
+   DropdownMenuItem,
+   DropdownMenuTrigger,
+ } from "@/shared/ui/dropdown-menu";
++import { ChannelFilesButton } from "@/features/channel-files/ui/ChannelFilesButton";
+ import { AddChannelBotDialog } from "./AddChannelBotDialog";
+ 
+ type ChannelMembersBarProps = {
+@@ -229,6 +230,7 @@ export function ChannelMembersBar({
+       </div>
+     ) : (
+       <div className="flex items-center gap-[6px]">
++        <ChannelFilesButton channelId={channel.id} channelName={channel.name} />
+         <Tooltip disableHoverableContent>
+           <TooltipTrigger asChild>
+             <Button
