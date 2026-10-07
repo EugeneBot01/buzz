@@ -13,6 +13,7 @@ with `git apply --3way`.
 
 | `40-korean.patch` | Korean UI (display-layer translation, toggle in Settings → Appearance; message bodies/inputs never translated) | `BUZZ-KOREAN-PATCH.md` |
 | `50-team-calendar.patch` | Team calendar: a month grid shared by, and editable by, every member of a community (sidebar → 캘린더) | `BUZZ-TEAM-CALENDAR-PATCH.md` |
+| `60-channel-files.patch` | Channel files: list a channel's attachments, select several and save them into one folder; raises the single-file download cap from 50 MiB to 512 MiB | `BUZZ-CHANNEL-FILES-PATCH.md` |
 
 | `35-call-notifications.patch` | Readable call (huddle) and wave notifications instead of raw JSON / HTML markers; Korean notification copy on Korean Macs | `BUZZ-NOTIFY-PATCH.md` §5 |
 | `36-korean-transcripts.patch` | Korean live huddle transcripts (SenseVoice model) with a 한/EN toggle, and remote speech attributed to the actual speaker | `BUZZ-KOREAN-TRANSCRIPT-PATCH.md` |
