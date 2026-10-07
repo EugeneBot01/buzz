@@ -1,5 +1,48 @@
+diff --git a/desktop/src/features/messages/ui/MessageActionBar.tsx b/desktop/src/features/messages/ui/MessageActionBar.tsx
+index 082cb0b..848f3c5 100644
+--- a/desktop/src/features/messages/ui/MessageActionBar.tsx
++++ b/desktop/src/features/messages/ui/MessageActionBar.tsx
+@@ -1,6 +1,7 @@
+ import {
+   BellOff,
+   BellRing,
++  CalendarPlus,
+   Clock,
+   Copy,
+   CornerUpLeft,
+@@ -17,6 +18,7 @@ import * as React from "react";
+ import { toast } from "sonner";
+ 
+ import { buildMessageLink } from "@/features/messages/lib/messageLink";
++import { requestAddFromMessage } from "@/features/team-calendar/lib/addFromMessage";
+ import { EmojiPicker } from "@/features/custom-emoji/ui/EmojiPicker";
+ import { useCustomEmoji } from "@/features/custom-emoji/hooks";
+ import { buildMentionClipboardHtml } from "@/features/messages/lib/mentionClipboard";
+@@ -255,6 +257,22 @@ function MoreActionsMenu({
+             </DropdownMenuItem>
+           ) : null}
+ 
++          {/* Team patch: make a team calendar entry from this message. */}
++          <DropdownMenuItem
++            data-no-translate=""
++            data-testid={`add-to-calendar-${message.id}`}
++            onClick={() =>
++              requestAddFromMessage({
++                eventId: message.id,
++                channelId: channelId ?? null,
++                text: message.body,
++              })
++            }
++          >
++            <CalendarPlus className="h-4 w-4" />
++            캘린더에 추가
++          </DropdownMenuItem>
++
+           {onSendToChannel ? (
+             <DropdownMenuItem
+               aria-label="Send to channel"
 diff --git a/desktop/src/features/sidebar/ui/AppSidebar.tsx b/desktop/src/features/sidebar/ui/AppSidebar.tsx
-index 22f10c68d..a434db37f 100644
+index 22f10c6..a434db3 100644
 --- a/desktop/src/features/sidebar/ui/AppSidebar.tsx
 +++ b/desktop/src/features/sidebar/ui/AppSidebar.tsx
 @@ -18,6 +18,7 @@ import {
@@ -24,7 +67,7 @@ index 22f10c68d..a434db37f 100644
                  onSelectAgents={onSelectAgents}
                  onSelectHome={onSelectHome}
 diff --git a/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx b/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
-index 660f7d9a8..460570469 100644
+index 660f7d9..4605704 100644
 --- a/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
 +++ b/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
 @@ -1,4 +1,5 @@
@@ -58,9 +101,234 @@ index 660f7d9a8..460570469 100644
          </SidebarMenu>
        </SidebarHeader>
        <SidebarProjectsSection />
+diff --git a/desktop/src/features/team-calendar/lib/addFromMessage.ts b/desktop/src/features/team-calendar/lib/addFromMessage.ts
+new file mode 100644
+index 0000000..dc018c5
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/addFromMessage.ts
+@@ -0,0 +1,30 @@
++/**
++ * Bridge from a chat message's menu to the calendar (team patch). The menu
++ * lives deep in the message list and the calendar under the sidebar, so the
++ * request travels as a window event instead of through shared React state.
++ */
++export type AddFromMessageRequest = {
++  eventId: string;
++  channelId: string | null;
++  text: string;
++};
++
++const EVENT_NAME = "buzz-team-calendar:add-from-message";
++
++export function requestAddFromMessage(request: AddFromMessageRequest): void {
++  window.dispatchEvent(new CustomEvent(EVENT_NAME, { detail: request }));
++}
++
++/** Calls `listener` for every request; returns the function that stops it. */
++export function onAddFromMessage(
++  listener: (request: AddFromMessageRequest) => void,
++): () => void {
++  const handle = (event: Event) =>
++    listener((event as CustomEvent<AddFromMessageRequest>).detail);
++  window.addEventListener(EVENT_NAME, handle);
++  return () => window.removeEventListener(EVENT_NAME, handle);
++}
++
++/** The calendar entry id for a message, so adding it twice edits one entry. */
++export const entryIdForMessage = (eventId: string) =>
++  `msg-${eventId.slice(0, 48)}`;
+diff --git a/desktop/src/features/team-calendar/lib/parseSchedule.ts b/desktop/src/features/team-calendar/lib/parseSchedule.ts
+new file mode 100644
+index 0000000..2b38eab
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/parseSchedule.ts
+@@ -0,0 +1,183 @@
++import { addDays, dateKey, daysBetween, todayKey } from "./teamCalendar";
++
++/**
++ * Finds a date and a time in a chat message written in Korean ("10월 12일
++ * 오후 3시", "내일 14:00", "다음 주 화요일 3시~5시"). It is a best guess the
++ * person confirms before anything is saved, so it prefers the common reading
++ * over being exact.
++ */
++export type ParsedSchedule = {
++  date: string;
++  time?: string;
++  endTime?: string;
++  /** False when the message named no day and today was assumed. */
++  hasDate: boolean;
++};
++
++const WEEKDAY_INDEX: Record<string, number> = {
++  일: 0,
++  월: 1,
++  화: 2,
++  수: 3,
++  목: 4,
++  금: 5,
++  토: 6,
++};
++const RELATIVE_DAYS: Record<string, number> = {
++  오늘: 0,
++  내일: 1,
++  모레: 2,
++  글피: 3,
++};
++
++const pad = (value: number) => String(value).padStart(2, "0");
++
++const isRealDate = (date: string) => addDays(date, 0) === date;
++
++function weekdayOf(date: string): number {
++  const [year, month, day] = date.split("-").map(Number) as [
++    number,
++    number,
++    number,
++  ];
++  return new Date(Date.UTC(year, month - 1, day)).getUTCDay();
++}
++
++function findDate(text: string, today: string): string | null {
++  const full = text.match(
++    /(\d{4})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})\s*일?/,
++  );
++  if (full) {
++    const date = dateKey(Number(full[1]), Number(full[2]), Number(full[3]));
++    if (isRealDate(date)) return date;
++  }
++  const monthDay =
++    text.match(/(\d{1,2})\s*월\s*(\d{1,2})\s*일/) ??
++    text.match(/(?<![\d/.])(\d{1,2})\/(\d{1,2})(?![\d/])/);
++  if (monthDay) {
++    const year = Number(today.slice(0, 4));
++    const month = Number(monthDay[1]);
++    const day = Number(monthDay[2]);
++    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
++      let date = dateKey(year, month, day);
++      // A day long past was meant for next year ("1월 5일" said in December).
++      if (isRealDate(date) && daysBetween(date, today) > 60)
++        date = dateKey(year + 1, month, day);
++      if (isRealDate(date)) return date;
++    }
++  }
++  const relative = text.match(/오늘|내일|모레|글피/);
++  if (relative)
++    return addDays(today, RELATIVE_DAYS[relative[0]] as number);
++  const weekday = text.match(
++    /(이번|다음|다다음)?\s*주?\s*([월화수목금토일])요일/,
++  );
++  if (weekday) {
++    const target = WEEKDAY_INDEX[weekday[2] as string] as number;
++    const current = weekdayOf(today);
++    if (weekday[1]) {
++      // Weeks run Monday to Sunday here, as people say "다음 주".
++      const monday = addDays(today, -((current + 6) % 7));
++      const weeks = { 이번: 0, 다음: 1, 다다음: 2 }[weekday[1]] as number;
++      return addDays(monday, weeks * 7 + ((target + 6) % 7));
++    }
++    return addDays(today, (target - current + 7) % 7);
++  }
++  const dayOnly = text.match(/(?<![\d월])(\d{1,2})\s*일(?!\s*(전|후|간|동안|째))/);
++  if (dayOnly) {
++    const day = Number(dayOnly[1]);
++    const year = Number(today.slice(0, 4));
++    const month = Number(today.slice(5, 7));
++    if (day >= 1 && day <= 31) {
++      let date = dateKey(year, month, day);
++      // "15일" said on the 20th means next month's 15th.
++      if (date < today)
++        date =
++          month === 12 ? dateKey(year + 1, 1, day) : dateKey(year, month + 1, day);
++      if (isRealDate(date)) return date;
++    }
++  }
++  return null;
++}
++
++type FoundTime = { time: string; index: number; end: number };
++
++function findTimes(text: string): FoundTime[] {
++  const found: FoundTime[] = [];
++  const pattern =
++    /(오전|오후|아침|저녁|밤|낮|새벽)?\s*(\d{1,2})\s*(?::\s*(\d{2})|시(?!간)\s*(반|(\d{1,2})\s*분)?)|(\d{1,2})\s*(am|pm)\b/gi;
++  let inherited: string | undefined;
++  for (const match of text.matchAll(pattern)) {
++    let hour: number;
++    let minute = 0;
++    let marker: string | undefined;
++    if (match[6] !== undefined) {
++      hour = Number(match[6]);
++      marker = (match[7] as string).toLowerCase() === "pm" ? "오후" : "오전";
++    } else {
++      hour = Number(match[2]);
++      marker = match[1] ?? undefined;
++      if (match[3] !== undefined) minute = Number(match[3]);
++      else if (match[4] === "반") minute = 30;
++      else if (match[5] !== undefined) minute = Number(match[5]);
++    }
++    if (hour > 24 || minute > 59) continue;
++    // "오후 3시~5시": the second time takes the first one's half of the day.
++    marker ??= inherited;
++    if (marker === "오후" || marker === "저녁" || marker === "밤" || marker === "낮") {
++      if (hour < 12 && !(marker === "낮" && hour >= 11)) hour += 12;
++    } else if (marker === "오전" || marker === "아침" || marker === "새벽") {
++      if (hour === 12) hour = 0;
++    } else if (match[3] === undefined && hour >= 1 && hour <= 6) {
++      // "3시" with nothing else almost always means the afternoon.
++      hour += 12;
++    }
++    if (hour >= 24) continue;
++    inherited = marker;
++    const index = match.index ?? 0;
++    found.push({
++      time: `${pad(hour)}:${pad(minute)}`,
++      index,
++      end: index + match[0].length,
++    });
++  }
++  return found;
++}
++
++/** The schedule a message talks about, or `null` when it names none. */
++export function parseSchedule(
++  text: string,
++  now: Date = new Date(),
++): ParsedSchedule | null {
++  const today = todayKey(now);
++  const date = findDate(text, today);
++  const times = findTimes(text);
++  const first = times[0];
++  if (!date && !first) return null;
++  const result: ParsedSchedule = {
++    date: date ?? today,
++    hasDate: date !== null,
++  };
++  if (first) {
++    result.time = first.time;
++    const second = times[1];
++    // An end time follows the start closely: "3시~5시", "3시부터 5시까지".
++    if (
++      second &&
++      second.time > first.time &&
++      /^\s*(~|-|–|부터|에서)\s*$/.test(text.slice(first.end, second.index))
++    )
++      result.endTime = second.time;
++  }
++  return result;
++}
++
++/** A short title for an entry made from a message: its first line, trimmed. */
++export function titleFromMessage(text: string, limit = 60): string {
++  const line =
++    text
++      .split("\n")
++      .map((part) => part.trim())
++      .find((part) => part.length > 0) ?? "";
++  return line.length > limit ? `${line.slice(0, limit - 1)}…` : line;
++}
 diff --git a/desktop/src/features/team-calendar/lib/teamCalendar.test.mjs b/desktop/src/features/team-calendar/lib/teamCalendar.test.mjs
 new file mode 100644
-index 000000000..82fb933fd
+index 0000000..82fb933
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/teamCalendar.test.mjs
 @@ -0,0 +1,415 @@
@@ -481,10 +749,10 @@ index 000000000..82fb933fd
 +});
 diff --git a/desktop/src/features/team-calendar/lib/teamCalendar.ts b/desktop/src/features/team-calendar/lib/teamCalendar.ts
 new file mode 100644
-index 000000000..9c32bbe2c
+index 0000000..aa9dd61
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/teamCalendar.ts
-@@ -0,0 +1,501 @@
+@@ -0,0 +1,674 @@
 +import type { RelayEvent } from "@/shared/api/types";
 +import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
 +
@@ -537,6 +805,24 @@ index 000000000..9c32bbe2c
 +  typeof value === "string" &&
 +  (CALENDAR_COLORS as readonly string[]).includes(value);
 +
++/** How often a repeating entry comes back. */
++export const REPEAT_CHOICES = ["daily", "weekly", "biweekly", "monthly"] as const;
++export type RepeatEvery = (typeof REPEAT_CHOICES)[number];
++export type CalendarRepeat = {
++  every: RepeatEvery;
++  /** Last day an occurrence may start on, `YYYY-MM-DD`; absent = no end. */
++  until?: string;
++};
++
++/**
++ * The document repeating entries live in. A repeating entry shows in every
++ * month, so it cannot be stored in the month it starts in.
++ */
++export const REPEAT_DOC = "repeat";
++/** Most members listed on one entry, and most skipped days of a series. */
++export const MAX_ATTENDEES = 200;
++export const MAX_SKIPPED_DAYS = 200;
++
 +export type CalendarEntry = {
 +  id: string;
 +  title: string;
@@ -550,6 +836,14 @@ index 000000000..9c32bbe2c
 +  endTime?: string;
 +  color?: CalendarColor;
 +  note?: string;
++  /** Pubkeys of the members this entry is for; absent = the whole team. */
++  attendees?: string[];
++  /** Set on a repeating entry (stored in the `REPEAT_DOC` document). */
++  repeat?: CalendarRepeat;
++  /** Start days of occurrences removed from a repeating entry. */
++  skip?: string[];
++  /** Id of the chat message this entry was made from. */
++  sourceEventId?: string;
 +  /** Milliseconds since epoch of the last edit. */
 +  updatedAt: number;
 +  /** Pubkey of the member who made the last edit. */
@@ -647,13 +941,38 @@ index 000000000..9c32bbe2c
 +  return cells;
 +}
 +
-+/** The `d` tag of one community's calendar for one month. */
++/** The document an entry is stored in: its start month, or `REPEAT_DOC`. */
++export const docOfEntry = (entry: { date: string; repeat?: CalendarRepeat }) =>
++  entry.repeat ? REPEAT_DOC : monthOfDate(entry.date);
++
++const isDocKey = (key: string) => key === REPEAT_DOC || MONTH_PATTERN.test(key);
++
++/** True when the entry is for `pubkey` (an entry without a list is for all). */
++export const isAttendee = (entry: CalendarEntry, pubkey: string) =>
++  !entry.attendees || entry.attendees.includes(pubkey);
++
++/** The `d` tag of one community's calendar for one month (or `REPEAT_DOC`). */
 +export function teamCalendarDTag(relayUrl: string, month: string): string {
 +  return `${TEAM_CALENDAR_D_TAG}:${normalizeRelayUrl(relayUrl)}:${month}`;
 +}
 +
 +const isPubkey = (value: unknown): value is string =>
 +  typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
++
++function readRepeat(raw: unknown, start: string): CalendarRepeat | null {
++  if (!raw || typeof raw !== "object") return null;
++  const value = raw as Record<string, unknown>;
++  if (!(REPEAT_CHOICES as readonly unknown[]).includes(value.every))
++    return null;
++  const repeat: CalendarRepeat = { every: value.every as RepeatEvery };
++  if (
++    typeof value.until === "string" &&
++    DATE_PATTERN.test(value.until) &&
++    value.until >= start
++  )
++    repeat.until = value.until;
++  return repeat;
++}
 +
 +/** A stored entry if it is well-formed and belongs to `month`, else `null`. */
 +function readEntry(
@@ -666,7 +985,7 @@ index 000000000..9c32bbe2c
 +  if (id.length === 0 || id.length > 64) return null;
 +  if (typeof value.date !== "string" || !DATE_PATTERN.test(value.date))
 +    return null;
-+  if (monthOfDate(value.date) !== month) return null;
++  if (month !== REPEAT_DOC && monthOfDate(value.date) !== month) return null;
 +  if (
 +    typeof value.updatedAt !== "number" ||
 +    !Number.isFinite(value.updatedAt) ||
@@ -707,13 +1026,41 @@ index 000000000..9c32bbe2c
 +  if (isCalendarColor(value.color)) entry.color = value.color;
 +  if (typeof value.note === "string" && value.note.trim().length > 0)
 +    entry.note = value.note.trim().slice(0, MAX_NOTE_LENGTH);
++  if (Array.isArray(value.attendees)) {
++    const attendees = [...new Set(value.attendees.filter(isPubkey))];
++    // An empty list would be an entry for nobody; treat it as the whole team.
++    if (attendees.length > 0)
++      entry.attendees = attendees.slice(0, MAX_ATTENDEES).sort();
++  }
++  if (month === REPEAT_DOC) {
++    const repeat = readRepeat(value.repeat, value.date);
++    // A live entry in the repeat document must repeat.
++    if (!repeat && !deleted) return null;
++    if (repeat) entry.repeat = repeat;
++    if (Array.isArray(value.skip)) {
++      const skip = [
++        ...new Set(
++          value.skip.filter(
++            (day): day is string =>
++              typeof day === "string" && DATE_PATTERN.test(day),
++          ),
++        ),
++      ];
++      if (skip.length > 0) entry.skip = skip.sort().slice(-MAX_SKIPPED_DAYS);
++    }
++  }
++  if (
++    typeof value.sourceEventId === "string" &&
++    /^[0-9a-f]{64}$/.test(value.sourceEventId)
++  )
++    entry.sourceEventId = value.sourceEventId;
 +  if (deleted) entry.deleted = true;
 +  return entry;
 +}
 +
 +/** Parses one member's month document. Malformed entries are skipped. */
 +export function decodeMonth(content: string, month: string): CalendarMonth {
-+  if (!MONTH_PATTERN.test(month)) return {};
++  if (!isDocKey(month)) return {};
 +  let json: unknown = null;
 +  try {
 +    json = JSON.parse(content);
@@ -742,7 +1089,11 @@ index 000000000..9c32bbe2c
 +
 +/** How many of the range and color fields an entry carries. */
 +const richness = (entry: CalendarEntry) =>
-+  (entry.endDate ? 1 : 0) + (entry.endTime ? 1 : 0) + (entry.color ? 1 : 0);
++  (entry.endDate ? 1 : 0) +
++  (entry.endTime ? 1 : 0) +
++  (entry.color ? 1 : 0) +
++  (entry.attendees ? 1 : 0) +
++  (entry.sourceEventId ? 1 : 0);
 +
 +/**
 + * True when `candidate` replaces `current` (later edit, then higher pubkey).
@@ -821,19 +1172,94 @@ index 000000000..9c32bbe2c
 +  return [...byId.values()].sort(byDisplayOrder);
 +}
 +
-+/** The entries that cover `date`, from the first day to the last. */
-+export function entriesOnDate(
++/**
++ * One showing of an entry. For a repeating entry `date`/`endDate` are those of
++ * this occurrence and `seriesDate` is the day the series itself starts.
++ */
++export type CalendarOccurrence = CalendarEntry & { seriesDate?: string };
++
++/** A stable key for one occurrence (an entry id repeats across occurrences). */
++export const occurrenceKey = (entry: CalendarOccurrence) =>
++  `${entry.id}@${entry.date}`;
++
++/** The start day of occurrence `index` (0 = the series start), or `null`. */
++function occurrenceStart(
++  start: string,
++  every: RepeatEvery,
++  index: number,
++): string | null {
++  if (every === "daily") return addDays(start, index);
++  if (every === "weekly") return addDays(start, index * 7);
++  if (every === "biweekly") return addDays(start, index * 14);
++  const [year, month, day] = start.split("-").map(Number) as [
++    number,
++    number,
++    number,
++  ];
++  const target = shiftMonth(monthKey(year, month), index);
++  const date = `${target}-${pad(day)}`;
++  // A month without that day (the 31st in a 30-day month) has no occurrence.
++  return addDays(date, 0) === date ? date : null;
++}
++
++/**
++ * `entries` with every repeating entry replaced by its occurrences that touch
++ * `from`..`to` (inclusive). One-off entries are passed through.
++ */
++export function expandRepeats(
 +  entries: CalendarEntry[],
++  from: string,
++  to: string,
++): CalendarOccurrence[] {
++  const result: CalendarOccurrence[] = [];
++  for (const entry of entries) {
++    if (!entry.repeat) {
++      result.push(entry);
++      continue;
++    }
++    const span = daysBetween(entry.date, entryEndDate(entry));
++    const last =
++      entry.repeat.until && entry.repeat.until < to ? entry.repeat.until : to;
++    const step = { daily: 1, weekly: 7, biweekly: 14, monthly: 31 }[
++      entry.repeat.every
++    ];
++    // Skip ahead to just before the window instead of walking from the start.
++    let index = Math.max(
++      0,
++      Math.floor((daysBetween(entry.date, from) - span) / step) - 1,
++    );
++    // Bounded: a window is a few months at most.
++    for (let guard = 0; guard < 500; guard++, index++) {
++      const start = occurrenceStart(entry.date, entry.repeat.every, index);
++      if (start === null) continue;
++      if (start > last) break;
++      if (addDays(start, span) < from) continue;
++      if (entry.skip?.includes(start)) continue;
++      const occurrence: CalendarOccurrence = {
++        ...entry,
++        date: start,
++        seriesDate: entry.date,
++      };
++      if (entry.endDate) occurrence.endDate = addDays(start, span);
++      result.push(occurrence);
++    }
++  }
++  return result.sort(byDisplayOrder);
++}
++
++/** The entries that cover `date`, from the first day to the last. */
++export function entriesOnDate<T extends CalendarEntry>(
++  entries: T[],
 +  date: string,
-+): CalendarEntry[] {
++): T[] {
 +  return entries.filter(
 +    (entry) => entry.date <= date && date <= entryEndDate(entry),
 +  );
 +}
 +
 +/** One entry's bar within one week row of the month grid. */
-+export type WeekSegment = {
-+  entry: CalendarEntry;
++export type WeekSegment<T extends CalendarEntry = CalendarEntry> = {
++  entry: T;
 +  /** Column of the first day shown in this week, 0 (Sunday) to 6. */
 +  startColumn: number;
 +  /** Days shown in this week. */
@@ -851,13 +1277,13 @@ index 000000000..9c32bbe2c
 + * earlier-starting entries get the upper lanes, and a bar takes the first lane
 + * that is free for all its days.
 + */
-+export function weekSegments(
-+  entries: CalendarEntry[],
++export function weekSegments<T extends CalendarEntry>(
++  entries: T[],
 +  week: string[],
-+): WeekSegment[] {
++): WeekSegment<T>[] {
 +  const first = week[0] as string;
 +  const last = week[6] as string;
-+  const segments: Omit<WeekSegment, "lane">[] = [];
++  const segments: Omit<WeekSegment<T>, "lane">[] = [];
 +  for (const entry of entries) {
 +    const end = entryEndDate(entry);
 +    if (end < first || entry.date > last) continue;
@@ -892,6 +1318,15 @@ index 000000000..9c32bbe2c
 +  time?: string;
 +  endDate?: string;
 +  endTime?: string;
++  repeat?: CalendarRepeat;
++};
++
++/** Shortest gap between two occurrences, in days. */
++const REPEAT_GAP_DAYS: Record<RepeatEvery, number> = {
++  daily: 1,
++  weekly: 7,
++  biweekly: 14,
++  monthly: 28,
 +};
 +
 +/** Why `range` cannot be saved (a message for the person), or `null`. */
@@ -907,6 +1342,12 @@ index 000000000..9c32bbe2c
 +    return "종료 시간을 정하려면 시작 시간도 정해 주세요.";
 +  if (span === 0 && range.time && range.endTime && range.endTime <= range.time)
 +    return "종료 시간은 시작 시간보다 늦어야 합니다.";
++  if (range.repeat) {
++    if (span >= REPEAT_GAP_DAYS[range.repeat.every])
++      return "반복 간격보다 긴 일정은 반복할 수 없습니다.";
++    if (range.repeat.until && range.repeat.until < range.date)
++      return "반복 종료 날짜는 시작 날짜보다 빠를 수 없습니다.";
++  }
 +  return null;
 +}
 +
@@ -986,12 +1427,745 @@ index 000000000..9c32bbe2c
 +  }
 +  return { merged, ownCreatedAt, own };
 +}
+diff --git a/desktop/src/features/team-calendar/lib/teamExtras.test.mjs b/desktop/src/features/team-calendar/lib/teamExtras.test.mjs
+new file mode 100644
+index 0000000..2b7733b
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/teamExtras.test.mjs
+@@ -0,0 +1,254 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import { parseSchedule, titleFromMessage } from "./parseSchedule.ts";
++import {
++  REPEAT_DOC,
++  decodeMonth,
++  docOfEntry,
++  encodeMonth,
++  expandRepeats,
++  isAttendee,
++  validateRange,
++} from "./teamCalendar.ts";
++import {
++  decodePollDoc,
++  encodePollDoc,
++  mergePollEvents,
++  pollOptions,
++  tallyPoll,
++  validatePoll,
++} from "./teamPolls.ts";
++import {
++  dueReminders,
++  occurrenceStartMs,
++  parseReminderOverrides,
++  reminderLabel,
++  reminderOffsets,
++} from "./teamReminders.ts";
++
++const A = "a".repeat(64);
++const B = "b".repeat(64);
++const entry = (fields) => ({
++  id: "e1",
++  title: "회의",
++  date: "2026-10-12",
++  updatedAt: 1,
++  updatedBy: A,
++  ...fields,
++});
++
++test("a repeating entry is stored in the repeat document and round-trips", () => {
++  const weekly = entry({
++    repeat: { every: "weekly", until: "2026-12-31" },
++    skip: ["2026-10-19"],
++    attendees: [B, A],
++  });
++  assert.equal(docOfEntry(weekly), REPEAT_DOC);
++  assert.equal(docOfEntry(entry({})), "2026-10");
++  const decoded = decodeMonth(encodeMonth({ e1: weekly }), REPEAT_DOC);
++  assert.deepEqual(decoded.e1.repeat, { every: "weekly", until: "2026-12-31" });
++  assert.deepEqual(decoded.e1.skip, ["2026-10-19"]);
++  assert.deepEqual(decoded.e1.attendees, [A, B]);
++  // A month document never carries a repeat, and the repeat document never
++  // carries an entry that does not repeat.
++  assert.equal(decodeMonth(encodeMonth({ e1: weekly }), "2026-10").e1.repeat, undefined);
++  assert.deepEqual(decodeMonth(encodeMonth({ e1: entry({}) }), REPEAT_DOC), {});
++});
++
++test("repeats expand inside the window, skipping removed days", () => {
++  const weekly = entry({ repeat: { every: "weekly" }, skip: ["2026-10-19"] });
++  const dates = expandRepeats([weekly], "2026-10-01", "2026-11-08").map(
++    (occurrence) => occurrence.date,
++  );
++  assert.deepEqual(dates, ["2026-10-12", "2026-10-26", "2026-11-02"]);
++  // Far from the start the right days still come out.
++  const far = expandRepeats([weekly], "2028-03-01", "2028-03-14").map(
++    (occurrence) => occurrence.date,
++  );
++  assert.deepEqual(far, ["2028-03-06", "2028-03-13"]);
++  const monthly = entry({ date: "2026-01-31", repeat: { every: "monthly" } });
++  assert.deepEqual(
++    expandRepeats([monthly], "2026-02-01", "2026-05-31").map((o) => o.date),
++    ["2026-03-31", "2026-05-31"],
++  );
++  const farMonthly = expandRepeats([monthly], "2036-03-01", "2036-03-31");
++  assert.deepEqual(farMonthly.map((o) => o.date), ["2036-03-31"]);
++  const until = entry({ repeat: { every: "daily", until: "2026-10-14" } });
++  assert.equal(expandRepeats([until], "2026-10-01", "2026-10-31").length, 3);
++  // A multi-day occurrence keeps its length and shows when it reaches in.
++  const span = entry({ endDate: "2026-10-13", repeat: { every: "weekly" } });
++  const [first] = expandRepeats([span], "2026-10-20", "2026-10-20");
++  assert.equal(first.date, "2026-10-19");
++  assert.equal(first.endDate, "2026-10-20");
++  assert.equal(first.seriesDate, "2026-10-12");
++});
++
++test("a repeat must be longer than the entry and end after it starts", () => {
++  assert.match(
++    validateRange({ date: "2026-10-12", endDate: "2026-10-13", repeat: { every: "daily" } }),
++    /반복 간격/,
++  );
++  assert.match(
++    validateRange({ date: "2026-10-12", repeat: { every: "weekly", until: "2026-10-01" } }),
++    /반복 종료/,
++  );
++  assert.equal(validateRange({ date: "2026-10-12", repeat: { every: "weekly" } }), null);
++});
++
++test("an entry without a list is for everyone", () => {
++  assert.equal(isAttendee(entry({}), B), true);
++  assert.equal(isAttendee(entry({ attendees: [A] }), B), false);
++});
++
++test("poll options, validation and round trip", () => {
++  const poll = {
++    id: "p1",
++    title: "모임",
++    startDate: "2026-10-12",
++    endDate: "2026-10-13",
++    hours: { from: 9, to: 11 },
++    createdBy: A,
++    updatedAt: 5,
++    updatedBy: A,
++  };
++  assert.deepEqual(pollOptions(poll), [
++    "2026-10-12T09",
++    "2026-10-12T10",
++    "2026-10-13T09",
++    "2026-10-13T10",
++  ]);
++  assert.match(validatePoll({ title: "", startDate: "2026-10-12", endDate: "2026-10-13" }), /제목/);
++  assert.match(validatePoll({ title: "x", startDate: "2026-10-12", endDate: "2026-12-13" }), /최대 31일/);
++  assert.match(
++    validatePoll({ title: "x", startDate: "2026-10-12", endDate: "2026-10-12", hours: { from: 9, to: 9 } }),
++    /시간 범위/,
++  );
++  const content = encodePollDoc(
++    {
++      polls: { p1: poll },
++      answers: { p1: { choices: ["2026-10-12T09", "2026-11-01T09"], updatedAt: 9 } },
++    },
++    "2026-10-12",
++  );
++  const doc = decodePollDoc(content);
++  assert.equal(doc.polls.p1.title, "모임");
++  // An answer for an option the poll does not have is dropped.
++  assert.deepEqual(doc.answers.p1.choices, ["2026-10-12T09"]);
++  // A poll that ended long ago is left out of what is published.
++  assert.deepEqual(decodePollDoc(encodePollDoc({ polls: { p1: poll }, answers: {} }, "2026-12-25")).polls, {});
++});
++
++test("answers are counted per author and the best days are found", () => {
++  const poll = {
++    id: "p1",
++    title: "모임",
++    startDate: "2026-10-12",
++    endDate: "2026-10-14",
++    createdBy: A,
++    updatedAt: 5,
++    updatedBy: A,
++  };
++  const event = (pubkey, created_at, answers, polls = { p1: poll }) => ({
++    id: `${pubkey.slice(0, 4)}${created_at}`,
++    pubkey,
++    created_at,
++    kind: 30078,
++    tags: [["d", "dtag"]],
++    content: JSON.stringify({ v: 1, polls, answers }),
++    sig: "",
++  });
++  const state = mergePollEvents(
++    [
++      event(A, 10, { p1: { choices: ["2026-10-12", "2026-10-13"], updatedAt: 1 } }),
++      // B's older event is replaced by the newer one.
++      event(B, 10, { p1: { choices: ["2026-10-12"], updatedAt: 1 } }),
++      event(B, 11, { p1: { choices: ["2026-10-13", "2026-10-14"], updatedAt: 2 } }),
++      { ...event(B, 99, {}), tags: [["d", "other"]] },
++    ],
++    "dtag",
++    A,
++  );
++  assert.equal(state.ownCreatedAt, 10);
++  const tally = tallyPoll(poll, state.answersByMember);
++  assert.deepEqual(tally.voters, [A, B]);
++  assert.deepEqual(tally.best, ["2026-10-13"]);
++  assert.equal(tally.bestCount, 2);
++  assert.deepEqual(tally.byOption["2026-10-12"], [A]);
++});
++
++test("reminders come due once, nearest first, only for attendees", () => {
++  const meeting = entry({ time: "15:00" });
++  const start = occurrenceStartMs(meeting);
++  assert.equal(new Date(start).getHours(), 15);
++  assert.deepEqual(reminderOffsets(meeting, {}), [1440, 30, 10]);
++  assert.deepEqual(reminderOffsets(entry({}), {}), [1440]);
++  assert.deepEqual(reminderOffsets(meeting, { e1: [60] }), [60]);
++  const due = (sinceMin, nowMin, extra = {}) =>
++    dueReminders({
++      entries: [meeting],
++      overrides: {},
++      pubkey: A,
++      sinceMs: start - sinceMin * 60_000,
++      nowMs: start - nowMin * 60_000,
++      ...extra,
++    }).map((reminder) => reminder.offset);
++  assert.deepEqual(due(31, 29.5), [30]);
++  assert.deepEqual(due(29.5, 29), []);
++  // The app was closed over two reminders: only the nearest is shown.
++  assert.deepEqual(due(2000, 5), [10]);
++  // Nothing once the entry has started.
++  assert.deepEqual(due(31, -1), []);
++  assert.deepEqual(
++    dueReminders({
++      entries: [entry({ time: "15:00", attendees: [B] })],
++      overrides: {},
++      pubkey: A,
++      sinceMs: start - 31 * 60_000,
++      nowMs: start - 29 * 60_000,
++    }),
++    [],
++  );
++  assert.equal(reminderLabel(1440), "하루 전");
++  assert.equal(reminderLabel(180), "3시간 전");
++  assert.equal(reminderLabel(10080), "1주 전");
++  assert.deepEqual(parseReminderOverrides('{"e1":[10,10,-5,"x",60]}'), { e1: [60, 10] });
++  assert.deepEqual(parseReminderOverrides("nope"), {});
++});
++
++test("dates and times are read from Korean messages", () => {
++  const now = new Date(2026, 9, 7, 10, 0); // Wed 2026-10-07
++  const parse = (text) => parseSchedule(text, now);
++  assert.deepEqual(parse("10월 12일 오후 3시에 회의해요"), {
++    date: "2026-10-12",
++    time: "15:00",
++    hasDate: true,
++  });
++  assert.deepEqual(parse("내일 14:00 ~ 16:30 미팅"), {
++    date: "2026-10-08",
++    time: "14:00",
++    endTime: "16:30",
++    hasDate: true,
++  });
++  assert.deepEqual(parse("다음 주 화요일 3시~5시"), {
++    date: "2026-10-13",
++    time: "15:00",
++    endTime: "17:00",
++    hasDate: true,
++  });
++  assert.equal(parse("금요일 오전 10시 반").date, "2026-10-09");
++  assert.equal(parse("금요일 오전 10시 반").time, "10:30");
++  assert.equal(parse("2026.11.03 회의").date, "2026-11-03");
++  assert.equal(parse("10/20에 봐요").date, "2026-10-20");
++  assert.equal(parse("1월 5일 신년회").date, "2027-01-05");
++  assert.equal(parse("15일에 만나요").date, "2026-10-15");
++  assert.equal(parse("3일에 만나요").date, "2026-11-03");
++  assert.deepEqual(parse("7시에 저녁"), { date: "2026-10-07", time: "07:00", hasDate: false });
++  assert.equal(parse("저녁 7시").time, "19:00");
++  assert.equal(parse("오전 12시").time, "00:00");
++  assert.equal(parse("2시간 정도 걸려요"), null);
++  assert.equal(parse("3일 전에 얘기했던 것"), null);
++  assert.equal(parse("안녕하세요"), null);
++  assert.equal(titleFromMessage("\n  첫 줄 \n둘째 줄"), "첫 줄");
++  assert.equal(titleFromMessage("가".repeat(80)).length, 60);
++});
+diff --git a/desktop/src/features/team-calendar/lib/teamPolls.ts b/desktop/src/features/team-calendar/lib/teamPolls.ts
+new file mode 100644
+index 0000000..91be425
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/teamPolls.ts
+@@ -0,0 +1,351 @@
++import type { RelayEvent } from "@/shared/api/types";
++import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
++import { addDays, daysBetween } from "./teamCalendar";
++
++/**
++ * Meeting-date polls (team patch): someone proposes a span of days (and,
++ * optionally, hours), every member ticks when they can make it, and the days
++ * most people can make are counted.
++ *
++ * Same sharing model as the calendar: each member publishes one plaintext
++ * kind 30078 event. It carries their merged copy of the poll definitions
++ * (last-writer-wins, like calendar entries) and their own answers. An answer
++ * is only ever read from its author's event, so nobody can answer for
++ * someone else.
++ */
++export const TEAM_POLLS_D_TAG = "team-calendar-polls";
++
++export const MAX_POLL_TITLE_LENGTH = 120;
++/** Longest span of a poll, in days (date-only, and with hours). */
++export const MAX_POLL_DAYS = 31;
++export const MAX_SLOT_POLL_DAYS = 14;
++/** A finished poll is dropped from published copies this long after its end. */
++export const POLL_KEEP_DAYS = 30;
++export const MAX_TEAM_POLLS_CONTENT_BYTES = 60_000;
++
++export type DatePoll = {
++  id: string;
++  title: string;
++  /** First and last candidate day, `YYYY-MM-DD`. */
++  startDate: string;
++  endDate: string;
++  /** Hours of the day to choose from (`from` inclusive, `to` exclusive). */
++  hours?: { from: number; to: number };
++  createdBy: string;
++  updatedAt: number;
++  updatedBy: string;
++  deleted?: true;
++};
++
++export type PollAnswer = {
++  /** Options the member can make (see `pollOptions`). */
++  choices: string[];
++  updatedAt: number;
++};
++
++export type PollDoc = {
++  polls: Record<string, DatePoll>;
++  /** This member's own answers by poll id. */
++  answers: Record<string, PollAnswer>;
++};
++
++export const emptyPollDoc = (): PollDoc => ({ polls: {}, answers: {} });
++
++const DATE_PATTERN = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
++const OPTION_PATTERN =
++  /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])(T([01]\d|2[0-3]))?$/;
++const isPubkey = (value: unknown): value is string =>
++  typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
++const isHour = (value: unknown): value is number =>
++  typeof value === "number" && Number.isInteger(value);
++
++export function teamPollsDTag(relayUrl: string): string {
++  return `${TEAM_POLLS_D_TAG}:${normalizeRelayUrl(relayUrl)}`;
++}
++
++const pad = (value: number) => String(value).padStart(2, "0");
++
++/** The option key of one hour of one day. */
++export const slotKey = (date: string, hour: number) => `${date}T${pad(hour)}`;
++
++/** The candidate days of a poll, first to last. */
++export function pollDates(poll: DatePoll): string[] {
++  const dates: string[] = [];
++  const days = daysBetween(poll.startDate, poll.endDate);
++  for (let offset = 0; offset <= days; offset++)
++    dates.push(addDays(poll.startDate, offset));
++  return dates;
++}
++
++/** The hours of a poll with hours (empty for a date-only poll). */
++export function pollHours(poll: DatePoll): number[] {
++  if (!poll.hours) return [];
++  const hours: number[] = [];
++  for (let hour = poll.hours.from; hour < poll.hours.to; hour++)
++    hours.push(hour);
++  return hours;
++}
++
++/** Everything a member can tick: days, or day-hours for a poll with hours. */
++export function pollOptions(poll: DatePoll): string[] {
++  const hours = pollHours(poll);
++  const dates = pollDates(poll);
++  if (hours.length === 0) return dates;
++  return dates.flatMap((date) => hours.map((hour) => slotKey(date, hour)));
++}
++
++export type PollInput = {
++  title: string;
++  startDate: string;
++  endDate: string;
++  hours?: { from: number; to: number };
++};
++
++/** Why a poll cannot be saved (a message for the person), or `null`. */
++export function validatePoll(input: PollInput): string | null {
++  if (input.title.trim().length === 0) return "투표 제목을 적어 주세요.";
++  if (!DATE_PATTERN.test(input.startDate)) return "시작 날짜를 확인해 주세요.";
++  if (!DATE_PATTERN.test(input.endDate)) return "종료 날짜를 확인해 주세요.";
++  const span = daysBetween(input.startDate, input.endDate);
++  if (span < 0) return "종료 날짜는 시작 날짜보다 빠를 수 없습니다.";
++  const limit = input.hours ? MAX_SLOT_POLL_DAYS : MAX_POLL_DAYS;
++  if (span >= limit) return `후보 기간은 최대 ${limit}일까지 잡을 수 있습니다.`;
++  if (input.hours) {
++    const { from, to } = input.hours;
++    if (!isHour(from) || !isHour(to) || from < 0 || to > 24 || from >= to)
++      return "시간 범위를 확인해 주세요.";
++  }
++  return null;
++}
++
++function readPoll(id: string, raw: unknown): DatePoll | null {
++  if (!raw || typeof raw !== "object") return null;
++  const value = raw as Record<string, unknown>;
++  if (id.length === 0 || id.length > 64) return null;
++  if (
++    typeof value.updatedAt !== "number" ||
++    !Number.isFinite(value.updatedAt) ||
++    value.updatedAt <= 0
++  )
++    return null;
++  if (!isPubkey(value.updatedBy) || !isPubkey(value.createdBy)) return null;
++  if (typeof value.startDate !== "string" || typeof value.endDate !== "string")
++    return null;
++  const title =
++    typeof value.title === "string"
++      ? value.title.trim().slice(0, MAX_POLL_TITLE_LENGTH)
++      : "";
++  const deleted = value.deleted === true;
++  const hoursRaw = value.hours as { from?: unknown; to?: unknown } | undefined;
++  const hours =
++    hoursRaw && isHour(hoursRaw.from) && isHour(hoursRaw.to)
++      ? { from: hoursRaw.from, to: hoursRaw.to }
++      : undefined;
++  const input: PollInput = {
++    title: deleted ? "-" : title,
++    startDate: value.startDate,
++    endDate: value.endDate,
++    hours,
++  };
++  if (validatePoll(input) !== null) return null;
++  const poll: DatePoll = {
++    id,
++    title,
++    startDate: value.startDate,
++    endDate: value.endDate,
++    createdBy: value.createdBy,
++    updatedAt: value.updatedAt,
++    updatedBy: value.updatedBy,
++  };
++  if (hours) poll.hours = hours;
++  if (deleted) poll.deleted = true;
++  return poll;
++}
++
++function readAnswer(raw: unknown): PollAnswer | null {
++  if (!raw || typeof raw !== "object") return null;
++  const value = raw as Record<string, unknown>;
++  if (typeof value.updatedAt !== "number" || !Number.isFinite(value.updatedAt))
++    return null;
++  if (!Array.isArray(value.choices)) return null;
++  const choices = [
++    ...new Set(
++      value.choices.filter(
++        (choice): choice is string =>
++          typeof choice === "string" && OPTION_PATTERN.test(choice),
++      ),
++    ),
++  ].sort();
++  return { choices, updatedAt: value.updatedAt };
++}
++
++/** Parses one member's document. Malformed parts are skipped. */
++export function decodePollDoc(content: string): PollDoc {
++  const doc = emptyPollDoc();
++  let json: unknown = null;
++  try {
++    json = JSON.parse(content);
++  } catch {
++    return doc;
++  }
++  if (!json || typeof json !== "object") return doc;
++  const { polls, answers } = json as { polls?: unknown; answers?: unknown };
++  if (polls && typeof polls === "object") {
++    for (const [id, raw] of Object.entries(polls as Record<string, unknown>)) {
++      const poll = readPoll(id, raw);
++      if (poll) doc.polls[id] = poll;
++    }
++  }
++  if (answers && typeof answers === "object") {
++    for (const [id, raw] of Object.entries(
++      answers as Record<string, unknown>,
++    )) {
++      const answer = readAnswer(raw);
++      if (answer && id.length > 0 && id.length <= 64) doc.answers[id] = answer;
++    }
++  }
++  return doc;
++}
++
++const pollWins = (candidate: DatePoll, current: DatePoll) =>
++  candidate.updatedAt !== current.updatedAt
++    ? candidate.updatedAt > current.updatedAt
++    : candidate.updatedBy !== current.updatedBy
++      ? candidate.updatedBy > current.updatedBy
++      : candidate.deleted === true && current.deleted !== true;
++
++/** Merges poll definitions. Returns `base` when nothing changed. */
++export function mergePolls(
++  base: Record<string, DatePoll>,
++  ...others: Record<string, DatePoll>[]
++): Record<string, DatePoll> {
++  let result = base;
++  for (const other of others) {
++    for (const [id, poll] of Object.entries(other)) {
++      const current = result[id];
++      if (current && !pollWins(poll, current)) continue;
++      if (result === base) result = { ...base };
++      result[id] = poll;
++    }
++  }
++  return result;
++}
++
++/** Live polls, the ones that end latest first. */
++export function livePolls(polls: Record<string, DatePoll>): DatePoll[] {
++  return Object.values(polls)
++    .filter((poll) => !poll.deleted)
++    .sort(
++      (a, b) =>
++        b.endDate.localeCompare(a.endDate) ||
++        b.updatedAt - a.updatedAt ||
++        a.id.localeCompare(b.id),
++    );
++}
++
++/**
++ * The document to publish: polls that ended more than `POLL_KEEP_DAYS` before
++ * `today` are left out together with their answers, and answers are trimmed
++ * to the options the poll still has. `null` when it cannot fit.
++ */
++export function encodePollDoc(doc: PollDoc, today: string): string | null {
++  const cutoff = addDays(today, -POLL_KEEP_DAYS);
++  const polls: Record<string, Omit<DatePoll, "id">> = {};
++  const answers: Record<string, PollAnswer> = {};
++  for (const id of Object.keys(doc.polls).sort()) {
++    const poll = doc.polls[id] as DatePoll;
++    if (poll.endDate < cutoff) continue;
++    const { id: _id, ...rest } = poll;
++    polls[id] = rest;
++    const answer = doc.answers[id];
++    if (!answer || poll.deleted) continue;
++    const options = new Set(pollOptions(poll));
++    answers[id] = {
++      choices: answer.choices.filter((choice) => options.has(choice)),
++      updatedAt: answer.updatedAt,
++    };
++  }
++  const content = JSON.stringify({ v: 1, polls, answers });
++  return new TextEncoder().encode(content).length <=
++    MAX_TEAM_POLLS_CONTENT_BYTES
++    ? content
++    : null;
++}
++
++export type PollState = {
++  polls: Record<string, DatePoll>;
++  /** Each member's answers by pubkey, then poll id. */
++  answersByMember: Record<string, Record<string, PollAnswer>>;
++};
++
++/**
++ * Every member's newest event merged: poll definitions by last-writer-wins,
++ * answers kept per author. Also `pubkey`'s own `created_at` (0 when none).
++ */
++export function mergePollEvents(
++  events: RelayEvent[],
++  dTag: string,
++  pubkey: string,
++): PollState & { ownCreatedAt: number } {
++  const newest = new Map<string, RelayEvent>();
++  for (const event of events) {
++    const d = event.tags.filter((tag) => tag[0] === "d");
++    if (d.length !== 1 || d[0]?.[1] !== dTag) continue;
++    const current = newest.get(event.pubkey);
++    if (
++      current &&
++      !(
++        event.created_at > current.created_at ||
++        (event.created_at === current.created_at && event.id < current.id)
++      )
++    )
++      continue;
++    newest.set(event.pubkey, event);
++  }
++  let polls: Record<string, DatePoll> = {};
++  const answersByMember: Record<string, Record<string, PollAnswer>> = {};
++  let ownCreatedAt = 0;
++  for (const event of newest.values()) {
++    const doc = decodePollDoc(event.content);
++    polls = mergePolls(polls, doc.polls);
++    answersByMember[event.pubkey] = doc.answers;
++    if (event.pubkey === pubkey) ownCreatedAt = event.created_at;
++  }
++  return { polls, answersByMember, ownCreatedAt };
++}
++
++export type PollTally = {
++  /** Members who can make each option. */
++  byOption: Record<string, string[]>;
++  /** Members who answered (even with nothing ticked). */
++  voters: string[];
++  /** The options most members can make (empty when nobody ticked any). */
++  best: string[];
++  /** How many members can make the best options. */
++  bestCount: number;
++};
++
++/** Counts a poll's answers. */
++export function tallyPoll(
++  poll: DatePoll,
++  answersByMember: Record<string, Record<string, PollAnswer>>,
++): PollTally {
++  const options = pollOptions(poll);
++  const byOption: Record<string, string[]> = {};
++  for (const option of options) byOption[option] = [];
++  const voters: string[] = [];
++  for (const member of Object.keys(answersByMember).sort()) {
++    const answer = answersByMember[member]?.[poll.id];
++    if (!answer) continue;
++    voters.push(member);
++    for (const choice of answer.choices) byOption[choice]?.push(member);
++  }
++  let bestCount = 0;
++  for (const option of options)
++    bestCount = Math.max(bestCount, byOption[option]?.length ?? 0);
++  const best =
++    bestCount === 0
++      ? []
++      : options.filter((option) => byOption[option]?.length === bestCount);
++  return { byOption, voters, best, bestCount };
++}
+diff --git a/desktop/src/features/team-calendar/lib/teamReminders.ts b/desktop/src/features/team-calendar/lib/teamReminders.ts
+new file mode 100644
+index 0000000..56078c0
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/teamReminders.ts
+@@ -0,0 +1,110 @@
++import { type CalendarOccurrence, isAttendee } from "./teamCalendar";
++
++/**
++ * Calendar reminders (team patch). Every attendee of an entry gets the default
++ * reminders; each person can change their own per entry. The choice is kept on
++ * this device, and a reminder only fires while the app is running: there is no
++ * server that could send it.
++ */
++
++/** Minutes before the start: a day, 30 minutes, 10 minutes. */
++export const DEFAULT_REMINDER_OFFSETS = [1_440, 30, 10] as const;
++/** An all-day entry has no clock time to count back from: only the day before. */
++export const ALL_DAY_REMINDER_OFFSETS = [1_440] as const;
++/** Offsets a person can pick, in minutes. */
++export const REMINDER_CHOICES = [10, 30, 60, 180, 1_440, 2_880, 10_080] as const;
++/** The longest offset: how far ahead entries must be read. */
++export const MAX_REMINDER_OFFSET_MINUTES = 10_080;
++/** An all-day entry counts as starting at this local hour. */
++export const ALL_DAY_START_HOUR = 9;
++
++/** A person's own reminder offsets by entry id. */
++export type ReminderOverrides = Record<string, number[]>;
++
++export function reminderLabel(offset: number): string {
++  if (offset % 10_080 === 0) return `${offset / 10_080}주 전`;
++  if (offset === 1_440) return "하루 전";
++  if (offset % 1_440 === 0) return `${offset / 1_440}일 전`;
++  if (offset % 60 === 0) return `${offset / 60}시간 전`;
++  return `${offset}분 전`;
++}
++
++/** Local start of an occurrence as milliseconds since epoch. */
++export function occurrenceStartMs(entry: CalendarOccurrence): number {
++  const [year, month, day] = entry.date.split("-").map(Number) as [
++    number,
++    number,
++    number,
++  ];
++  const [hour, minute] = entry.time
++    ? (entry.time.split(":").map(Number) as [number, number])
++    : [ALL_DAY_START_HOUR, 0];
++  return new Date(year, month - 1, day, hour, minute).getTime();
++}
++
++/** The offsets that apply to an entry for this person. */
++export function reminderOffsets(
++  entry: CalendarOccurrence,
++  overrides: ReminderOverrides,
++): number[] {
++  const own = overrides[entry.id];
++  if (own) return own;
++  return [...(entry.time ? DEFAULT_REMINDER_OFFSETS : ALL_DAY_REMINDER_OFFSETS)];
++}
++
++export function parseReminderOverrides(raw: string | null): ReminderOverrides {
++  if (!raw) return {};
++  try {
++    const json: unknown = JSON.parse(raw);
++    if (!json || typeof json !== "object") return {};
++    const result: ReminderOverrides = {};
++    for (const [id, value] of Object.entries(json as Record<string, unknown>)) {
++      if (!Array.isArray(value)) continue;
++      result[id] = [
++        ...new Set(
++          value.filter(
++            (offset): offset is number =>
++              typeof offset === "number" &&
++              Number.isInteger(offset) &&
++              offset > 0 &&
++              offset <= MAX_REMINDER_OFFSET_MINUTES,
++          ),
++        ),
++      ].sort((a, b) => b - a);
++    }
++    return result;
++  } catch {
++    return {};
++  }
++}
++
++export type DueReminder = { entry: CalendarOccurrence; offset: number };
++
++/**
++ * The reminders that came due after `sinceMs` and up to `nowMs`, for entries
++ * `pubkey` attends that have not started yet. One per entry: when several
++ * came due together (the app was closed), only the nearest to the start.
++ */
++export function dueReminders(input: {
++  entries: CalendarOccurrence[];
++  overrides: ReminderOverrides;
++  pubkey: string;
++  sinceMs: number;
++  nowMs: number;
++}): DueReminder[] {
++  const due: DueReminder[] = [];
++  for (const entry of input.entries) {
++    if (entry.deleted || !isAttendee(entry, input.pubkey)) continue;
++    const start = occurrenceStartMs(entry);
++    if (start <= input.nowMs) continue;
++    const offsets = reminderOffsets(entry, input.overrides)
++      .filter((offset) => {
++        const fireAt = start - offset * 60_000;
++        return fireAt > input.sinceMs && fireAt <= input.nowMs;
++      })
++      .sort((a, b) => a - b);
++    const nearest = offsets[0];
++    if (nearest !== undefined) due.push({ entry, offset: nearest });
++  }
++  return due;
++}
 diff --git a/desktop/src/features/team-calendar/lib/useTeamCalendar.ts b/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
 new file mode 100644
-index 000000000..90befe105
+index 0000000..0a21cca
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
-@@ -0,0 +1,407 @@
+@@ -0,0 +1,478 @@
 +import * as React from "react";
 +
 +import { relayClient } from "@/shared/api/relayClient";
@@ -1002,17 +2176,21 @@ index 000000000..90befe105
 +  type CalendarColor,
 +  type CalendarEntry,
 +  type CalendarMonth,
++  type CalendarRepeat,
++  MAX_ATTENDEES,
 +  MAX_NOTE_LENGTH,
++  MAX_SKIPPED_DAYS,
 +  MAX_TEAM_CALENDAR_AUTHORS,
 +  MAX_TITLE_LENGTH,
++  REPEAT_DOC,
 +  TEAM_CALENDAR_D_TAG,
 +  combineMonths,
 +  decodeMonth,
++  docOfEntry,
 +  encodeForPublish,
 +  hasNewerEntries,
 +  mergeMonthEvents,
 +  mergeMonths,
-+  monthOfDate,
 +  monthsAround,
 +  teamCalendarDTag,
 +  validateRange,
@@ -1032,7 +2210,28 @@ index 000000000..90befe105
 +  endTime?: string;
 +  color?: CalendarColor;
 +  note?: string;
++  /** Leave out (or empty) for the whole team. */
++  attendees?: string[];
++  repeat?: CalendarRepeat;
++  skip?: string[];
++  sourceEventId?: string;
 +};
++
++/** The input that saves `entry` again unchanged (to change one field of it). */
++export const inputOfEntry = (entry: CalendarEntry): CalendarEntryInput => ({
++  id: entry.id,
++  title: entry.title,
++  date: entry.date,
++  time: entry.time,
++  endDate: entry.endDate,
++  endTime: entry.endTime,
++  color: entry.color,
++  note: entry.note,
++  attendees: entry.attendees,
++  repeat: entry.repeat,
++  skip: entry.skip,
++  sourceEventId: entry.sourceEventId,
++});
 +
 +export type TeamCalendarStatus = "loading" | "ready" | "error";
 +
@@ -1115,6 +2314,44 @@ index 000000000..90befe105
 +  if (input.color) entry.color = input.color;
 +  const note = input.note?.trim().slice(0, MAX_NOTE_LENGTH);
 +  if (note) entry.note = note;
++  if (input.attendees && input.attendees.length > 0)
++    entry.attendees = [...new Set(input.attendees)]
++      .slice(0, MAX_ATTENDEES)
++      .sort();
++  if (input.repeat) {
++    entry.repeat = { every: input.repeat.every };
++    if (input.repeat.until) entry.repeat.until = input.repeat.until;
++    if (input.skip && input.skip.length > 0)
++      entry.skip = [...new Set(input.skip)].sort().slice(-MAX_SKIPPED_DAYS);
++  }
++  if (input.sourceEventId) entry.sourceEventId = input.sourceEventId;
++  return entry;
++}
++
++/**
++ * Saves an entry straight into the document it belongs to, without a month
++ * view open: reads that document, merges the entry in and publishes this
++ * member's copy. Saving the same id again replaces the entry.
++ */
++export async function saveEntryToDoc(input: {
++  pubkey: string;
++  relayUrl: string;
++  entry: CalendarEntryInput;
++  isCurrent?: () => boolean;
++}): Promise<CalendarEntry> {
++  const problem = validateRange(input.entry);
++  if (problem) throw new Error(problem);
++  const doc = docOfEntry(input.entry);
++  const there = await fetchMonth(input.relayUrl, doc, input.pubkey);
++  const previous = input.entry.id ? there.merged[input.entry.id] : undefined;
++  const entry = buildEntry(input.entry, previous, input.pubkey);
++  await publishMonth({
++    relayUrl: input.relayUrl,
++    month: doc,
++    entries: mergeMonths(there.merged, { [entry.id]: entry }),
++    ownCreatedAt: there.ownCreatedAt,
++    isCurrent: input.isCurrent ?? (() => true),
++  });
 +  return entry;
 +}
 +
@@ -1280,7 +2517,7 @@ index 000000000..90befe105
 +      const live = liveRef.current;
 +      const previous = input.id ? live?.entries[input.id] : undefined;
 +      const entry = buildEntry(input, previous, pubkey);
-+      const targetMonth = monthOfDate(entry.date);
++      const targetMonth = docOfEntry(entry);
 +      if (targetMonth === month) {
 +        await commit((entries) => mergeMonths(entries, { [entry.id]: entry }));
 +        return;
@@ -1346,16 +2583,24 @@ index 000000000..90befe105
 +  const previous = useTeamCalendarMonth(pubkey, relayUrl, before);
 +  const current = useTeamCalendarMonth(pubkey, relayUrl, here);
 +  const following = useTeamCalendarMonth(pubkey, relayUrl, after);
++  const repeating = useTeamCalendarMonth(pubkey, relayUrl, REPEAT_DOC);
 +
 +  const entries = React.useMemo(
-+    () => combineMonths([previous.entries, current.entries, following.entries]),
-+    [previous.entries, current.entries, following.entries],
++    () =>
++      combineMonths([
++        previous.entries,
++        current.entries,
++        following.entries,
++        repeating.entries,
++      ]),
++    [previous.entries, current.entries, following.entries, repeating.entries],
 +  );
 +
 +  const handles: Array<[string, MonthHandle]> = [
 +    [before, previous],
 +    [here, current],
 +    [after, following],
++    [REPEAT_DOC, repeating],
 +  ];
 +  /** The month that holds the live copy of an entry. */
 +  const ownerOf = (id: string) =>
@@ -1368,7 +2613,7 @@ index 000000000..90befe105
 +
 +  const saveEntry = async (input: CalendarEntryInput): Promise<void> => {
 +    const owner = input.id ? ownerOf(input.id) : undefined;
-+    const target = handleForMonth(monthOfDate(input.date));
++    const target = handleForMonth(docOfEntry(input));
 +    if (owner && target && owner !== target) {
 +      // Moved to another month we have open: write it there first, then leave
 +      // a deletion here, so a failure in between leaves a duplicate (the newer
@@ -1399,39 +2644,537 @@ index 000000000..90befe105
 +    retry,
 +  };
 +}
-diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+diff --git a/desktop/src/features/team-calendar/lib/useTeamCalendarReminders.ts b/desktop/src/features/team-calendar/lib/useTeamCalendarReminders.ts
 new file mode 100644
-index 000000000..13e917725
+index 0000000..c1241aa
 --- /dev/null
-+++ b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
-@@ -0,0 +1,671 @@
-+import { ChevronLeft, ChevronRight, Pencil, Plus, Trash2 } from "lucide-react";
++++ b/desktop/src/features/team-calendar/lib/useTeamCalendarReminders.ts
+@@ -0,0 +1,156 @@
 +import * as React from "react";
 +import { toast } from "sonner";
 +
++import { sendDesktopNotification } from "@/features/notifications/lib/desktop";
 +import {
-+  type CalendarColor,
-+  type CalendarEntry,
-+  CALENDAR_COLORS,
++  type CalendarOccurrence,
++  REPEAT_DOC,
 +  addDays,
-+  daysBetween,
-+  MAX_NOTE_LENGTH,
-+  MAX_TITLE_LENGTH,
-+  entriesOnDate,
-+  entryEndDate,
-+  monthGrid,
++  combineMonths,
++  expandRepeats,
 +  monthOfDate,
 +  shiftMonth,
 +  todayKey,
-+  validateRange,
-+  weekSegments,
-+} from "@/features/team-calendar/lib/teamCalendar";
++} from "./teamCalendar";
 +import {
-+  type CalendarEntryInput,
-+  useTeamCalendarRange,
-+} from "@/features/team-calendar/lib/useTeamCalendar";
-+import { cn } from "@/shared/lib/cn";
-+import { Button } from "@/shared/ui/button";
++  MAX_REMINDER_OFFSET_MINUTES,
++  type ReminderOverrides,
++  dueReminders,
++  parseReminderOverrides,
++  reminderLabel,
++} from "./teamReminders";
++import { useTeamCalendarMonth } from "./useTeamCalendar";
++
++const CHECK_INTERVAL_MS = 30_000;
++const OVERRIDES_PREFIX = "buzz-team-calendar-reminders.v1";
++const WATERMARK_PREFIX = "buzz-team-calendar-reminded.v1";
++const OVERRIDES_EVENT = "buzz-team-calendar-reminders-changed";
++
++const storageKey = (prefix: string, pubkey: string, relayUrl: string) =>
++  `${prefix}:${pubkey}:${relayUrl}`;
++
++function readOverrides(pubkey: string, relayUrl: string): ReminderOverrides {
++  try {
++    return parseReminderOverrides(
++      window.localStorage.getItem(storageKey(OVERRIDES_PREFIX, pubkey, relayUrl)),
++    );
++  } catch {
++    return {};
++  }
++}
++
++/** This person's own reminder choices per entry, kept on this device. */
++export function useReminderOverrides(pubkey: string, relayUrl: string) {
++  const [overrides, setOverrides] = React.useState(() =>
++    readOverrides(pubkey, relayUrl),
++  );
++  React.useEffect(() => {
++    const refresh = () => setOverrides(readOverrides(pubkey, relayUrl));
++    refresh();
++    window.addEventListener(OVERRIDES_EVENT, refresh);
++    return () => window.removeEventListener(OVERRIDES_EVENT, refresh);
++  }, [pubkey, relayUrl]);
++
++  /** `offsets = null` goes back to the default reminders. */
++  const setEntryOffsets = React.useCallback(
++    (entryId: string, offsets: number[] | null) => {
++      const next = { ...readOverrides(pubkey, relayUrl) };
++      if (offsets === null) delete next[entryId];
++      else next[entryId] = [...new Set(offsets)].sort((a, b) => b - a);
++      try {
++        window.localStorage.setItem(
++          storageKey(OVERRIDES_PREFIX, pubkey, relayUrl),
++          JSON.stringify(next),
++        );
++      } catch {
++        // Storage is full or blocked: the choice lasts until the app restarts.
++      }
++      setOverrides(next);
++      window.dispatchEvent(new Event(OVERRIDES_EVENT));
++    },
++    [pubkey, relayUrl],
++  );
++
++  return { overrides, setEntryOffsets };
++}
++
++function dateLabel(entry: CalendarOccurrence): string {
++  const [, month, day] = entry.date.split("-").map(Number);
++  return `${month}월 ${day}일${entry.time ? ` ${entry.time}` : ""}`;
++}
++
++/**
++ * Fires calendar reminders while the app runs (team patch). Mount once per
++ * community: it reads this month, the next one and the repeating entries, and
++ * every 30 seconds shows the reminders that came due since the last check.
++ */
++export function useTeamCalendarReminders(pubkey: string, relayUrl: string) {
++  const [month, setMonth] = React.useState(() => monthOfDate(todayKey()));
++  const here = useTeamCalendarMonth(pubkey, relayUrl, month);
++  const next = useTeamCalendarMonth(pubkey, relayUrl, shiftMonth(month, 1));
++  const repeating = useTeamCalendarMonth(pubkey, relayUrl, REPEAT_DOC);
++
++  const entriesRef = React.useRef<CalendarOccurrence[]>([]);
++  const readyRef = React.useRef(false);
++  const today = todayKey();
++  entriesRef.current = React.useMemo(
++    () =>
++      expandRepeats(
++        combineMonths([here.entries, next.entries, repeating.entries]),
++        today,
++        addDays(today, MAX_REMINDER_OFFSET_MINUTES / 1_440 + 1),
++      ),
++    [here.entries, next.entries, repeating.entries, today],
++  );
++  readyRef.current =
++    here.status === "ready" &&
++    next.status === "ready" &&
++    repeating.status === "ready";
++
++  React.useEffect(() => {
++    const key = storageKey(WATERMARK_PREFIX, pubkey, relayUrl);
++    // Reminders already shown in this run, in case storage cannot be written.
++    const shown = new Set<string>();
++    const startedAt = Date.now();
++
++    const check = () => {
++      setMonth(monthOfDate(todayKey()));
++      // An unfinished read must not move the watermark past unseen entries.
++      if (!readyRef.current) return;
++      const nowMs = Date.now();
++      let sinceMs = startedAt;
++      try {
++        const stored = Number(window.localStorage.getItem(key));
++        // First run ever: start from now, not from every past reminder.
++        if (Number.isFinite(stored) && stored > 0) sinceMs = stored;
++      } catch {
++        // Fall back to the start of this run.
++      }
++      const due = dueReminders({
++        entries: entriesRef.current,
++        overrides: readOverrides(pubkey, relayUrl),
++        pubkey,
++        sinceMs,
++        nowMs,
++      });
++      try {
++        window.localStorage.setItem(key, String(nowMs));
++      } catch {
++        // `shown` still stops repeats within this run.
++      }
++      for (const { entry, offset } of due) {
++        const id = `${entry.id}@${entry.date}@${offset}`;
++        if (shown.has(id)) continue;
++        shown.add(id);
++        const title = `일정 알림 · ${reminderLabel(offset)}`;
++        const body = `${entry.title} — ${dateLabel(entry)}`;
++        toast(title, { description: body, duration: 15_000 });
++        void sendDesktopNotification({ title, body });
++      }
++    };
++
++    check();
++    const interval = window.setInterval(check, CHECK_INTERVAL_MS);
++    return () => window.clearInterval(interval);
++  }, [pubkey, relayUrl]);
++}
+diff --git a/desktop/src/features/team-calendar/lib/useTeamMembers.ts b/desktop/src/features/team-calendar/lib/useTeamMembers.ts
+new file mode 100644
+index 0000000..3039fd4
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/useTeamMembers.ts
+@@ -0,0 +1,45 @@
++import * as React from "react";
++
++import { useRelayMembersQuery } from "@/features/community-members/hooks";
++import { useUsersBatchQuery } from "@/features/profile/hooks";
++
++export type TeamMember = { pubkey: string; name: string };
++
++/**
++ * The people of the community with a display name, for picking attendees and
++ * showing who answered a poll. Agents are left out; `extra` adds pubkeys that
++ * must be listed even when they are not relay members (a channel's members).
++ */
++export function useTeamMembers(extra: string[] = []): {
++  members: TeamMember[];
++  nameOf: (pubkey: string) => string;
++} {
++  const relayMembers = useRelayMembersQuery().data;
++  const extraKey = [...extra].sort().join(",");
++  const pubkeys = React.useMemo(
++    () => [
++      ...new Set([
++        ...(relayMembers ?? []).map((member) => member.pubkey.toLowerCase()),
++        ...(extraKey ? extraKey.split(",") : []),
++      ]),
++    ],
++    [relayMembers, extraKey],
++  );
++  const profiles = useUsersBatchQuery(pubkeys).data?.profiles;
++
++  return React.useMemo(() => {
++    const nameOf = (pubkey: string) => {
++      const profile = profiles?.[pubkey.toLowerCase()];
++      return profile?.displayName || profile?.name || "이름 없는 멤버";
++    };
++    const members = pubkeys
++      .filter((pubkey) => profiles?.[pubkey]?.isAgent !== true)
++      .map((pubkey) => ({ pubkey, name: nameOf(pubkey) }))
++      .sort(
++        (a, b) =>
++          a.name.localeCompare(b.name, "ko") ||
++          a.pubkey.localeCompare(b.pubkey),
++      );
++    return { members, nameOf };
++  }, [pubkeys, profiles]);
++}
+diff --git a/desktop/src/features/team-calendar/lib/useTeamPolls.ts b/desktop/src/features/team-calendar/lib/useTeamPolls.ts
+new file mode 100644
+index 0000000..1005312
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/useTeamPolls.ts
+@@ -0,0 +1,291 @@
++import * as React from "react";
++
++import { relayClient } from "@/shared/api/relayClient";
++import { signRelayEvent } from "@/shared/api/tauri";
++import type { RelayEvent } from "@/shared/api/types";
++import { KIND_CHANNEL_SECTIONS } from "@/shared/constants/kinds";
++import { MAX_TEAM_CALENDAR_AUTHORS, todayKey } from "./teamCalendar";
++import {
++  type DatePoll,
++  MAX_POLL_TITLE_LENGTH,
++  type PollAnswer,
++  type PollInput,
++  type PollState,
++  TEAM_POLLS_D_TAG,
++  decodePollDoc,
++  encodePollDoc,
++  mergePollEvents,
++  mergePolls,
++  pollOptions,
++  teamPollsDTag,
++  validatePoll,
++} from "./teamPolls";
++
++export type TeamPollsStatus = "loading" | "ready" | "error";
++
++const emptyState = (): PollState => ({ polls: {}, answersByMember: {} });
++
++/**
++ * The community's meeting-date polls for one pubkey + relay scope: every
++ * member's copy merged, kept live, and this member's edits and answers
++ * published.
++ */
++export function useTeamPolls(pubkey: string, relayUrl: string) {
++  const scope = `${pubkey}|${relayUrl}`;
++  const [state, setState] = React.useState<{
++    scope: string;
++    data: PollState;
++    status: TeamPollsStatus;
++  }>({ scope, data: emptyState(), status: "loading" });
++  const current =
++    state.scope === scope
++      ? state
++      : { scope, data: emptyState(), status: "loading" as const };
++
++  const liveRef = React.useRef<{
++    scope: string;
++    cancelled: boolean;
++    /** The first read finished, so this member's own answers are known. */
++    loaded: boolean;
++    data: PollState;
++    ownCreatedAt: number;
++    /** What this member's event on the relay holds, as far as we know. */
++    published: string | null;
++    queue: Promise<void>;
++  } | null>(null);
++
++  React.useEffect(() => {
++    const live = {
++      scope,
++      cancelled: false,
++      loaded: false,
++      data: emptyState(),
++      ownCreatedAt: 0,
++      published: null as string | null,
++      queue: Promise.resolve(),
++    };
++    liveRef.current = live;
++    setState({ scope, data: emptyState(), status: "loading" });
++
++    const dTag = teamPollsDTag(relayUrl);
++    const filter = { kinds: [KIND_CHANNEL_SECTIONS], "#d": [dTag] };
++    const apply = (data: PollState, status?: TeamPollsStatus) => {
++      live.data = data;
++      setState((previous) => ({
++        scope,
++        data,
++        status:
++          status ?? (previous.scope === scope ? previous.status : "ready"),
++      }));
++    };
++
++    /** Folds one member's document in; their answers replace the old ones. */
++    const fold = (
++      base: PollState,
++      author: string,
++      polls: Record<string, DatePoll>,
++      answers: Record<string, PollAnswer>,
++    ): PollState => {
++      // This member's own answers are whatever they last chose here, not an
++      // echo of an older event.
++      const keepOwn = author === pubkey && base.answersByMember[pubkey];
++      return {
++        polls: mergePolls(base.polls, polls),
++        answersByMember: keepOwn
++          ? base.answersByMember
++          : { ...base.answersByMember, [author]: answers },
++      };
++    };
++
++    const load = () =>
++      void relayClient
++        .fetchEvents({ ...filter, limit: MAX_TEAM_CALENDAR_AUTHORS })
++        .then(
++          (events) => {
++            if (live.cancelled) return;
++            const merged = mergePollEvents(events, dTag, pubkey);
++            if (merged.ownCreatedAt > live.ownCreatedAt)
++              live.ownCreatedAt = merged.ownCreatedAt;
++            let next = live.data;
++            for (const [author, answers] of Object.entries(
++              merged.answersByMember,
++            ))
++              next = fold(next, author, {}, answers);
++            next = { ...next, polls: mergePolls(next.polls, merged.polls) };
++            live.loaded = true;
++            apply(next, "ready");
++          },
++          () => {
++            if (live.cancelled) return;
++            setState((previous) =>
++              previous.scope === scope && previous.status === "loading"
++                ? { ...previous, status: "error" }
++                : previous,
++            );
++          },
++        );
++
++    const ingest = (event: RelayEvent) => {
++      if (live.cancelled) return;
++      const d = event.tags.filter((tag) => tag[0] === "d");
++      if (d.length !== 1 || d[0]?.[1] !== dTag) return;
++      if (event.pubkey === pubkey && event.created_at > live.ownCreatedAt)
++        live.ownCreatedAt = event.created_at;
++      const doc = decodePollDoc(event.content);
++      apply(fold(live.data, event.pubkey, doc.polls, doc.answers));
++    };
++
++    let unsubLive: (() => Promise<void>) | null = null;
++    void relayClient
++      .subscribeLive({ ...filter, limit: 0 }, ingest)
++      .then((dispose) => {
++        if (live.cancelled) void dispose();
++        else unsubLive = dispose;
++      })
++      .catch(() => {});
++    const unsubReconnect = relayClient.subscribeToReconnects(load);
++    load();
++
++    return () => {
++      live.cancelled = true;
++      unsubReconnect();
++      if (unsubLive) void unsubLive();
++    };
++  }, [scope, pubkey, relayUrl]);
++
++  /** Applies `change` locally, then publishes this member's document. */
++  const commit = React.useCallback(
++    (change: (data: PollState) => PollState): Promise<void> => {
++      const live = liveRef.current;
++      // Publishing before the first read would drop answers already saved.
++      if (!live || live.cancelled || live.scope !== scope || !live.loaded)
++        return Promise.reject(new Error("투표를 아직 불러오는 중입니다."));
++      const next = change(live.data);
++      live.data = next;
++      setState((previous) => ({
++        scope,
++        data: next,
++        status: previous.scope === scope ? previous.status : "ready",
++      }));
++      const run = async () => {
++        if (live.cancelled) return;
++        const content = encodePollDoc(
++          {
++            polls: live.data.polls,
++            answers: live.data.answersByMember[pubkey] ?? {},
++          },
++          todayKey(),
++        );
++        if (content === null)
++          throw new Error("투표가 너무 많아 더 저장할 수 없습니다.");
++        if (content === live.published) return;
++        const createdAt = Math.max(
++          Math.floor(Date.now() / 1_000),
++          live.ownCreatedAt + 1,
++        );
++        const event = await signRelayEvent({
++          kind: KIND_CHANNEL_SECTIONS,
++          content,
++          createdAt,
++          tags: [
++            ["d", teamPollsDTag(relayUrl)],
++            ["t", TEAM_POLLS_D_TAG],
++          ],
++        });
++        try {
++          await relayClient.publishEvent(
++            event,
++            "투표를 저장하는 데 시간이 너무 오래 걸립니다.",
++            "투표를 저장하지 못했습니다.",
++            () => !live.cancelled,
++          );
++        } catch (error) {
++          if (!String((error as Error)?.message).startsWith("duplicate:"))
++            throw error;
++        }
++        live.ownCreatedAt = createdAt;
++        live.published = content;
++      };
++      const result = live.queue.then(run, run);
++      live.queue = result.catch(() => {});
++      return result;
++    },
++    [scope, pubkey, relayUrl],
++  );
++
++  /** Creates a poll, or changes one (pass its `id`). */
++  const savePoll = React.useCallback(
++    (input: PollInput & { id?: string }): Promise<void> => {
++      const problem = validatePoll(input);
++      if (problem) return Promise.reject(new Error(problem));
++      return commit((data) => {
++        const previous = input.id ? data.polls[input.id] : undefined;
++        const poll: DatePoll = {
++          id: input.id ?? crypto.randomUUID(),
++          title: input.title.trim().slice(0, MAX_POLL_TITLE_LENGTH),
++          startDate: input.startDate,
++          endDate: input.endDate,
++          createdBy: previous?.createdBy ?? pubkey,
++          updatedAt: Math.max(Date.now(), (previous?.updatedAt ?? 0) + 1),
++          updatedBy: pubkey,
++        };
++        if (input.hours) poll.hours = input.hours;
++        return { ...data, polls: mergePolls(data.polls, { [poll.id]: poll }) };
++      });
++    },
++    [commit, pubkey],
++  );
++
++  const deletePoll = React.useCallback(
++    (id: string): Promise<void> =>
++      commit((data) => {
++        const poll = data.polls[id];
++        if (!poll || poll.deleted) return data;
++        const gone: DatePoll = {
++          ...poll,
++          title: "",
++          updatedAt: Math.max(Date.now(), poll.updatedAt + 1),
++          updatedBy: pubkey,
++          deleted: true,
++        };
++        return { ...data, polls: mergePolls(data.polls, { [id]: gone }) };
++      }),
++    [commit, pubkey],
++  );
++
++  /** Replaces this member's answer to a poll. */
++  const answerPoll = React.useCallback(
++    (id: string, choices: string[]): Promise<void> =>
++      commit((data) => {
++        const poll = data.polls[id];
++        if (!poll || poll.deleted) return data;
++        const options = new Set(pollOptions(poll));
++        const answer: PollAnswer = {
++          choices: [...new Set(choices)]
++            .filter((choice) => options.has(choice))
++            .sort(),
++          updatedAt: Date.now(),
++        };
++        return {
++          ...data,
++          answersByMember: {
++            ...data.answersByMember,
++            [pubkey]: { ...data.answersByMember[pubkey], [id]: answer },
++          },
++        };
++      }),
++    [commit, pubkey],
++  );
++
++  const retry = React.useCallback(() => commit((data) => data), [commit]);
++
++  return {
++    polls: current.data.polls,
++    answersByMember: current.data.answersByMember,
++    status: current.status,
++    savePoll,
++    deletePoll,
++    answerPoll,
++    retry,
++  };
++}
+diff --git a/desktop/src/features/team-calendar/ui/AddFromMessageDialog.tsx b/desktop/src/features/team-calendar/ui/AddFromMessageDialog.tsx
+new file mode 100644
+index 0000000..203cbbc
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/AddFromMessageDialog.tsx
+@@ -0,0 +1,135 @@
++import * as React from "react";
++import { toast } from "sonner";
++
++import { useChannelMembersQuery } from "@/features/channels/hooks";
++import {
++  type AddFromMessageRequest,
++  entryIdForMessage,
++} from "@/features/team-calendar/lib/addFromMessage";
++import {
++  parseSchedule,
++  titleFromMessage,
++} from "@/features/team-calendar/lib/parseSchedule";
++import { todayKey } from "@/features/team-calendar/lib/teamCalendar";
++import { saveEntryToDoc } from "@/features/team-calendar/lib/useTeamCalendar";
++import { useTeamMembers } from "@/features/team-calendar/lib/useTeamMembers";
 +import {
 +  Dialog,
 +  DialogContent,
@@ -1439,18 +3182,153 @@ index 000000000..13e917725
 +  DialogHeader,
 +  DialogTitle,
 +} from "@/shared/ui/dialog";
++import {
++  type Draft,
++  EntryForm,
++  draftError,
++  emptyDraft,
++  inputOfDraft,
++} from "./EntryForm";
++
++/**
++ * Confirms a calendar entry made from a chat message (team patch). The date
++ * and time are read from the message text as a first guess, and the channel's
++ * members are the attendees until the person changes them. The entry id comes
++ * from the message, so adding the same message again edits that entry.
++ */
++export function AddFromMessageDialog({
++  pubkey,
++  relayUrl,
++  request,
++  onClose,
++}: {
++  pubkey: string;
++  relayUrl: string;
++  request: AddFromMessageRequest;
++  onClose: () => void;
++}) {
++  const channelMembers = useChannelMembersQuery(request.channelId).data;
++  const channelPeople = React.useMemo(
++    () =>
++      (channelMembers ?? [])
++        .filter((member) => !member.isAgent)
++        .map((member) => member.pubkey.toLowerCase()),
++    [channelMembers],
++  );
++  const { members } = useTeamMembers(channelPeople);
++  const parsed = React.useMemo(
++    () => parseSchedule(request.text),
++    [request.text],
++  );
++  const [draft, setDraft] = React.useState<Draft>(() => {
++    return {
++      ...emptyDraft(parsed?.date ?? todayKey()),
++      id: entryIdForMessage(request.eventId),
++      sourceEventId: request.eventId,
++      title: titleFromMessage(request.text),
++      time: parsed?.time ?? "",
++      endTime: parsed?.endTime ?? "",
++    };
++  });
++  const [saving, setSaving] = React.useState(false);
++  // The channel's members arrive after the first render; they are the default
++  // attendees until the person touches the list.
++  const touchedRef = React.useRef(false);
++  React.useEffect(() => {
++    if (touchedRef.current || channelPeople.length === 0) return;
++    setDraft((current) => ({
++      ...current,
++      everyone: false,
++      attendees: channelPeople,
++    }));
++  }, [channelPeople]);
++
++  const submit = async () => {
++    if (saving || draft.title.trim().length === 0 || draftError(draft)) return;
++    setSaving(true);
++    try {
++      await saveEntryToDoc({ pubkey, relayUrl, entry: inputOfDraft(draft) });
++      toast.success("캘린더에 추가했습니다.");
++      onClose();
++    } catch (error) {
++      toast.error(
++        error instanceof Error && error.message
++          ? error.message
++          : "일정을 저장하지 못했습니다.",
++      );
++    } finally {
++      setSaving(false);
++    }
++  };
++
++  return (
++    <Dialog onOpenChange={(open) => (open ? undefined : onClose())} open>
++      <DialogContent
++        className="max-w-md"
++        data-no-translate=""
++        data-testid="team-calendar-from-message"
++      >
++        <DialogHeader>
++          <DialogTitle>캘린더에 추가</DialogTitle>
++          <DialogDescription>
++            {parsed
++              ? "메시지에서 날짜와 시간을 읽어 왔습니다. 맞는지 확인하고 저장해 주세요."
++              : "메시지에서 날짜를 찾지 못했습니다. 직접 골라 주세요."}
++          </DialogDescription>
++        </DialogHeader>
++        <EntryForm
++          draft={draft}
++          members={members}
++          onCancel={onClose}
++          onChange={(next) => {
++            if (
++              next.everyone !== draft.everyone ||
++              next.attendees !== draft.attendees
++            )
++              touchedRef.current = true;
++            setDraft(next);
++          }}
++          onSubmit={() => void submit()}
++          saving={saving}
++        />
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/desktop/src/features/team-calendar/ui/EntryForm.tsx b/desktop/src/features/team-calendar/ui/EntryForm.tsx
+new file mode 100644
+index 0000000..d456450
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/EntryForm.tsx
+@@ -0,0 +1,355 @@
++import type * as React from "react";
++
++import {
++  type CalendarColor,
++  type CalendarOccurrence,
++  CALENDAR_COLORS,
++  MAX_NOTE_LENGTH,
++  MAX_TITLE_LENGTH,
++  type RepeatEvery,
++  REPEAT_CHOICES,
++  addDays,
++  daysBetween,
++  entryEndDate,
++  validateRange,
++} from "@/features/team-calendar/lib/teamCalendar";
++import type { CalendarEntryInput } from "@/features/team-calendar/lib/useTeamCalendar";
++import type { TeamMember } from "@/features/team-calendar/lib/useTeamMembers";
++import { cn } from "@/shared/lib/cn";
++import { Button } from "@/shared/ui/button";
 +import { Input } from "@/shared/ui/input";
 +import { Textarea } from "@/shared/ui/textarea";
-+
-+const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"] as const;
-+/** Bars drawn under the day number; more are counted as "+N" in the cell. */
-+const MAX_LANES = 3;
++import { MemberPicker } from "./MemberPicker";
 +
 +/** An empty color is the default look. */
-+type ColorChoice = CalendarColor | "";
++export type ColorChoice = CalendarColor | "";
 +
 +// Tailwind only keeps class names it can read in full, so they are spelled out.
-+const COLOR_STYLES: Record<
++export const COLOR_STYLES: Record<
 +  ColorChoice,
 +  { label: string; bar: string; dot: string }
 +> = {
@@ -1465,7 +3343,14 @@ index 000000000..13e917725
 +};
 +const COLOR_CHOICES: ColorChoice[] = ["", ...CALENDAR_COLORS];
 +
-+type Draft = {
++export const REPEAT_LABELS: Record<RepeatEvery, string> = {
++  daily: "매일",
++  weekly: "매주",
++  biweekly: "2주마다",
++  monthly: "매월",
++};
++
++export type Draft = {
 +  id?: string;
 +  title: string;
 +  date: string;
@@ -1474,9 +3359,15 @@ index 000000000..13e917725
 +  endTime: string;
 +  color: ColorChoice;
 +  note: string;
++  repeat: RepeatEvery | "";
++  until: string;
++  everyone: boolean;
++  attendees: string[];
++  skip?: string[];
++  sourceEventId?: string;
 +};
 +
-+const emptyDraft = (date: string): Draft => ({
++export const emptyDraft = (date: string): Draft => ({
 +  title: "",
 +  date,
 +  time: "",
@@ -1484,24 +3375,904 @@ index 000000000..13e917725
 +  endTime: "",
 +  color: "",
 +  note: "",
++  repeat: "",
++  until: "",
++  everyone: true,
++  attendees: [],
 +});
 +
-+const draftOf = (entry: CalendarEntry): Draft => ({
-+  id: entry.id,
-+  title: entry.title,
-+  date: entry.date,
-+  time: entry.time ?? "",
-+  endDate: entryEndDate(entry),
-+  endTime: entry.endTime ?? "",
-+  color: entry.color ?? "",
-+  note: entry.note ?? "",
-+});
++/** The draft that edits `entry` (for a repeating entry: the whole series). */
++export function draftOf(entry: CalendarOccurrence): Draft {
++  const start = entry.seriesDate ?? entry.date;
++  const span = daysBetween(entry.date, entryEndDate(entry));
++  return {
++    id: entry.id,
++    title: entry.title,
++    date: start,
++    time: entry.time ?? "",
++    endDate: addDays(start, span),
++    endTime: entry.endTime ?? "",
++    color: entry.color ?? "",
++    note: entry.note ?? "",
++    repeat: entry.repeat?.every ?? "",
++    until: entry.repeat?.until ?? "",
++    everyone: !entry.attendees,
++    attendees: entry.attendees ?? [],
++    skip: entry.skip,
++    sourceEventId: entry.sourceEventId,
++  };
++}
++
++const repeatOf = (draft: Draft) =>
++  draft.repeat
++    ? { every: draft.repeat, until: draft.until || undefined }
++    : undefined;
++
++/** Why the draft cannot be saved (a message for the person), or `null`. */
++export function draftError(draft: Draft): string | null {
++  const range = validateRange({
++    date: draft.date,
++    time: draft.time || undefined,
++    endDate: draft.endDate || undefined,
++    endTime: draft.endTime || undefined,
++    repeat: repeatOf(draft),
++  });
++  if (range) return range;
++  if (!draft.everyone && draft.attendees.length === 0)
++    return "참석자를 한 명 이상 골라 주세요.";
++  return null;
++}
++
++export function inputOfDraft(draft: Draft): CalendarEntryInput {
++  return {
++    id: draft.id,
++    title: draft.title.trim(),
++    date: draft.date,
++    time: draft.time || undefined,
++    endDate: draft.endDate || undefined,
++    endTime: draft.endTime || undefined,
++    color: draft.color || undefined,
++    note: draft.note.trim() || undefined,
++    attendees: draft.everyone ? undefined : draft.attendees,
++    repeat: repeatOf(draft),
++    skip: draft.repeat ? draft.skip : undefined,
++    sourceEventId: draft.sourceEventId,
++  };
++}
 +
 +/** The end date once the start moves to `date`: an entry keeps its length. */
 +function endAfterStartMove(draft: Draft, date: string): string {
 +  if (!date || !draft.date || !draft.endDate) return date || draft.endDate;
 +  return addDays(date, Math.max(0, daysBetween(draft.date, draft.endDate)));
 +}
++
++const SELECT_CLASS =
++  "h-9 rounded-md border border-input bg-background px-2 text-sm focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring";
++
++/** The add/edit form of one calendar entry. */
++export function EntryForm({
++  draft,
++  members,
++  saving,
++  onChange,
++  onCancel,
++  onSubmit,
++}: {
++  draft: Draft;
++  members: TeamMember[];
++  saving: boolean;
++  onChange: (draft: Draft) => void;
++  onCancel: () => void;
++  onSubmit: () => void;
++}) {
++  const error = draftError(draft);
++  const submit = (event: React.FormEvent) => {
++    event.preventDefault();
++    onSubmit();
++  };
++
++  return (
++    <form
++      className="flex max-h-[28rem] flex-col gap-2 overflow-y-auto pr-1"
++      data-testid="team-calendar-form"
++      onSubmit={submit}
++    >
++      <label className="flex flex-col gap-1 text-xs">
++        제목
++        <Input
++          autoFocus
++          maxLength={MAX_TITLE_LENGTH}
++          onChange={(event) => onChange({ ...draft, title: event.target.value })}
++          placeholder="예: 기획 회의"
++          required
++          value={draft.title}
++        />
++      </label>
++      <div className="flex gap-2">
++        <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
++          시작 날짜
++          <Input
++            onChange={(event) => {
++              const date = event.target.value;
++              onChange({
++                ...draft,
++                date,
++                endDate: endAfterStartMove(draft, date),
++              });
++            }}
++            required
++            type="date"
++            value={draft.date}
++          />
++        </label>
++        <label className="flex w-28 flex-col gap-1 text-xs">
++          시작 시간 (선택)
++          <Input
++            onChange={(event) =>
++              onChange({
++                ...draft,
++                time: event.target.value,
++                // An end time means nothing without a start time.
++                endTime: event.target.value ? draft.endTime : "",
++              })
++            }
++            type="time"
++            value={draft.time}
++          />
++        </label>
++      </div>
++      <div className="flex gap-2">
++        <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
++          종료 날짜
++          <Input
++            min={draft.date || undefined}
++            onChange={(event) =>
++              onChange({ ...draft, endDate: event.target.value })
++            }
++            required
++            type="date"
++            value={draft.endDate}
++          />
++        </label>
++        <label className="flex w-28 flex-col gap-1 text-xs">
++          종료 시간 (선택)
++          <Input
++            disabled={!draft.time}
++            onChange={(event) =>
++              onChange({ ...draft, endTime: event.target.value })
++            }
++            type="time"
++            value={draft.endTime}
++          />
++        </label>
++      </div>
++      <div className="flex gap-2">
++        <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
++          반복
++          <select
++            className={SELECT_CLASS}
++            data-testid="team-calendar-repeat"
++            onChange={(event) =>
++              onChange({
++                ...draft,
++                repeat: event.target.value as RepeatEvery | "",
++              })
++            }
++            value={draft.repeat}
++          >
++            <option value="">반복 안 함</option>
++            {REPEAT_CHOICES.map((choice) => (
++              <option key={choice} value={choice}>
++                {REPEAT_LABELS[choice]}
++              </option>
++            ))}
++          </select>
++        </label>
++        {draft.repeat ? (
++          <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
++            반복 종료 (선택)
++            <Input
++              min={draft.date || undefined}
++              onChange={(event) =>
++                onChange({ ...draft, until: event.target.value })
++              }
++              type="date"
++              value={draft.until}
++            />
++          </label>
++        ) : null}
++      </div>
++      {error ? (
++        <p
++          className="text-xs text-destructive"
++          data-testid="team-calendar-range-error"
++          role="alert"
++        >
++          {error}
++        </p>
++      ) : null}
++      <fieldset className="flex min-w-0 flex-col gap-1 text-xs">
++        <legend className="mb-1">색상</legend>
++        <div className="flex flex-wrap gap-1.5">
++          {COLOR_CHOICES.map((choice) => {
++            const { label, dot } = COLOR_STYLES[choice];
++            const checked = draft.color === choice;
++            return (
++              <button
++                aria-label={label}
++                aria-pressed={checked}
++                className={cn(
++                  "h-5 w-5 rounded-full border-2 transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
++                  dot,
++                  checked ? "border-foreground" : "border-transparent",
++                )}
++                data-testid={`team-calendar-color-${choice || "default"}`}
++                key={choice || "default"}
++                onClick={() => onChange({ ...draft, color: choice })}
++                title={label}
++                type="button"
++              />
++            );
++          })}
++        </div>
++      </fieldset>
++      <MemberPicker
++        everyone={draft.everyone}
++        members={members}
++        onChange={({ everyone, selected }) =>
++          onChange({ ...draft, everyone, attendees: selected })
++        }
++        selected={draft.attendees}
++      />
++      <label className="flex flex-col gap-1 text-xs">
++        메모 (선택)
++        <Textarea
++          maxLength={MAX_NOTE_LENGTH}
++          onChange={(event) => onChange({ ...draft, note: event.target.value })}
++          rows={2}
++          value={draft.note}
++        />
++      </label>
++      <div className="flex justify-end gap-2">
++        <Button
++          disabled={saving}
++          onClick={onCancel}
++          size="sm"
++          type="button"
++          variant="ghost"
++        >
++          취소
++        </Button>
++        <Button
++          disabled={
++            saving || draft.title.trim().length === 0 || error !== null
++          }
++          size="sm"
++          type="submit"
++        >
++          {draft.id ? "수정 저장" : "저장"}
++        </Button>
++      </div>
++    </form>
++  );
++}
+diff --git a/desktop/src/features/team-calendar/ui/MemberPicker.tsx b/desktop/src/features/team-calendar/ui/MemberPicker.tsx
+new file mode 100644
+index 0000000..d702c0e
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/MemberPicker.tsx
+@@ -0,0 +1,59 @@
++import type { TeamMember } from "@/features/team-calendar/lib/useTeamMembers";
++import { Checkbox } from "@/shared/ui/checkbox";
++
++/**
++ * Attendee choice: the whole team, or a ticked list of members. An empty
++ * `selected` with `everyone` means the entry is for all.
++ */
++export function MemberPicker({
++  members,
++  everyone,
++  selected,
++  onChange,
++}: {
++  members: TeamMember[];
++  everyone: boolean;
++  selected: string[];
++  onChange: (next: { everyone: boolean; selected: string[] }) => void;
++}) {
++  const chosen = new Set(selected);
++  return (
++    <fieldset className="flex min-w-0 flex-col gap-1 text-xs">
++      <legend className="mb-1">참석자</legend>
++      <label className="flex items-center gap-2">
++        <Checkbox
++          checked={everyone}
++          data-testid="team-calendar-attendees-everyone"
++          onCheckedChange={(checked) =>
++            onChange({ everyone: checked === true, selected })
++          }
++        />
++        팀 전체
++      </label>
++      {everyone ? null : (
++        <div className="flex max-h-32 flex-col gap-1 overflow-y-auto rounded-lg border border-border/60 p-2">
++          {members.length === 0 ? (
++            <span className="text-muted-foreground">
++              멤버를 불러오는 중…
++            </span>
++          ) : (
++            members.map((member) => (
++              <label className="flex items-center gap-2" key={member.pubkey}>
++                <Checkbox
++                  checked={chosen.has(member.pubkey)}
++                  onCheckedChange={(checked) => {
++                    const next = new Set(chosen);
++                    if (checked === true) next.add(member.pubkey);
++                    else next.delete(member.pubkey);
++                    onChange({ everyone: false, selected: [...next] });
++                  }}
++                />
++                <span className="truncate">{member.name}</span>
++              </label>
++            ))
++          )}
++        </div>
++      )}
++    </fieldset>
++  );
++}
+diff --git a/desktop/src/features/team-calendar/ui/PollsPanel.tsx b/desktop/src/features/team-calendar/ui/PollsPanel.tsx
+new file mode 100644
+index 0000000..09704a0
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/PollsPanel.tsx
+@@ -0,0 +1,487 @@
++import { ArrowLeft, CalendarPlus, Plus, Trash2 } from "lucide-react";
++import * as React from "react";
++import { toast } from "sonner";
++
++import { addDays, todayKey } from "@/features/team-calendar/lib/teamCalendar";
++import {
++  type DatePoll,
++  MAX_POLL_TITLE_LENGTH,
++  type PollInput,
++  livePolls,
++  pollDates,
++  pollHours,
++  slotKey,
++  tallyPoll,
++  validatePoll,
++} from "@/features/team-calendar/lib/teamPolls";
++import { useTeamPolls } from "@/features/team-calendar/lib/useTeamPolls";
++import { cn } from "@/shared/lib/cn";
++import { Button } from "@/shared/ui/button";
++import { Checkbox } from "@/shared/ui/checkbox";
++import { Input } from "@/shared/ui/input";
++
++const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"] as const;
++
++function dayLabel(date: string): string {
++  const [year, month, day] = date.split("-").map(Number) as [
++    number,
++    number,
++    number,
++  ];
++  return `${month}/${day} (${WEEKDAYS[new Date(year, month - 1, day).getDay()]})`;
++}
++
++/** "10/12 (월)" or "10/12 (월) 15시" for an option key. */
++function optionLabel(option: string): string {
++  const [date, hour] = option.split("T") as [string, string | undefined];
++  return hour === undefined
++    ? dayLabel(date)
++    : `${dayLabel(date)} ${Number(hour)}시`;
++}
++
++const errorText = (error: unknown, fallback: string) =>
++  error instanceof Error && error.message ? error.message : fallback;
++
++const SELECT_CLASS =
++  "h-9 rounded-md border border-input bg-background px-2 text-sm focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring";
++
++type PollDraft = {
++  title: string;
++  startDate: string;
++  endDate: string;
++  withHours: boolean;
++  from: number;
++  to: number;
++};
++
++const inputOf = (draft: PollDraft): PollInput => ({
++  title: draft.title,
++  startDate: draft.startDate,
++  endDate: draft.endDate,
++  hours: draft.withHours ? { from: draft.from, to: draft.to } : undefined,
++});
++
++/** What "make this an entry" hands to the calendar. */
++export type PollPick = {
++  title: string;
++  date: string;
++  time?: string;
++  attendees: string[];
++};
++
++/**
++ * Meeting-date polls (team patch): propose a span of days, everyone ticks
++ * when they can make it, and the days most people can make are shown.
++ */
++export function PollsPanel({
++  pubkey,
++  relayUrl,
++  nameOf,
++  onPick,
++}: {
++  pubkey: string;
++  relayUrl: string;
++  nameOf: (pubkey: string) => string;
++  onPick: (pick: PollPick) => void;
++}) {
++  const { polls, answersByMember, status, savePoll, deletePoll, answerPoll } =
++    useTeamPolls(pubkey, relayUrl);
++  const [openId, setOpenId] = React.useState<string | null>(null);
++  const [draft, setDraft] = React.useState<PollDraft | null>(null);
++  const [saving, setSaving] = React.useState(false);
++  const [confirmingDelete, setConfirmingDelete] = React.useState(false);
++
++  const list = livePolls(polls);
++  const poll: DatePoll | undefined = openId
++    ? list.find((candidate) => candidate.id === openId)
++    : undefined;
++
++  const run = async (action: () => Promise<void>, failure: string) => {
++    setSaving(true);
++    try {
++      await action();
++      return true;
++    } catch (error) {
++      toast.error(errorText(error, failure));
++      return false;
++    } finally {
++      setSaving(false);
++    }
++  };
++
++  if (draft) {
++    const problem = validatePoll(inputOf(draft));
++    return (
++      <form
++        className="flex max-w-md flex-col gap-2"
++        data-testid="team-poll-form"
++        onSubmit={(event) => {
++          event.preventDefault();
++          if (problem || saving) return;
++          void run(
++            () => savePoll(inputOf(draft)),
++            "투표를 만들지 못했습니다.",
++          ).then((saved) => {
++            if (saved) setDraft(null);
++          });
++        }}
++      >
++        <h3 className="text-sm font-semibold">모임 날짜 투표 만들기</h3>
++        <label className="flex flex-col gap-1 text-xs">
++          제목
++          <Input
++            autoFocus
++            maxLength={MAX_POLL_TITLE_LENGTH}
++            onChange={(event) =>
++              setDraft({ ...draft, title: event.target.value })
++            }
++            placeholder="예: 10월 정기 모임"
++            value={draft.title}
++          />
++        </label>
++        <div className="flex gap-2">
++          <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
++            후보 시작 날짜
++            <Input
++              onChange={(event) =>
++                setDraft({ ...draft, startDate: event.target.value })
++              }
++              type="date"
++              value={draft.startDate}
++            />
++          </label>
++          <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
++            후보 종료 날짜
++            <Input
++              min={draft.startDate || undefined}
++              onChange={(event) =>
++                setDraft({ ...draft, endDate: event.target.value })
++              }
++              type="date"
++              value={draft.endDate}
++            />
++          </label>
++        </div>
++        <label className="flex items-center gap-2 text-xs">
++          <Checkbox
++            checked={draft.withHours}
++            data-testid="team-poll-with-hours"
++            onCheckedChange={(checked) =>
++              setDraft({ ...draft, withHours: checked === true })
++            }
++          />
++          시간대까지 고르기
++        </label>
++        {draft.withHours ? (
++          <div className="flex items-center gap-2 text-xs">
++            <select
++              aria-label="시작 시각"
++              className={SELECT_CLASS}
++              onChange={(event) =>
++                setDraft({ ...draft, from: Number(event.target.value) })
++              }
++              value={draft.from}
++            >
++              {Array.from({ length: 24 }, (_, hour) => hour).map((hour) => (
++                <option key={hour} value={hour}>
++                  {hour}시
++                </option>
++              ))}
++            </select>
++            부터
++            <select
++              aria-label="끝 시각"
++              className={SELECT_CLASS}
++              onChange={(event) =>
++                setDraft({ ...draft, to: Number(event.target.value) })
++              }
++              value={draft.to}
++            >
++              {Array.from({ length: 24 }, (_, hour) => hour + 1).map((hour) => (
++                <option key={hour} value={hour}>
++                  {hour}시
++                </option>
++              ))}
++            </select>
++            까지
++          </div>
++        ) : null}
++        {problem && draft.title.trim().length > 0 ? (
++          <p className="text-xs text-destructive" role="alert">
++            {problem}
++          </p>
++        ) : null}
++        <div className="flex justify-end gap-2">
++          <Button
++            disabled={saving}
++            onClick={() => setDraft(null)}
++            size="sm"
++            type="button"
++            variant="ghost"
++          >
++            취소
++          </Button>
++          <Button disabled={saving || problem !== null} size="sm" type="submit">
++            만들기
++          </Button>
++        </div>
++      </form>
++    );
++  }
++
++  if (poll) {
++    const tally = tallyPoll(poll, answersByMember);
++    const mine = new Set(answersByMember[pubkey]?.[poll.id]?.choices ?? []);
++    const dates = pollDates(poll);
++    const hours = pollHours(poll);
++    const toggle = (option: string) => {
++      const next = new Set(mine);
++      if (next.has(option)) next.delete(option);
++      else next.add(option);
++      void run(
++        () => answerPoll(poll.id, [...next]),
++        "답을 저장하지 못했습니다.",
++      );
++    };
++    const cell = (option: string, label: string) => {
++      const count = tally.byOption[option]?.length ?? 0;
++      const isMine = mine.has(option);
++      const isBest = count > 0 && count === tally.bestCount;
++      return (
++        <button
++          aria-label={`${optionLabel(option)}, ${count}명 가능${isMine ? ", 내가 고름" : ""}`}
++          aria-pressed={isMine}
++          className={cn(
++            "flex min-w-0 flex-col items-center rounded-md border px-2 py-1 text-xs transition-colors hover:bg-muted/70 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring",
++            isMine
++              ? "border-primary bg-primary/15"
++              : "border-border/60 bg-background",
++            isBest && "ring-2 ring-green-500/70",
++          )}
++          data-testid={`team-poll-option-${option}`}
++          key={option}
++          onClick={() => toggle(option)}
++          title={(tally.byOption[option] ?? []).map(nameOf).join(", ")}
++          type="button"
++        >
++          <span className="truncate">{label}</span>
++          <span className="text-2xs text-muted-foreground">{count}명</span>
++        </button>
++      );
++    };
++
++    return (
++      <div className="flex flex-col gap-3" data-testid="team-poll-detail">
++        <div className="flex items-center gap-2">
++          <Button
++            aria-label="투표 목록으로"
++            onClick={() => {
++              setOpenId(null);
++              setConfirmingDelete(false);
++            }}
++            size="icon"
++            type="button"
++            variant="ghost"
++          >
++            <ArrowLeft className="h-4 w-4" />
++          </Button>
++          <h3 className="min-w-0 flex-1 truncate text-sm font-semibold">
++            {poll.title}
++          </h3>
++          {confirmingDelete ? (
++            <Button
++              disabled={saving}
++              onBlur={() => setConfirmingDelete(false)}
++              onClick={() => {
++                setConfirmingDelete(false);
++                setOpenId(null);
++                void run(
++                  () => deletePoll(poll.id),
++                  "투표를 삭제하지 못했습니다.",
++                );
++              }}
++              size="xs"
++              type="button"
++              variant="destructive"
++            >
++              삭제 확인
++            </Button>
++          ) : (
++            <Button
++              aria-label="투표 삭제"
++              disabled={saving}
++              onClick={() => setConfirmingDelete(true)}
++              size="icon-xs"
++              type="button"
++              variant="ghost"
++            >
++              <Trash2 />
++            </Button>
++          )}
++        </div>
++        <p className="text-xs text-muted-foreground">
++          내가 되는 {hours.length > 0 ? "시간" : "날"}을 모두 눌러 주세요. 다시
++          누르면 취소됩니다. 초록 테두리는 가장 많은 사람이 되는{" "}
++          {hours.length > 0 ? "시간" : "날"}입니다.
++        </p>
++
++        {hours.length === 0 ? (
++          <div className="grid grid-cols-4 gap-1.5 sm:grid-cols-7">
++            {dates.map((date) => cell(date, dayLabel(date)))}
++          </div>
++        ) : (
++          <div className="max-h-80 overflow-auto">
++            <div
++              className="grid gap-1"
++              style={{
++                gridTemplateColumns: `3rem repeat(${dates.length}, minmax(4.5rem, 1fr))`,
++              }}
++            >
++              <span />
++              {dates.map((date) => (
++                <span
++                  className="text-center text-2xs text-muted-foreground"
++                  key={date}
++                >
++                  {dayLabel(date)}
++                </span>
++              ))}
++              {hours.map((hour) => (
++                <React.Fragment key={hour}>
++                  <span className="self-center text-right text-2xs text-muted-foreground">
++                    {hour}시
++                  </span>
++                  {dates.map((date) => cell(slotKey(date, hour), `${hour}시`))}
++                </React.Fragment>
++              ))}
++            </div>
++          </div>
++        )}
++
++        <div className="rounded-lg border border-border/60 px-3 py-2 text-xs">
++          <p>
++            응답 {tally.voters.length}명
++            {tally.voters.length > 0
++              ? `: ${tally.voters.map(nameOf).join(", ")}`
++              : ""}
++          </p>
++          {tally.best.length === 0 ? (
++            <p className="mt-1 text-muted-foreground">
++              아직 고른 사람이 없습니다.
++            </p>
++          ) : (
++            <ul className="mt-2 flex flex-col gap-1.5">
++              {tally.best.slice(0, 5).map((option) => {
++                const [date, hour] = option.split("T") as [
++                  string,
++                  string | undefined,
++                ];
++                const people = tally.byOption[option] ?? [];
++                return (
++                  <li className="flex items-center gap-2" key={option}>
++                    <span className="min-w-0 flex-1">
++                      <span className="font-medium">
++                        {optionLabel(option)}
++                      </span>{" "}
++                      — {people.length}명 ({people.map(nameOf).join(", ")})
++                    </span>
++                    <Button
++                      data-testid="team-poll-pick"
++                      onClick={() =>
++                        onPick({
++                          title: poll.title,
++                          date,
++                          time: hour === undefined ? undefined : `${hour}:00`,
++                          attendees: people,
++                        })
++                      }
++                      size="xs"
++                      type="button"
++                      variant="outline"
++                    >
++                      <CalendarPlus className="h-3.5 w-3.5" />
++                      일정으로 만들기
++                    </Button>
++                  </li>
++                );
++              })}
++              {tally.best.length > 5 ? (
++                <li className="text-muted-foreground">
++                  외 {tally.best.length - 5}개
++                </li>
++              ) : null}
++            </ul>
++          )}
++        </div>
++      </div>
++    );
++  }
++
++  const today = todayKey();
++  return (
++    <div className="flex flex-col gap-3" data-testid="team-poll-list">
++      <div className="flex items-center justify-between gap-2">
++        <p className="text-xs text-muted-foreground">
++          모일 수 있는 날을 팀원들에게 물어보고, 가장 많이 되는 날을 찾습니다.
++        </p>
++        <Button
++          data-testid="team-poll-add"
++          disabled={status !== "ready"}
++          onClick={() =>
++            setDraft({
++              title: "",
++              startDate: today,
++              endDate: addDays(today, 6),
++              withHours: false,
++              from: 9,
++              to: 22,
++            })
++          }
++          size="sm"
++          type="button"
++        >
++          <Plus className="h-4 w-4" />
++          투표 만들기
++        </Button>
++      </div>
++      {status === "loading" ? (
++        <p className="text-sm text-muted-foreground">투표를 불러오는 중…</p>
++      ) : status === "error" ? (
++        <p className="text-sm text-muted-foreground">
++          투표를 불러오지 못했습니다. 연결을 확인해 주세요.
++        </p>
++      ) : list.length === 0 ? (
++        <p className="text-sm text-muted-foreground">
++          아직 만든 투표가 없습니다.
++        </p>
++      ) : (
++        <ul className="flex max-h-96 flex-col gap-2 overflow-y-auto">
++          {list.map((item) => {
++            const tally = tallyPoll(item, answersByMember);
++            const answered = tally.voters.includes(pubkey);
++            return (
++              <li key={item.id}>
++                <button
++                  className="flex w-full flex-col items-start gap-0.5 rounded-lg border border-border/60 px-3 py-2 text-left transition-colors hover:bg-muted/70 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
++                  data-testid="team-poll-item"
++                  onClick={() => setOpenId(item.id)}
++                  type="button"
++                >
++                  <span className="text-sm font-medium">{item.title}</span>
++                  <span className="text-xs text-muted-foreground">
++                    {dayLabel(item.startDate)} ~ {dayLabel(item.endDate)}
++                    {item.hours
++                      ? ` · ${item.hours.from}시~${item.hours.to}시`
++                      : ""}{" "}
++                    · 응답 {tally.voters.length}명
++                    {answered ? "" : " · 아직 답하지 않음"}
++                  </span>
++                </button>
++              </li>
++            );
++          })}
++        </ul>
++      )}
++    </div>
++  );
++}
+diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+new file mode 100644
+index 0000000..5450593
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+@@ -0,0 +1,626 @@
++import { ChevronLeft, ChevronRight, Pencil, Plus, Trash2 } from "lucide-react";
++import * as React from "react";
++import { toast } from "sonner";
++
++import {
++  type CalendarOccurrence,
++  entriesOnDate,
++  entryEndDate,
++  expandRepeats,
++  isAttendee,
++  monthGrid,
++  monthOfDate,
++  occurrenceKey,
++  shiftMonth,
++  todayKey,
++  weekSegments,
++} from "@/features/team-calendar/lib/teamCalendar";
++import {
++  REMINDER_CHOICES,
++  reminderLabel,
++  reminderOffsets,
++} from "@/features/team-calendar/lib/teamReminders";
++import {
++  inputOfEntry,
++  useTeamCalendarRange,
++} from "@/features/team-calendar/lib/useTeamCalendar";
++import { useReminderOverrides } from "@/features/team-calendar/lib/useTeamCalendarReminders";
++import { useTeamMembers } from "@/features/team-calendar/lib/useTeamMembers";
++import { cn } from "@/shared/lib/cn";
++import { Button } from "@/shared/ui/button";
++import { Checkbox } from "@/shared/ui/checkbox";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogHeader,
++  DialogTitle,
++} from "@/shared/ui/dialog";
++import {
++  COLOR_STYLES,
++  type Draft,
++  EntryForm,
++  REPEAT_LABELS,
++  draftError,
++  draftOf,
++  emptyDraft,
++  inputOfDraft,
++} from "./EntryForm";
++import { type PollPick, PollsPanel } from "./PollsPanel";
++
++const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"] as const;
++/** Bars drawn under the day number; more are counted as "+N" in the cell. */
++const MAX_LANES = 3;
 +
 +/** The seven days of each of the grid's six weeks. */
 +function weeksOf<T>(cells: T[]): T[][] {
@@ -1532,7 +4303,7 @@ index 000000000..13e917725
 +}
 +
 +/** When an entry happens: its time, or its first and last day for a span. */
-+function rangeLabel(entry: CalendarEntry): string {
++function rangeLabel(entry: CalendarOccurrence): string {
 +  const end = entryEndDate(entry);
 +  if (end === entry.date) {
 +    if (!entry.time) return "하루 종일";
@@ -1556,7 +4327,7 @@ index 000000000..13e917725
 +
 +/**
 + * Team calendar (team patch): a month grid every member of the community
-+ * shares. Any member can add, edit, or delete an entry.
++ * shares, plus meeting-date polls. Any member can add, edit, or delete.
 + */
 +export function TeamCalendarDialog({
 +  open,
@@ -1564,28 +4335,31 @@ index 000000000..13e917725
 +  pubkey,
 +  relayUrl,
 +}: TeamCalendarDialogProps) {
++  const [tab, setTab] = React.useState<"calendar" | "polls">("calendar");
 +  const [selectedDate, setSelectedDate] = React.useState(() => todayKey());
 +  const [month, setMonth] = React.useState(() => monthOfDate(todayKey()));
 +  const [draft, setDraft] = React.useState<Draft | null>(null);
 +  const [saving, setSaving] = React.useState(false);
 +  const [unsaved, setUnsaved] = React.useState(false);
++  const [mineOnly, setMineOnly] = React.useState(false);
 +  // Deleting takes two clicks on the same entry (no native confirm dialog).
-+  const [confirmingId, setConfirmingId] = React.useState<string | null>(null);
++  const [confirmingKey, setConfirmingKey] = React.useState<string | null>(null);
++  const [remindersFor, setRemindersFor] = React.useState<string | null>(null);
 +
 +  const { entries, status, saveEntry, deleteEntry, retry } =
 +    useTeamCalendarRange(pubkey, relayUrl, month);
++  const { members, nameOf } = useTeamMembers();
++  const { overrides, setEntryOffsets } = useReminderOverrides(pubkey, relayUrl);
 +
 +  const weeks = React.useMemo(() => weeksOf(monthGrid(month)), [month]);
 +  const today = todayKey();
-+  const selectedEntries = entriesOnDate(entries, selectedDate);
-+  const rangeError = draft
-+    ? validateRange({
-+        date: draft.date,
-+        time: draft.time || undefined,
-+        endDate: draft.endDate || undefined,
-+        endTime: draft.endTime || undefined,
-+      })
-+    : null;
++  const shownEntries = React.useMemo(() => {
++    const first = weeks[0]?.[0]?.date ?? `${month}-01`;
++    const last = weeks[5]?.[6]?.date ?? `${month}-28`;
++    const all = expandRepeats(entries, first, last);
++    return mineOnly ? all.filter((entry) => isAttendee(entry, pubkey)) : all;
++  }, [entries, weeks, month, mineOnly, pubkey]);
++  const selectedEntries = entriesOnDate(shownEntries, selectedDate);
 +
 +  const goToMonth = (next: string) => {
 +    setMonth(next);
@@ -1603,7 +4377,8 @@ index 000000000..13e917725
 +  const selectDate = (date: string) => {
 +    setSelectedDate(date);
 +    setDraft(null);
-+    setConfirmingId(null);
++    setConfirmingKey(null);
++    setRemindersFor(null);
 +    if (monthOfDate(date) !== month) setMonth(monthOfDate(date));
 +  };
 +
@@ -1622,21 +4397,10 @@ index 000000000..13e917725
 +    }
 +  };
 +
-+  const submitDraft = async (event: React.FormEvent) => {
-+    event.preventDefault();
++  const submitDraft = async () => {
 +    if (!draft || saving) return;
-+    const title = draft.title.trim();
-+    if (title.length === 0 || rangeError) return;
-+    const input: CalendarEntryInput = {
-+      id: draft.id,
-+      title,
-+      date: draft.date,
-+      time: draft.time || undefined,
-+      endDate: draft.endDate || undefined,
-+      endTime: draft.endTime || undefined,
-+      color: draft.color || undefined,
-+      note: draft.note.trim() || undefined,
-+    };
++    if (draft.title.trim().length === 0 || draftError(draft)) return;
++    const input = inputOfDraft(draft);
 +    const saved = await run(
 +      () => saveEntry(input),
 +      "일정을 저장하지 못했습니다.",
@@ -1646,15 +4410,44 @@ index 000000000..13e917725
 +    selectDate(input.date);
 +  };
 +
-+  const removeEntry = (entry: CalendarEntry) => {
++  /** Removes the whole entry (for a repeating entry: every occurrence). */
++  const removeEntry = (entry: CalendarOccurrence) => {
 +    if (saving) return;
-+    if (confirmingId !== entry.id) {
-+      setConfirmingId(entry.id);
-+      return;
-+    }
-+    setConfirmingId(null);
++    setConfirmingKey(null);
 +    void run(() => deleteEntry(entry.id), "일정을 삭제하지 못했습니다.");
 +  };
++
++  /** Removes one occurrence of a repeating entry. */
++  const skipOccurrence = (entry: CalendarOccurrence) => {
++    const series = entries.find((candidate) => candidate.id === entry.id);
++    if (saving || !series?.repeat) return;
++    setConfirmingKey(null);
++    void run(
++      () =>
++        saveEntry({
++          ...inputOfEntry(series),
++          skip: [...(series.skip ?? []), entry.date],
++        }),
++      "일정을 삭제하지 못했습니다.",
++    );
++  };
++
++  const pickFromPoll = (pick: PollPick) => {
++    setTab("calendar");
++    selectDate(pick.date);
++    setDraft({
++      ...emptyDraft(pick.date),
++      title: pick.title,
++      time: pick.time ?? "",
++      everyone: false,
++      attendees: pick.attendees,
++    });
++  };
++
++  const attendeeLabel = (entry: CalendarOccurrence) =>
++    entry.attendees
++      ? `참석: ${entry.attendees.map(nameOf).join(", ")}`
++      : "참석: 팀 전체";
 +
 +  return (
 +    <Dialog onOpenChange={onOpenChange} open={open}>
@@ -1670,6 +4463,36 @@ index 000000000..13e917725
 +          </DialogDescription>
 +        </DialogHeader>
 +
++        <div className="flex items-center gap-1" role="tablist">
++          {(
++            [
++              ["calendar", "달력"],
++              ["polls", "모임 날짜 투표"],
++            ] as const
++          ).map(([value, label]) => (
++            <Button
++              aria-selected={tab === value}
++              data-testid={`team-calendar-tab-${value}`}
++              key={value}
++              onClick={() => setTab(value)}
++              role="tab"
++              size="sm"
++              type="button"
++              variant={tab === value ? "secondary" : "ghost"}
++            >
++              {label}
++            </Button>
++          ))}
++        </div>
++
++        {tab === "polls" ? (
++          <PollsPanel
++            nameOf={nameOf}
++            onPick={pickFromPoll}
++            pubkey={pubkey}
++            relayUrl={relayUrl}
++          />
++        ) : (
 +        <div className="flex flex-col gap-4 md:flex-row">
 +          <section aria-label="달력" className="min-w-0 flex-1">
 +            <div className="mb-2 flex items-center gap-1">
@@ -1697,8 +4520,15 @@ index 000000000..13e917725
 +              >
 +                <ChevronRight className="h-4 w-4" />
 +              </Button>
++              <label className="ml-auto flex items-center gap-1.5 text-xs">
++                <Checkbox
++                  checked={mineOnly}
++                  data-testid="team-calendar-mine-only"
++                  onCheckedChange={(checked) => setMineOnly(checked === true)}
++                />
++                내 일정만
++              </label>
 +              <Button
-+                className="ml-auto"
 +                onClick={() => selectDate(today)}
 +                size="sm"
 +                type="button"
@@ -1718,7 +4548,7 @@ index 000000000..13e917725
 +            <div className="flex flex-col gap-px overflow-hidden rounded-lg border border-border/60 bg-border/60">
 +              {weeks.map((week) => {
 +                const bars = weekSegments(
-+                  entries,
++                  shownEntries,
 +                  week.map((cell) => cell.date),
 +                );
 +                const shown = bars.filter((bar) => bar.lane < MAX_LANES);
@@ -1736,7 +4566,7 @@ index 000000000..13e917725
 +                  <div className="relative" key={week[0]?.date}>
 +                    <div className="grid grid-cols-7 gap-px">
 +                      {week.map((cell, column) => {
-+                        const count = entriesOnDate(entries, cell.date).length;
++                        const count = entriesOnDate(shownEntries, cell.date).length;
 +                        const isSelected = cell.date === selectedDate;
 +                        return (
 +                          <button
@@ -1790,7 +4620,7 @@ index 000000000..13e917725
 +                              : "mr-0.5 rounded-r",
 +                          )}
 +                          data-testid="team-calendar-bar"
-+                          key={`${bar.entry.id}-${week[0]?.date}`}
++                          key={`${occurrenceKey(bar.entry)}-${week[0]?.date}`}
 +                          style={{
 +                            gridColumn: `${bar.startColumn + 1} / span ${bar.span}`,
 +                            gridRow: bar.lane + 1,
@@ -1852,246 +4682,194 @@ index 000000000..13e917725
 +            ) : null}
 +
 +            {draft ? (
-+              <form
-+                className="flex flex-col gap-2"
-+                data-testid="team-calendar-form"
-+                onSubmit={(event) => void submitDraft(event)}
-+              >
-+                <label className="flex flex-col gap-1 text-xs">
-+                  제목
-+                  <Input
-+                    autoFocus
-+                    maxLength={MAX_TITLE_LENGTH}
-+                    onChange={(event) =>
-+                      setDraft({ ...draft, title: event.target.value })
-+                    }
-+                    placeholder="예: 기획 회의"
-+                    required
-+                    value={draft.title}
-+                  />
-+                </label>
-+                <div className="flex gap-2">
-+                  <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
-+                    시작 날짜
-+                    <Input
-+                      onChange={(event) => {
-+                        const date = event.target.value;
-+                        setDraft({
-+                          ...draft,
-+                          date,
-+                          endDate: endAfterStartMove(draft, date),
-+                        });
-+                      }}
-+                      required
-+                      type="date"
-+                      value={draft.date}
-+                    />
-+                  </label>
-+                  <label className="flex w-28 flex-col gap-1 text-xs">
-+                    시작 시간 (선택)
-+                    <Input
-+                      onChange={(event) =>
-+                        setDraft({
-+                          ...draft,
-+                          time: event.target.value,
-+                          // An end time means nothing without a start time.
-+                          endTime: event.target.value ? draft.endTime : "",
-+                        })
-+                      }
-+                      type="time"
-+                      value={draft.time}
-+                    />
-+                  </label>
-+                </div>
-+                <div className="flex gap-2">
-+                  <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
-+                    종료 날짜
-+                    <Input
-+                      min={draft.date || undefined}
-+                      onChange={(event) =>
-+                        setDraft({ ...draft, endDate: event.target.value })
-+                      }
-+                      required
-+                      type="date"
-+                      value={draft.endDate}
-+                    />
-+                  </label>
-+                  <label className="flex w-28 flex-col gap-1 text-xs">
-+                    종료 시간 (선택)
-+                    <Input
-+                      disabled={!draft.time}
-+                      onChange={(event) =>
-+                        setDraft({ ...draft, endTime: event.target.value })
-+                      }
-+                      type="time"
-+                      value={draft.endTime}
-+                    />
-+                  </label>
-+                </div>
-+                {rangeError ? (
-+                  <p
-+                    className="text-xs text-destructive"
-+                    data-testid="team-calendar-range-error"
-+                    role="alert"
-+                  >
-+                    {rangeError}
-+                  </p>
-+                ) : null}
-+                <fieldset className="flex min-w-0 flex-col gap-1 text-xs">
-+                  <legend className="mb-1">색상</legend>
-+                  <div className="flex flex-wrap gap-1.5">
-+                    {COLOR_CHOICES.map((choice) => {
-+                      const { label, dot } = COLOR_STYLES[choice];
-+                      const checked = draft.color === choice;
-+                      return (
-+                        <button
-+                          aria-label={label}
-+                          aria-pressed={checked}
-+                          className={cn(
-+                            "h-5 w-5 rounded-full border-2 transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
-+                            dot,
-+                            checked
-+                              ? "border-foreground"
-+                              : "border-transparent",
-+                          )}
-+                          data-testid={`team-calendar-color-${choice || "default"}`}
-+                          key={choice || "default"}
-+                          onClick={() => setDraft({ ...draft, color: choice })}
-+                          title={label}
-+                          type="button"
-+                        />
-+                      );
-+                    })}
-+                  </div>
-+                </fieldset>
-+                <label className="flex flex-col gap-1 text-xs">
-+                  메모 (선택)
-+                  <Textarea
-+                    maxLength={MAX_NOTE_LENGTH}
-+                    onChange={(event) =>
-+                      setDraft({ ...draft, note: event.target.value })
-+                    }
-+                    rows={3}
-+                    value={draft.note}
-+                  />
-+                </label>
-+                <div className="flex justify-end gap-2">
-+                  <Button
-+                    disabled={saving}
-+                    onClick={() => setDraft(null)}
-+                    size="sm"
-+                    type="button"
-+                    variant="ghost"
-+                  >
-+                    취소
-+                  </Button>
-+                  <Button
-+                    disabled={
-+                      saving ||
-+                      draft.title.trim().length === 0 ||
-+                      rangeError !== null
-+                    }
-+                    size="sm"
-+                    type="submit"
-+                  >
-+                    {draft.id ? "수정 저장" : "저장"}
-+                  </Button>
-+                </div>
-+              </form>
++              <EntryForm
++                draft={draft}
++                members={members}
++                onCancel={() => setDraft(null)}
++                onChange={setDraft}
++                onSubmit={() => void submitDraft()}
++                saving={saving}
++              />
 +            ) : selectedEntries.length === 0 ? (
 +              <p className="text-sm text-muted-foreground">
 +                이 날에는 일정이 없습니다.
 +              </p>
 +            ) : (
-+              <ul className="flex max-h-80 flex-col gap-2 overflow-y-auto">
-+                {selectedEntries.map((entry) => (
-+                  <li
-+                    className="rounded-lg border border-border/60 px-3 py-2"
-+                    data-testid="team-calendar-entry"
-+                    key={entry.id}
-+                  >
-+                    <div className="flex items-start gap-2">
-+                      <div className="min-w-0 flex-1">
-+                        <p className="flex items-start gap-1.5 break-words text-sm font-medium">
-+                          <span
-+                            aria-hidden="true"
-+                            className={cn(
-+                              "mt-1.5 h-2 w-2 shrink-0 rounded-full",
-+                              COLOR_STYLES[entry.color ?? ""].dot,
-+                            )}
-+                          />
-+                          {entry.title}
-+                        </p>
-+                        <p className="text-xs text-muted-foreground">
-+                          {rangeLabel(entry)}
-+                        </p>
-+                      </div>
-+                      <Button
-+                        aria-label={`${entry.title} 수정`}
-+                        disabled={saving}
-+                        onClick={() => setDraft(draftOf(entry))}
-+                        size="icon-xs"
-+                        type="button"
-+                        variant="ghost"
-+                      >
-+                        <Pencil />
-+                      </Button>
-+                      {confirmingId === entry.id ? (
++              <ul className="flex max-h-96 flex-col gap-2 overflow-y-auto">
++                {selectedEntries.map((entry) => {
++                  const key = occurrenceKey(entry);
++                  const offsets = reminderOffsets(entry, overrides);
++                  const mine = isAttendee(entry, pubkey);
++                  return (
++                    <li
++                      className="rounded-lg border border-border/60 px-3 py-2"
++                      data-testid="team-calendar-entry"
++                      key={key}
++                    >
++                      <div className="flex items-start gap-2">
++                        <div className="min-w-0 flex-1">
++                          <p className="flex items-start gap-1.5 break-words text-sm font-medium">
++                            <span
++                              aria-hidden="true"
++                              className={cn(
++                                "mt-1.5 h-2 w-2 shrink-0 rounded-full",
++                                COLOR_STYLES[entry.color ?? ""].dot,
++                              )}
++                            />
++                            {entry.title}
++                          </p>
++                          <p className="text-xs text-muted-foreground">
++                            {rangeLabel(entry)}
++                            {entry.repeat
++                              ? ` · ${REPEAT_LABELS[entry.repeat.every]} 반복`
++                              : ""}
++                          </p>
++                        </div>
 +                        <Button
-+                          aria-label={`${entry.title} 삭제 확인`}
++                          aria-label={`${entry.title} 수정`}
 +                          disabled={saving}
-+                          onBlur={() => setConfirmingId(null)}
-+                          onClick={() => removeEntry(entry)}
-+                          size="xs"
++                          onClick={() => setDraft(draftOf(entry))}
++                          size="icon-xs"
 +                          type="button"
-+                          variant="destructive"
++                          variant="ghost"
 +                        >
-+                          삭제 확인
++                          <Pencil />
 +                        </Button>
-+                      ) : (
 +                        <Button
 +                          aria-label={`${entry.title} 삭제`}
 +                          disabled={saving}
-+                          onClick={() => removeEntry(entry)}
++                          onClick={() =>
++                            setConfirmingKey(confirmingKey === key ? null : key)
++                          }
 +                          size="icon-xs"
 +                          type="button"
 +                          variant="ghost"
 +                        >
 +                          <Trash2 />
 +                        </Button>
-+                      )}
-+                    </div>
-+                    {entry.note ? (
-+                      <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted-foreground">
-+                        {entry.note}
++                      </div>
++                      {confirmingKey === key ? (
++                        <div className="mt-1 flex flex-wrap justify-end gap-1">
++                          {entry.repeat ? (
++                            <Button
++                              disabled={saving}
++                              onClick={() => skipOccurrence(entry)}
++                              size="xs"
++                              type="button"
++                              variant="outline"
++                            >
++                              이 날만 삭제
++                            </Button>
++                          ) : null}
++                          <Button
++                            aria-label={`${entry.title} 삭제 확인`}
++                            disabled={saving}
++                            onClick={() => removeEntry(entry)}
++                            size="xs"
++                            type="button"
++                            variant="destructive"
++                          >
++                            {entry.repeat ? "반복 전체 삭제" : "삭제 확인"}
++                          </Button>
++                        </div>
++                      ) : null}
++                      <p className="mt-1 break-words text-xs text-muted-foreground">
++                        {attendeeLabel(entry)}
 +                      </p>
-+                    ) : null}
-+                  </li>
-+                ))}
++                      {entry.note ? (
++                        <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted-foreground">
++                          {entry.note}
++                        </p>
++                      ) : null}
++                      {mine ? (
++                        <div className="mt-1 text-xs text-muted-foreground">
++                          <button
++                            className="underline-offset-2 hover:underline focus-visible:underline focus-visible:outline-hidden"
++                            data-testid="team-calendar-reminders-toggle"
++                            onClick={() =>
++                              setRemindersFor(remindersFor === key ? null : key)
++                            }
++                            type="button"
++                          >
++                            내 알림:{" "}
++                            {offsets.length === 0
++                              ? "없음"
++                              : offsets.map(reminderLabel).join(", ")}
++                          </button>
++                          {remindersFor === key ? (
++                            <div className="mt-1 flex flex-wrap gap-1">
++                              {REMINDER_CHOICES.map((choice) => {
++                                const on = offsets.includes(choice);
++                                return (
++                                  <Button
++                                    aria-pressed={on}
++                                    key={choice}
++                                    onClick={() =>
++                                      setEntryOffsets(
++                                        entry.id,
++                                        on
++                                          ? offsets.filter(
++                                              (offset) => offset !== choice,
++                                            )
++                                          : [...offsets, choice],
++                                      )
++                                    }
++                                    size="xs"
++                                    type="button"
++                                    variant={on ? "secondary" : "outline"}
++                                  >
++                                    {reminderLabel(choice)}
++                                  </Button>
++                                );
++                              })}
++                              <Button
++                                onClick={() => setEntryOffsets(entry.id, null)}
++                                size="xs"
++                                type="button"
++                                variant="ghost"
++                              >
++                                기본값으로
++                              </Button>
++                            </div>
++                          ) : null}
++                        </div>
++                      ) : null}
++                    </li>
++                  );
++                })}
 +              </ul>
 +            )}
 +          </section>
 +        </div>
++        )}
 +      </DialogContent>
 +    </Dialog>
 +  );
 +}
 diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
 new file mode 100644
-index 000000000..d601433e6
+index 0000000..92e1eb5
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,75 @@
 +import { CalendarDays } from "lucide-react";
 +import * as React from "react";
 +
++import {
++  type AddFromMessageRequest,
++  onAddFromMessage,
++} from "@/features/team-calendar/lib/addFromMessage";
++import { useTeamCalendarReminders } from "@/features/team-calendar/lib/useTeamCalendarReminders";
 +import { SidebarMenuButton, SidebarMenuItem } from "@/shared/ui/sidebar";
 +import { SidebarMenuLabel } from "@/shared/ui/sidebar-menu-label";
++import { AddFromMessageDialog } from "./AddFromMessageDialog";
 +import { TeamCalendarDialog } from "./TeamCalendarDialog";
 +
 +/**
-+ * Sidebar entry for the team calendar (team patch). The dialog is mounted
-+ * only while open, so the calendar's relay subscription exists only then.
++ * Sidebar entry for the team calendar (team patch). The calendar window is
++ * mounted only while open. Reminders and "add to calendar" from a message are
++ * handled here too, because this is mounted for as long as a community is
++ * shown.
 + */
 +export function TeamCalendarSidebarEntry({
 +  pubkey,
@@ -2100,8 +4878,23 @@ index 000000000..d601433e6
 +  pubkey?: string;
 +  relayUrl?: string;
 +}) {
-+  const [open, setOpen] = React.useState(false);
 +  if (!pubkey || !relayUrl) return null;
++  return <TeamCalendarEntry pubkey={pubkey} relayUrl={relayUrl} />;
++}
++
++function TeamCalendarEntry({
++  pubkey,
++  relayUrl,
++}: {
++  pubkey: string;
++  relayUrl: string;
++}) {
++  const [open, setOpen] = React.useState(false);
++  const [request, setRequest] = React.useState<AddFromMessageRequest | null>(
++    null,
++  );
++  useTeamCalendarReminders(pubkey, relayUrl);
++  React.useEffect(() => onAddFromMessage(setRequest), []);
 +
 +  return (
 +    <SidebarMenuItem data-no-translate="">
@@ -2120,6 +4913,15 @@ index 000000000..d601433e6
 +          open={open}
 +          pubkey={pubkey}
 +          relayUrl={relayUrl}
++        />
++      ) : null}
++      {request ? (
++        <AddFromMessageDialog
++          key={request.eventId}
++          onClose={() => setRequest(null)}
++          pubkey={pubkey}
++          relayUrl={relayUrl}
++          request={request}
 +        />
 +      ) : null}
 +    </SidebarMenuItem>
