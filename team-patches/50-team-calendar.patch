@@ -1,0 +1,1391 @@
+diff --git a/desktop/src/features/sidebar/ui/AppSidebar.tsx b/desktop/src/features/sidebar/ui/AppSidebar.tsx
+index 22f10c6..a434db3 100644
+--- a/desktop/src/features/sidebar/ui/AppSidebar.tsx
++++ b/desktop/src/features/sidebar/ui/AppSidebar.tsx
+@@ -18,6 +18,7 @@ import {
+   useTeamSectionsPreference,
+ } from "@/features/sidebar/lib/useTeamChannelSections";
+ import { useProvideTeamSectionsMenu } from "@/features/sidebar/ui/TeamSectionsMenu";
++import { TeamCalendarSidebarEntry } from "@/features/team-calendar/ui/TeamCalendarSidebarEntry";
+ import { useActiveWorkingChannelsById } from "@/features/sidebar/lib/useActiveWorkingChannelsById";
+ import { useDmSidebarMetadata } from "@/features/sidebar/useDmSidebarMetadata";
+ import { sortDmChannelsForSidebar } from "@/features/sidebar/lib/dmSidebarSort";
+@@ -616,6 +617,12 @@ export function AppSidebar({
+               data-testid="sidebar-scroll-content"
+             >
+               <AppSidebarPrimaryMenu
++                extraItems={
++                  <TeamCalendarSidebarEntry
++                    pubkey={currentPubkey}
++                    relayUrl={activeCommunity?.relayUrl}
++                  />
++                }
+                 homeBadgeCount={homeBadgeCount}
+                 onSelectAgents={onSelectAgents}
+                 onSelectHome={onSelectHome}
+diff --git a/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx b/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
+index 660f7d9..4605704 100644
+--- a/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
++++ b/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
+@@ -1,4 +1,5 @@
+ import { Activity, Bot, Folders, Inbox, Zap } from "lucide-react";
++import type * as React from "react";
+ 
+ import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
+ import { SidebarProjectsSection } from "@/features/sidebar/ui/SidebarProjectsSection";
+@@ -40,6 +41,8 @@ type AppSidebarPinnedHeaderProps = {
+ };
+ 
+ type AppSidebarPrimaryMenuProps = {
++  /** Extra menu items appended after the built-in ones (team patches). */
++  extraItems?: React.ReactNode;
+   homeBadgeCount: number;
+   onSelectAgents: () => void;
+   onSelectHome: () => void;
+@@ -90,6 +93,7 @@ export function AppSidebarPinnedHeader({
+ }
+ 
+ export function AppSidebarPrimaryMenu({
++  extraItems,
+   homeBadgeCount,
+   onSelectAgents,
+   onSelectHome,
+@@ -183,6 +187,7 @@ export function AppSidebarPrimaryMenu({
+               </SidebarMenuButton>
+             </SidebarMenuItem>
+           </FeatureGate>
++          {extraItems}
+         </SidebarMenu>
+       </SidebarHeader>
+       <SidebarProjectsSection />
+diff --git a/desktop/src/features/team-calendar/lib/teamCalendar.test.mjs b/desktop/src/features/team-calendar/lib/teamCalendar.test.mjs
+new file mode 100644
+index 0000000..9f0e54a
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/teamCalendar.test.mjs
+@@ -0,0 +1,166 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import {
++  MAX_TEAM_CALENDAR_CONTENT_BYTES,
++  decodeMonth,
++  encodeForPublish,
++  encodeMonth,
++  entriesByDate,
++  hasNewerEntries,
++  mergeMonthEvents,
++  mergeMonths,
++  monthGrid,
++  shiftMonth,
++  teamCalendarDTag,
++} from "./teamCalendar.ts";
++
++const ALICE = "a".repeat(64);
++const BOB = "b".repeat(64);
++
++const entry = (id, overrides = {}) => ({
++  id,
++  title: `Entry ${id}`,
++  date: "2026-10-07",
++  updatedAt: 1_000,
++  updatedBy: ALICE,
++  ...overrides,
++});
++
++const monthOf = (...entries) =>
++  Object.fromEntries(entries.map((value) => [value.id, value]));
++
++let seq = 0;
++const ev = (pubkey, month, createdAt, dTag) => ({
++  id: `id-${String(++seq).padStart(6, "0")}`,
++  pubkey,
++  kind: 30078,
++  content: encodeMonth(month),
++  created_at: createdAt,
++  tags: [["d", dTag]],
++  sig: "s",
++});
++
++test("the d tag names the community and the month", () => {
++  const here = teamCalendarDTag("wss://a.example.com/", "2026-10");
++  assert.equal(here, teamCalendarDTag("WSS://A.example.com", "2026-10"));
++  assert.notEqual(here, teamCalendarDTag("wss://b.example.com", "2026-10"));
++  assert.notEqual(here, teamCalendarDTag("wss://a.example.com", "2026-11"));
++});
++
++test("month arithmetic crosses year boundaries", () => {
++  assert.equal(shiftMonth("2026-12", 1), "2027-01");
++  assert.equal(shiftMonth("2026-01", -1), "2025-12");
++  assert.equal(shiftMonth("2026-10", 0), "2026-10");
++});
++
++test("the month grid is six full weeks starting on Sunday", () => {
++  const grid = monthGrid("2026-10");
++  assert.equal(grid.length, 42);
++  // 2026-10-01 is a Thursday, so the grid starts on Sunday 2026-09-27.
++  assert.deepEqual(grid[0], { date: "2026-09-27", day: 27, inMonth: false });
++  assert.deepEqual(grid[4], { date: "2026-10-01", day: 1, inMonth: true });
++  assert.equal(grid.filter((cell) => cell.inMonth).length, 31);
++  assert.equal(grid[41].date, "2026-11-07");
++});
++
++test("a document round-trips and malformed entries are dropped", () => {
++  const month = monthOf(
++    entry("a", { time: "09:30", note: "Bring slides" }),
++    entry("b", { deleted: true, title: "" }),
++  );
++  assert.deepEqual(decodeMonth(encodeMonth(month), "2026-10"), month);
++
++  const raw = JSON.stringify({
++    v: 1,
++    entries: {
++      ok: { title: " Trim me ", date: "2026-10-01", updatedAt: 5, updatedBy: BOB },
++      wrongMonth: { title: "x", date: "2026-11-01", updatedAt: 5, updatedBy: BOB },
++      badDate: { title: "x", date: "2026-10-32", updatedAt: 5, updatedBy: BOB },
++      noTitle: { title: "  ", date: "2026-10-01", updatedAt: 5, updatedBy: BOB },
++      badAuthor: { title: "x", date: "2026-10-01", updatedAt: 5, updatedBy: "me" },
++      badTime: { title: "x", date: "2026-10-01", time: "25:00", updatedAt: 5, updatedBy: BOB },
++    },
++  });
++  const decoded = decodeMonth(raw, "2026-10");
++  assert.deepEqual(Object.keys(decoded).sort(), ["badTime", "ok"]);
++  assert.equal(decoded.ok.title, "Trim me");
++  assert.equal(decoded.badTime.time, undefined);
++  assert.deepEqual(decodeMonth("not json", "2026-10"), {});
++  assert.deepEqual(decodeMonth("[]", "2026-10"), {});
++});
++
++test("the later edit of an entry wins, and a deletion beats an older copy", () => {
++  const mine = monthOf(entry("a", { title: "Old", updatedAt: 10 }));
++  const theirs = monthOf(
++    entry("a", { title: "New", updatedAt: 20, updatedBy: BOB }),
++    entry("b", { updatedAt: 5, updatedBy: BOB }),
++  );
++  const merged = mergeMonths(mine, theirs);
++  assert.equal(merged.a.title, "New");
++  assert.ok(merged.b);
++  assert.equal(mergeMonths(merged, mine), merged, "nothing newer: same object");
++
++  const deleted = monthOf(
++    entry("a", { deleted: true, updatedAt: 30, updatedBy: BOB }),
++  );
++  assert.equal(mergeMonths(merged, deleted).a.deleted, true);
++  assert.equal(mergeMonths(deleted, merged).a.deleted, true);
++  assert.deepEqual(entriesByDate(mergeMonths(merged, deleted))["2026-10-07"].map((e) => e.id), ["b"]);
++});
++
++test("entries are listed by date, timed before all-day", () => {
++  const month = monthOf(
++    entry("late", { time: "15:00" }),
++    entry("allday"),
++    entry("early", { time: "09:00" }),
++    entry("first", { date: "2026-10-01" }),
++  );
++  const grouped = entriesByDate(month);
++  assert.deepEqual(grouped["2026-10-07"].map((e) => e.id), ["early", "late", "allday"]);
++  assert.deepEqual(grouped["2026-10-01"].map((e) => e.id), ["first"]);
++});
++
++test("every member's newest event is merged and my own is tracked", () => {
++  const dTag = teamCalendarDTag("wss://a.example.com", "2026-10");
++  const other = teamCalendarDTag("wss://b.example.com", "2026-10");
++  const events = [
++    ev(ALICE, monthOf(entry("a", { title: "Stale", updatedAt: 1 })), 100, dTag),
++    ev(ALICE, monthOf(entry("a", { title: "Mine", updatedAt: 2 })), 200, dTag),
++    ev(BOB, monthOf(entry("b", { updatedBy: BOB })), 150, dTag),
++    ev(BOB, monthOf(entry("elsewhere", { updatedBy: BOB })), 999, other),
++  ];
++  const { merged, own, ownCreatedAt } = mergeMonthEvents(events, dTag, "2026-10", ALICE);
++  assert.deepEqual(Object.keys(merged).sort(), ["a", "b"]);
++  assert.equal(merged.a.title, "Mine");
++  assert.equal(ownCreatedAt, 200);
++  assert.deepEqual(Object.keys(own), ["a"]);
++  // What Alice still has to publish: Bob's entry is not in her own event.
++  assert.equal(hasNewerEntries(merged, own), true);
++  assert.equal(hasNewerEntries(own, merged), false);
++});
++
++test("an oversized month drops its oldest deletions before giving up", () => {
++  const note = "n".repeat(900);
++  const live = Array.from({ length: 30 }, (_, i) =>
++    entry(`live-${i}`, { note, updatedAt: 1_000 + i }),
++  );
++  const deletions = Array.from({ length: 60 }, (_, i) =>
++    entry(`gone-${String(i).padStart(2, "0")}`, {
++      deleted: true,
++      title: "t".repeat(120),
++      note,
++      updatedAt: i + 1,
++    }),
++  );
++  const content = encodeForPublish(monthOf(...live, ...deletions));
++  assert.ok(content);
++  assert.ok(new TextEncoder().encode(content).length <= MAX_TEAM_CALENDAR_CONTENT_BYTES);
++  const kept = decodeMonth(content, "2026-10");
++  assert.equal(Object.values(kept).filter((e) => !e.deleted).length, 30);
++  assert.ok(!kept["gone-00"], "oldest deletion dropped first");
++  assert.ok(kept["gone-59"], "newest deletion kept");
++
++  const tooMany = Array.from({ length: 80 }, (_, i) => entry(`x-${i}`, { note }));
++  assert.equal(encodeForPublish(monthOf(...tooMany)), null);
++});
+diff --git a/desktop/src/features/team-calendar/lib/teamCalendar.ts b/desktop/src/features/team-calendar/lib/teamCalendar.ts
+new file mode 100644
+index 0000000..a31e84d
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/teamCalendar.ts
+@@ -0,0 +1,299 @@
++import type { RelayEvent } from "@/shared/api/types";
++import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
++
++/**
++ * Team calendar (team patch): one calendar every member of a community sees
++ * and any member can edit.
++ *
++ * Same sharing model as team sections: nobody can overwrite another member's
++ * event, so each member publishes their merged copy of a month as a plaintext
++ * kind 30078 event at their own `(pubkey, d)` coordinate, and readers merge
++ * every member's copy. An entry is last-writer-wins as a whole (`updatedAt`,
++ * then `updatedBy`); a deletion is an entry with `deleted: true` so it also
++ * wins over older copies.
++ *
++ * The `d` tag names the community (relay URL) and the month, so a calendar
++ * never shows up in another community on a shared host and one busy month
++ * cannot push the whole calendar over the relay's event size limit.
++ */
++export const TEAM_CALENDAR_D_TAG = "team-calendar";
++
++/** Most member events merged per read. */
++export const MAX_TEAM_CALENDAR_AUTHORS = 200;
++/** Relay event size ceiling, with headroom for the envelope. */
++export const MAX_TEAM_CALENDAR_CONTENT_BYTES = 60_000;
++
++export const MAX_TITLE_LENGTH = 120;
++export const MAX_NOTE_LENGTH = 1_000;
++
++export type CalendarEntry = {
++  id: string;
++  title: string;
++  /** Local calendar date, `YYYY-MM-DD`. */
++  date: string;
++  /** Optional local start time, `HH:MM` (24h). */
++  time?: string;
++  note?: string;
++  /** Milliseconds since epoch of the last edit. */
++  updatedAt: number;
++  /** Pubkey of the member who made the last edit. */
++  updatedBy: string;
++  deleted?: true;
++};
++
++/** Every entry of one month by id, deletions included. */
++export type CalendarMonth = Record<string, CalendarEntry>;
++
++const DATE_PATTERN = /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
++const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
++const MONTH_PATTERN = /^\d{4}-(0[1-9]|1[0-2])$/;
++
++const pad = (value: number) => String(value).padStart(2, "0");
++
++/** `YYYY-MM` for a year and a 1-based month. */
++export const monthKey = (year: number, month: number) =>
++  `${year}-${pad(month)}`;
++
++/** `YYYY-MM-DD` for a year, a 1-based month and a day. */
++export const dateKey = (year: number, month: number, day: number) =>
++  `${year}-${pad(month)}-${pad(day)}`;
++
++/** The month (`YYYY-MM`) a `YYYY-MM-DD` date falls in. */
++export const monthOfDate = (date: string) => date.slice(0, 7);
++
++/** Local today as `YYYY-MM-DD`. */
++export function todayKey(now: Date = new Date()): string {
++  return dateKey(now.getFullYear(), now.getMonth() + 1, now.getDate());
++}
++
++/** The month before (`step = -1`) or after (`step = 1`) a `YYYY-MM` key. */
++export function shiftMonth(month: string, step: number): string {
++  const [year, value] = month.split("-").map(Number) as [number, number];
++  const index = year * 12 + (value - 1) + step;
++  return monthKey(Math.floor(index / 12), (index % 12) + 1);
++}
++
++/**
++ * The 42 day cells (6 weeks, Sunday first) of a month grid. Days outside the
++ * month are included so every row is full.
++ */
++export function monthGrid(
++  month: string,
++): Array<{ date: string; day: number; inMonth: boolean }> {
++  const [year, value] = month.split("-").map(Number) as [number, number];
++  const first = new Date(year, value - 1, 1);
++  const cells: Array<{ date: string; day: number; inMonth: boolean }> = [];
++  for (let offset = 0; offset < 42; offset++) {
++    const cell = new Date(year, value - 1, 1 - first.getDay() + offset);
++    cells.push({
++      date: dateKey(cell.getFullYear(), cell.getMonth() + 1, cell.getDate()),
++      day: cell.getDate(),
++      inMonth: cell.getMonth() === value - 1,
++    });
++  }
++  return cells;
++}
++
++/** The `d` tag of one community's calendar for one month. */
++export function teamCalendarDTag(relayUrl: string, month: string): string {
++  return `${TEAM_CALENDAR_D_TAG}:${normalizeRelayUrl(relayUrl)}:${month}`;
++}
++
++const isPubkey = (value: unknown): value is string =>
++  typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
++
++/** A stored entry if it is well-formed and belongs to `month`, else `null`. */
++function readEntry(
++  id: string,
++  raw: unknown,
++  month: string,
++): CalendarEntry | null {
++  if (!raw || typeof raw !== "object") return null;
++  const value = raw as Record<string, unknown>;
++  if (id.length === 0 || id.length > 64) return null;
++  if (typeof value.date !== "string" || !DATE_PATTERN.test(value.date))
++    return null;
++  if (monthOfDate(value.date) !== month) return null;
++  if (
++    typeof value.updatedAt !== "number" ||
++    !Number.isFinite(value.updatedAt) ||
++    value.updatedAt <= 0
++  )
++    return null;
++  if (!isPubkey(value.updatedBy)) return null;
++  const title =
++    typeof value.title === "string"
++      ? value.title.trim().slice(0, MAX_TITLE_LENGTH)
++      : "";
++  const deleted = value.deleted === true;
++  if (!deleted && title.length === 0) return null;
++  const entry: CalendarEntry = {
++    id,
++    title,
++    date: value.date,
++    updatedAt: value.updatedAt,
++    updatedBy: value.updatedBy,
++  };
++  if (typeof value.time === "string" && TIME_PATTERN.test(value.time))
++    entry.time = value.time;
++  if (typeof value.note === "string" && value.note.trim().length > 0)
++    entry.note = value.note.trim().slice(0, MAX_NOTE_LENGTH);
++  if (deleted) entry.deleted = true;
++  return entry;
++}
++
++/** Parses one member's month document. Malformed entries are skipped. */
++export function decodeMonth(content: string, month: string): CalendarMonth {
++  if (!MONTH_PATTERN.test(month)) return {};
++  let json: unknown = null;
++  try {
++    json = JSON.parse(content);
++  } catch {
++    return {};
++  }
++  if (!json || typeof json !== "object") return {};
++  const entries = (json as { entries?: unknown }).entries;
++  if (!entries || typeof entries !== "object") return {};
++  const result: CalendarMonth = {};
++  for (const [id, raw] of Object.entries(entries as Record<string, unknown>)) {
++    const entry = readEntry(id, raw, month);
++    if (entry) result[id] = entry;
++  }
++  return result;
++}
++
++export function encodeMonth(month: CalendarMonth): string {
++  const entries: Record<string, Omit<CalendarEntry, "id">> = {};
++  for (const id of Object.keys(month).sort()) {
++    const { id: _id, ...rest } = month[id] as CalendarEntry;
++    entries[id] = rest;
++  }
++  return JSON.stringify({ v: 1, entries });
++}
++
++/** True when `candidate` replaces `current` (later edit, then higher pubkey). */
++function wins(candidate: CalendarEntry, current: CalendarEntry): boolean {
++  if (candidate.updatedAt !== current.updatedAt)
++    return candidate.updatedAt > current.updatedAt;
++  if (candidate.updatedBy !== current.updatedBy)
++    return candidate.updatedBy > current.updatedBy;
++  return candidate.deleted === true && current.deleted !== true;
++}
++
++/** Merges month copies entry by entry. Returns `base` when nothing changed. */
++export function mergeMonths(
++  base: CalendarMonth,
++  ...others: CalendarMonth[]
++): CalendarMonth {
++  let result = base;
++  for (const other of others) {
++    for (const [id, entry] of Object.entries(other)) {
++      const current = result[id];
++      if (current && !wins(entry, current)) continue;
++      if (result === base) result = { ...base };
++      result[id] = entry;
++    }
++  }
++  return result;
++}
++
++/** True when `local` holds an entry (or a newer edit) that `remote` lacks. */
++export function hasNewerEntries(
++  local: CalendarMonth,
++  remote: CalendarMonth,
++): boolean {
++  return Object.values(local).some((entry) => {
++    const current = remote[entry.id];
++    return !current || wins(entry, current);
++  });
++}
++
++/** Live entries, ordered by date, then timed before all-day by time, then title. */
++export function liveEntries(month: CalendarMonth): CalendarEntry[] {
++  return Object.values(month)
++    .filter((entry) => !entry.deleted)
++    .sort(
++      (a, b) =>
++        a.date.localeCompare(b.date) ||
++        (a.time ?? "99:99").localeCompare(b.time ?? "99:99") ||
++        a.title.localeCompare(b.title) ||
++        a.id.localeCompare(b.id),
++    );
++}
++
++/** Live entries of one month grouped by `YYYY-MM-DD`. */
++export function entriesByDate(
++  month: CalendarMonth,
++): Record<string, CalendarEntry[]> {
++  const grouped: Record<string, CalendarEntry[]> = {};
++  for (const entry of liveEntries(month)) {
++    const list = grouped[entry.date];
++    if (list) list.push(entry);
++    else grouped[entry.date] = [entry];
++  }
++  return grouped;
++}
++
++const byteLength = (text: string) => new TextEncoder().encode(text).length;
++
++/**
++ * The document to publish for a month, or `null` when it cannot fit the
++ * relay's size limit. Deletions are kept (they are what stops an older copy
++ * from bringing an entry back); only when the month is over the limit are the
++ * oldest deletions dropped to make room.
++ */
++export function encodeForPublish(month: CalendarMonth): string | null {
++  let content = encodeMonth(month);
++  if (byteLength(content) <= MAX_TEAM_CALENDAR_CONTENT_BYTES) return content;
++  const trimmed: CalendarMonth = { ...month };
++  const deletions = Object.values(month)
++    .filter((entry) => entry.deleted)
++    .sort((a, b) => a.updatedAt - b.updatedAt);
++  for (const entry of deletions) {
++    delete trimmed[entry.id];
++    content = encodeMonth(trimmed);
++    if (byteLength(content) <= MAX_TEAM_CALENDAR_CONTENT_BYTES) return content;
++  }
++  return null;
++}
++
++/**
++ * Every member's newest event for one month merged into one copy, plus the
++ * `created_at` of `pubkey`'s own event (0 when they have none) so the next
++ * publish can replace it.
++ */
++export function mergeMonthEvents(
++  events: RelayEvent[],
++  dTag: string,
++  month: string,
++  pubkey: string,
++): { merged: CalendarMonth; ownCreatedAt: number; own: CalendarMonth } {
++  const newest = new Map<string, RelayEvent>();
++  for (const event of events) {
++    const d = event.tags.filter((tag) => tag[0] === "d");
++    if (d.length !== 1 || d[0]?.[1] !== dTag) continue;
++    const current = newest.get(event.pubkey);
++    // The relay's replaceable winner: later `created_at`, then lower id.
++    if (
++      current &&
++      !(
++        event.created_at > current.created_at ||
++        (event.created_at === current.created_at && event.id < current.id)
++      )
++    )
++      continue;
++    newest.set(event.pubkey, event);
++  }
++  let merged: CalendarMonth = {};
++  let own: CalendarMonth = {};
++  let ownCreatedAt = 0;
++  for (const event of newest.values()) {
++    const copy = decodeMonth(event.content, month);
++    merged = mergeMonths(merged, copy);
++    if (event.pubkey === pubkey) {
++      own = copy;
++      ownCreatedAt = event.created_at;
++    }
++  }
++  return { merged, ownCreatedAt, own };
++}
+diff --git a/desktop/src/features/team-calendar/lib/useTeamCalendar.ts b/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
+new file mode 100644
+index 0000000..e01ed3e
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
+@@ -0,0 +1,324 @@
++import * as React from "react";
++
++import { relayClient } from "@/shared/api/relayClient";
++import { signRelayEvent } from "@/shared/api/tauri";
++import type { RelayEvent } from "@/shared/api/types";
++import { KIND_CHANNEL_SECTIONS } from "@/shared/constants/kinds";
++import {
++  type CalendarEntry,
++  type CalendarMonth,
++  MAX_NOTE_LENGTH,
++  MAX_TEAM_CALENDAR_AUTHORS,
++  MAX_TITLE_LENGTH,
++  TEAM_CALENDAR_D_TAG,
++  decodeMonth,
++  encodeForPublish,
++  hasNewerEntries,
++  mergeMonthEvents,
++  mergeMonths,
++  monthOfDate,
++  teamCalendarDTag,
++} from "./teamCalendar";
++
++/** kind 30078 (application data), the same kind team sections use. */
++const KIND_TEAM_CALENDAR = KIND_CHANNEL_SECTIONS;
++
++export type CalendarEntryInput = {
++  /** Omit to create a new entry. */
++  id?: string;
++  title: string;
++  date: string;
++  time?: string;
++  note?: string;
++};
++
++export type TeamCalendarStatus = "loading" | "ready" | "error";
++
++const monthFilter = (dTag: string) => ({
++  kinds: [KIND_TEAM_CALENDAR],
++  "#d": [dTag],
++});
++
++async function fetchMonth(relayUrl: string, month: string, pubkey: string) {
++  const dTag = teamCalendarDTag(relayUrl, month);
++  const events = await relayClient.fetchEvents({
++    ...monthFilter(dTag),
++    limit: MAX_TEAM_CALENDAR_AUTHORS,
++  });
++  return mergeMonthEvents(events, dTag, month, pubkey);
++}
++
++/**
++ * Publishes this member's copy of one month. Returns the `created_at` used so
++ * the next publish can replace it. `isCurrent` is checked right before the
++ * send, so a publish that outlives its scope (a community switch mid-flight)
++ * is dropped instead of sent.
++ */
++async function publishMonth(input: {
++  relayUrl: string;
++  month: string;
++  entries: CalendarMonth;
++  ownCreatedAt: number;
++  isCurrent: () => boolean;
++}): Promise<number> {
++  const content = encodeForPublish(input.entries);
++  if (content === null) {
++    throw new Error("이 달에는 일정이 너무 많아 더 저장할 수 없습니다.");
++  }
++  const dTag = teamCalendarDTag(input.relayUrl, input.month);
++  const createdAt = Math.max(
++    Math.floor(Date.now() / 1_000),
++    input.ownCreatedAt + 1,
++  );
++  const event = await signRelayEvent({
++    kind: KIND_TEAM_CALENDAR,
++    content,
++    createdAt,
++    tags: [
++      ["d", dTag],
++      ["t", TEAM_CALENDAR_D_TAG],
++    ],
++  });
++  try {
++    await relayClient.publishEvent(
++      event,
++      "팀 캘린더를 저장하는 데 시간이 너무 오래 걸립니다.",
++      "팀 캘린더를 저장하지 못했습니다.",
++      input.isCurrent,
++    );
++  } catch (error) {
++    if (!String((error as Error)?.message).startsWith("duplicate:"))
++      throw error;
++  }
++  return createdAt;
++}
++
++function buildEntry(
++  input: CalendarEntryInput,
++  previous: CalendarEntry | undefined,
++  pubkey: string,
++): CalendarEntry {
++  const entry: CalendarEntry = {
++    id: input.id ?? crypto.randomUUID(),
++    title: input.title.trim().slice(0, MAX_TITLE_LENGTH),
++    date: input.date,
++    // Always later than the copy it replaces, even if this clock is behind.
++    updatedAt: Math.max(Date.now(), (previous?.updatedAt ?? 0) + 1),
++    updatedBy: pubkey,
++  };
++  if (input.time) entry.time = input.time;
++  const note = input.note?.trim().slice(0, MAX_NOTE_LENGTH);
++  if (note) entry.note = note;
++  return entry;
++}
++
++const tombstone = (entry: CalendarEntry, pubkey: string): CalendarEntry => ({
++  id: entry.id,
++  title: "",
++  date: entry.date,
++  updatedAt: Math.max(Date.now(), entry.updatedAt + 1),
++  updatedBy: pubkey,
++  deleted: true,
++});
++
++/**
++ * One month of the team calendar for one pubkey + relay scope: every member's
++ * copy merged, kept live, and this member's edits published.
++ */
++export function useTeamCalendarMonth(
++  pubkey: string,
++  relayUrl: string,
++  month: string,
++) {
++  const scope = `${pubkey}|${relayUrl}|${month}`;
++  const [state, setState] = React.useState<{
++    scope: string;
++    entries: CalendarMonth;
++    status: TeamCalendarStatus;
++  }>({ scope, entries: {}, status: "loading" });
++  // Never show another month's (or community's) entries for a frame.
++  const current =
++    state.scope === scope
++      ? state
++      : { scope, entries: {} as CalendarMonth, status: "loading" as const };
++
++  // What this scope's effect instance knows; replaced on every scope change.
++  const liveRef = React.useRef<{
++    scope: string;
++    cancelled: boolean;
++    entries: CalendarMonth;
++    own: CalendarMonth;
++    ownCreatedAt: number;
++    queue: Promise<void>;
++  } | null>(null);
++
++  React.useEffect(() => {
++    const live = {
++      scope,
++      cancelled: false,
++      entries: {} as CalendarMonth,
++      own: {} as CalendarMonth,
++      ownCreatedAt: 0,
++      queue: Promise.resolve(),
++    };
++    liveRef.current = live;
++    setState({ scope, entries: {}, status: "loading" });
++
++    const dTag = teamCalendarDTag(relayUrl, month);
++    const apply = (next: CalendarMonth, status?: TeamCalendarStatus) => {
++      live.entries = next;
++      setState((previous) => ({
++        scope,
++        entries: next,
++        status: status ?? (previous.scope === scope ? previous.status : "ready"),
++      }));
++    };
++
++    const load = () =>
++      void fetchMonth(relayUrl, month, pubkey).then(
++        (result) => {
++          if (live.cancelled) return;
++          // Keep the newest own event seen so the next publish replaces it.
++          if (result.ownCreatedAt >= live.ownCreatedAt) {
++            live.ownCreatedAt = result.ownCreatedAt;
++            live.own = result.own;
++          }
++          apply(mergeMonths(live.entries, result.merged), "ready");
++        },
++        () => {
++          if (live.cancelled) return;
++          setState((previous) =>
++            previous.scope === scope && previous.status === "loading"
++              ? { ...previous, status: "error" }
++              : previous,
++          );
++        },
++      );
++
++    const ingest = (event: RelayEvent) => {
++      if (live.cancelled) return;
++      const d = event.tags.filter((tag) => tag[0] === "d");
++      if (d.length !== 1 || d[0]?.[1] !== dTag) return;
++      const copy = decodeMonth(event.content, month);
++      if (event.pubkey === pubkey && event.created_at >= live.ownCreatedAt) {
++        live.ownCreatedAt = event.created_at;
++        live.own = copy;
++      }
++      const merged = mergeMonths(live.entries, copy);
++      if (merged !== live.entries) apply(merged);
++    };
++
++    let unsubLive: (() => Promise<void>) | null = null;
++    void relayClient
++      .subscribeLive({ ...monthFilter(dTag), limit: 0 }, ingest)
++      .then((dispose) => {
++        if (live.cancelled) void dispose();
++        else unsubLive = dispose;
++      })
++      .catch(() => {});
++    const unsubReconnect = relayClient.subscribeToReconnects(load);
++    load();
++
++    return () => {
++      live.cancelled = true;
++      unsubReconnect();
++      if (unsubLive) void unsubLive();
++    };
++  }, [scope, pubkey, relayUrl, month]);
++
++  /**
++   * Applies `change` to this month locally, then publishes this member's
++   * copy. Publishes run one at a time so each replaces the one before it.
++   */
++  const commit = React.useCallback(
++    (change: (entries: CalendarMonth) => CalendarMonth): Promise<void> => {
++      const live = liveRef.current;
++      if (!live || live.cancelled || live.scope !== scope) {
++        return Promise.reject(new Error("캘린더를 아직 불러오는 중입니다."));
++      }
++      const next = change(live.entries);
++      live.entries = next;
++      setState((previous) => ({
++        scope,
++        entries: next,
++        status: previous.scope === scope ? previous.status : "ready",
++      }));
++      const run = async () => {
++        if (live.cancelled) return;
++        // Publish whatever is newest by the time this turn runs.
++        const entries = live.entries;
++        if (!hasNewerEntries(entries, live.own)) return;
++        const createdAt = await publishMonth({
++          relayUrl,
++          month,
++          entries,
++          ownCreatedAt: live.ownCreatedAt,
++          isCurrent: () => !live.cancelled,
++        });
++        live.ownCreatedAt = createdAt;
++        live.own = entries;
++      };
++      const result = live.queue.then(run, run);
++      live.queue = result.catch(() => {});
++      return result;
++    },
++    [scope, relayUrl, month],
++  );
++
++  /** Creates or updates an entry. Moving it to another month is handled too. */
++  const saveEntry = React.useCallback(
++    async (input: CalendarEntryInput): Promise<void> => {
++      const live = liveRef.current;
++      const previous = input.id ? live?.entries[input.id] : undefined;
++      const entry = buildEntry(input, previous, pubkey);
++      const targetMonth = monthOfDate(entry.date);
++      if (targetMonth === month) {
++        await commit((entries) => mergeMonths(entries, { [entry.id]: entry }));
++        return;
++      }
++      // The date moved to another month: write it there first, then remove
++      // it here, so a failure in between leaves a duplicate, not a loss.
++      const there = await fetchMonth(relayUrl, targetMonth, pubkey);
++      await publishMonth({
++        relayUrl,
++        month: targetMonth,
++        entries: mergeMonths(there.merged, { [entry.id]: entry }),
++        ownCreatedAt: there.ownCreatedAt,
++        isCurrent: () => liveRef.current?.cancelled !== true,
++      });
++      if (previous) {
++        await commit((entries) =>
++          mergeMonths(entries, {
++            [previous.id]: tombstone(previous, pubkey),
++          }),
++        );
++      }
++    },
++    [commit, month, pubkey, relayUrl],
++  );
++
++  const deleteEntry = React.useCallback(
++    (id: string): Promise<void> =>
++      commit((entries) => {
++        const entry = entries[id];
++        return entry && !entry.deleted
++          ? mergeMonths(entries, { [id]: tombstone(entry, pubkey) })
++          : entries;
++      }),
++    [commit, pubkey],
++  );
++
++  /** Publishes again after a failed save (nothing to do when all is saved). */
++  const retry = React.useCallback(
++    () => commit((entries) => entries),
++    [commit],
++  );
++
++  return {
++    entries: current.entries,
++    status: current.status,
++    saveEntry,
++    deleteEntry,
++    retry,
++  };
++}
+diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+new file mode 100644
+index 0000000..3e568f4
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+@@ -0,0 +1,469 @@
++import { ChevronLeft, ChevronRight, Pencil, Plus, Trash2 } from "lucide-react";
++import * as React from "react";
++import { toast } from "sonner";
++
++import {
++  type CalendarEntry,
++  MAX_NOTE_LENGTH,
++  MAX_TITLE_LENGTH,
++  entriesByDate,
++  monthGrid,
++  monthOfDate,
++  shiftMonth,
++  todayKey,
++} from "@/features/team-calendar/lib/teamCalendar";
++import {
++  type CalendarEntryInput,
++  useTeamCalendarMonth,
++} from "@/features/team-calendar/lib/useTeamCalendar";
++import { cn } from "@/shared/lib/cn";
++import { Button } from "@/shared/ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogHeader,
++  DialogTitle,
++} from "@/shared/ui/dialog";
++import { Input } from "@/shared/ui/input";
++import { Textarea } from "@/shared/ui/textarea";
++
++const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"] as const;
++const MAX_TITLES_PER_CELL = 2;
++
++type Draft = {
++  id?: string;
++  title: string;
++  date: string;
++  time: string;
++  note: string;
++};
++
++function monthLabel(month: string): string {
++  const [year, value] = month.split("-").map(Number);
++  return `${year}년 ${value}월`;
++}
++
++function dateLabel(date: string): string {
++  const [year, month, day] = date.split("-").map(Number) as [
++    number,
++    number,
++    number,
++  ];
++  const weekday = WEEKDAYS[new Date(year, month - 1, day).getDay()];
++  return `${month}월 ${day}일 (${weekday})`;
++}
++
++function errorMessage(error: unknown, fallback: string): string {
++  return error instanceof Error && error.message ? error.message : fallback;
++}
++
++type TeamCalendarDialogProps = {
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
++  pubkey: string;
++  relayUrl: string;
++};
++
++/**
++ * Team calendar (team patch): a month grid every member of the community
++ * shares. Any member can add, edit, or delete an entry.
++ */
++export function TeamCalendarDialog({
++  open,
++  onOpenChange,
++  pubkey,
++  relayUrl,
++}: TeamCalendarDialogProps) {
++  const [selectedDate, setSelectedDate] = React.useState(() => todayKey());
++  const [month, setMonth] = React.useState(() => monthOfDate(todayKey()));
++  const [draft, setDraft] = React.useState<Draft | null>(null);
++  const [saving, setSaving] = React.useState(false);
++  const [unsaved, setUnsaved] = React.useState(false);
++  // Deleting takes two clicks on the same entry (no native confirm dialog).
++  const [confirmingId, setConfirmingId] = React.useState<string | null>(null);
++
++  const { entries, status, saveEntry, deleteEntry, retry } =
++    useTeamCalendarMonth(pubkey, relayUrl, month);
++
++  const byDate = React.useMemo(() => entriesByDate(entries), [entries]);
++  const cells = React.useMemo(() => monthGrid(month), [month]);
++  const today = todayKey();
++  const selectedEntries = byDate[selectedDate] ?? [];
++
++  const goToMonth = (next: string) => {
++    setMonth(next);
++    setDraft(null);
++    // Keep a day of the visible month selected.
++    setSelectedDate((current) =>
++      monthOfDate(current) === next
++        ? current
++        : monthOfDate(today) === next
++          ? today
++          : `${next}-01`,
++    );
++  };
++
++  const selectDate = (date: string) => {
++    setSelectedDate(date);
++    setDraft(null);
++    setConfirmingId(null);
++    if (monthOfDate(date) !== month) setMonth(monthOfDate(date));
++  };
++
++  const run = async (action: () => Promise<void>, failure: string) => {
++    setSaving(true);
++    try {
++      await action();
++      setUnsaved(false);
++      return true;
++    } catch (error) {
++      setUnsaved(true);
++      toast.error(errorMessage(error, failure));
++      return false;
++    } finally {
++      setSaving(false);
++    }
++  };
++
++  const submitDraft = async (event: React.FormEvent) => {
++    event.preventDefault();
++    if (!draft || saving) return;
++    const title = draft.title.trim();
++    if (title.length === 0 || draft.date.length === 0) return;
++    const input: CalendarEntryInput = {
++      id: draft.id,
++      title,
++      date: draft.date,
++      time: draft.time || undefined,
++      note: draft.note.trim() || undefined,
++    };
++    const saved = await run(
++      () => saveEntry(input),
++      "일정을 저장하지 못했습니다.",
++    );
++    if (!saved) return;
++    setDraft(null);
++    selectDate(input.date);
++  };
++
++  const removeEntry = (entry: CalendarEntry) => {
++    if (saving) return;
++    if (confirmingId !== entry.id) {
++      setConfirmingId(entry.id);
++      return;
++    }
++    setConfirmingId(null);
++    void run(() => deleteEntry(entry.id), "일정을 삭제하지 못했습니다.");
++  };
++
++  return (
++    <Dialog onOpenChange={onOpenChange} open={open}>
++      <DialogContent
++        className="max-w-4xl"
++        data-no-translate=""
++        data-testid="team-calendar-dialog"
++      >
++        <DialogHeader>
++          <DialogTitle>팀 캘린더</DialogTitle>
++          <DialogDescription>
++            이 커뮤니티의 모든 멤버가 함께 보고 고칠 수 있는 일정입니다.
++          </DialogDescription>
++        </DialogHeader>
++
++        <div className="flex flex-col gap-4 md:flex-row">
++          <section aria-label="달력" className="min-w-0 flex-1">
++            <div className="mb-2 flex items-center gap-1">
++              <Button
++                aria-label="이전 달"
++                onClick={() => goToMonth(shiftMonth(month, -1))}
++                size="icon"
++                type="button"
++                variant="ghost"
++              >
++                <ChevronLeft className="h-4 w-4" />
++              </Button>
++              <h3
++                aria-live="polite"
++                className="min-w-28 text-center text-sm font-semibold"
++              >
++                {monthLabel(month)}
++              </h3>
++              <Button
++                aria-label="다음 달"
++                onClick={() => goToMonth(shiftMonth(month, 1))}
++                size="icon"
++                type="button"
++                variant="ghost"
++              >
++                <ChevronRight className="h-4 w-4" />
++              </Button>
++              <Button
++                className="ml-auto"
++                onClick={() => selectDate(today)}
++                size="sm"
++                type="button"
++                variant="outline"
++              >
++                오늘
++              </Button>
++            </div>
++
++            <div className="grid grid-cols-7 text-center text-xs text-muted-foreground">
++              {WEEKDAYS.map((weekday) => (
++                <div className="py-1" key={weekday}>
++                  {weekday}
++                </div>
++              ))}
++            </div>
++            <div className="grid grid-cols-7 gap-px overflow-hidden rounded-lg border border-border/60 bg-border/60">
++              {cells.map((cell) => {
++                const dayEntries = byDate[cell.date] ?? [];
++                const isSelected = cell.date === selectedDate;
++                return (
++                  <button
++                    aria-label={`${dateLabel(cell.date)}, 일정 ${dayEntries.length}개`}
++                    aria-pressed={isSelected}
++                    className={cn(
++                      "flex h-20 min-w-0 flex-col items-stretch gap-0.5 bg-background p-1 text-left transition-colors hover:bg-muted/70 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring",
++                      !cell.inMonth && "text-muted-foreground/50",
++                      isSelected && "bg-accent hover:bg-accent",
++                    )}
++                    data-testid={`team-calendar-day-${cell.date}`}
++                    key={cell.date}
++                    onClick={() => selectDate(cell.date)}
++                    type="button"
++                  >
++                    <span
++                      className={cn(
++                        "flex h-5 w-5 items-center justify-center self-start rounded-full text-xs",
++                        cell.date === today &&
++                          "bg-primary font-semibold text-primary-foreground",
++                      )}
++                    >
++                      {cell.day}
++                    </span>
++                    {dayEntries.slice(0, MAX_TITLES_PER_CELL).map((entry) => (
++                      <span
++                        className="truncate rounded bg-primary/15 px-1 text-2xs text-foreground"
++                        key={entry.id}
++                      >
++                        {entry.title}
++                      </span>
++                    ))}
++                    {dayEntries.length > MAX_TITLES_PER_CELL ? (
++                      <span className="px-1 text-2xs text-muted-foreground">
++                        +{dayEntries.length - MAX_TITLES_PER_CELL}
++                      </span>
++                    ) : null}
++                  </button>
++                );
++              })}
++            </div>
++            <p
++              aria-live="polite"
++              className="mt-2 min-h-4 text-xs text-muted-foreground"
++            >
++              {status === "loading" ? "일정을 불러오는 중…" : null}
++              {status === "error"
++                ? "일정을 불러오지 못했습니다. 연결을 확인해 주세요."
++                : null}
++            </p>
++          </section>
++
++          <section
++            aria-label={`${dateLabel(selectedDate)} 일정`}
++            className="flex w-full shrink-0 flex-col gap-3 md:w-72"
++          >
++            <div className="flex items-center justify-between gap-2">
++              <h3 className="text-sm font-semibold">
++                {dateLabel(selectedDate)}
++              </h3>
++              {draft ? null : (
++                <Button
++                  data-testid="team-calendar-add"
++                  onClick={() =>
++                    setDraft({
++                      title: "",
++                      date: selectedDate,
++                      time: "",
++                      note: "",
++                    })
++                  }
++                  size="sm"
++                  type="button"
++                >
++                  <Plus className="h-4 w-4" />
++                  일정 추가
++                </Button>
++              )}
++            </div>
++
++            {unsaved ? (
++              <div className="flex items-center justify-between gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs">
++                <span>저장되지 않은 변경이 있습니다.</span>
++                <Button
++                  disabled={saving}
++                  onClick={() =>
++                    void run(retry, "다시 저장하지 못했습니다.")
++                  }
++                  size="xs"
++                  type="button"
++                  variant="outline"
++                >
++                  다시 저장
++                </Button>
++              </div>
++            ) : null}
++
++            {draft ? (
++              <form
++                className="flex flex-col gap-2"
++                data-testid="team-calendar-form"
++                onSubmit={(event) => void submitDraft(event)}
++              >
++                <label className="flex flex-col gap-1 text-xs">
++                  제목
++                  <Input
++                    autoFocus
++                    maxLength={MAX_TITLE_LENGTH}
++                    onChange={(event) =>
++                      setDraft({ ...draft, title: event.target.value })
++                    }
++                    placeholder="예: 기획 회의"
++                    required
++                    value={draft.title}
++                  />
++                </label>
++                <div className="flex gap-2">
++                  <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
++                    날짜
++                    <Input
++                      onChange={(event) =>
++                        setDraft({ ...draft, date: event.target.value })
++                      }
++                      required
++                      type="date"
++                      value={draft.date}
++                    />
++                  </label>
++                  <label className="flex w-28 flex-col gap-1 text-xs">
++                    시간 (선택)
++                    <Input
++                      onChange={(event) =>
++                        setDraft({ ...draft, time: event.target.value })
++                      }
++                      type="time"
++                      value={draft.time}
++                    />
++                  </label>
++                </div>
++                <label className="flex flex-col gap-1 text-xs">
++                  메모 (선택)
++                  <Textarea
++                    maxLength={MAX_NOTE_LENGTH}
++                    onChange={(event) =>
++                      setDraft({ ...draft, note: event.target.value })
++                    }
++                    rows={3}
++                    value={draft.note}
++                  />
++                </label>
++                <div className="flex justify-end gap-2">
++                  <Button
++                    disabled={saving}
++                    onClick={() => setDraft(null)}
++                    size="sm"
++                    type="button"
++                    variant="ghost"
++                  >
++                    취소
++                  </Button>
++                  <Button
++                    disabled={saving || draft.title.trim().length === 0}
++                    size="sm"
++                    type="submit"
++                  >
++                    {draft.id ? "수정 저장" : "저장"}
++                  </Button>
++                </div>
++              </form>
++            ) : selectedEntries.length === 0 ? (
++              <p className="text-sm text-muted-foreground">
++                이 날에는 일정이 없습니다.
++              </p>
++            ) : (
++              <ul className="flex max-h-80 flex-col gap-2 overflow-y-auto">
++                {selectedEntries.map((entry) => (
++                  <li
++                    className="rounded-lg border border-border/60 px-3 py-2"
++                    data-testid="team-calendar-entry"
++                    key={entry.id}
++                  >
++                    <div className="flex items-start gap-2">
++                      <div className="min-w-0 flex-1">
++                        <p className="break-words text-sm font-medium">
++                          {entry.title}
++                        </p>
++                        <p className="text-xs text-muted-foreground">
++                          {entry.time ?? "하루 종일"}
++                        </p>
++                      </div>
++                      <Button
++                        aria-label={`${entry.title} 수정`}
++                        disabled={saving}
++                        onClick={() =>
++                          setDraft({
++                            id: entry.id,
++                            title: entry.title,
++                            date: entry.date,
++                            time: entry.time ?? "",
++                            note: entry.note ?? "",
++                          })
++                        }
++                        size="icon-xs"
++                        type="button"
++                        variant="ghost"
++                      >
++                        <Pencil />
++                      </Button>
++                      {confirmingId === entry.id ? (
++                        <Button
++                          aria-label={`${entry.title} 삭제 확인`}
++                          disabled={saving}
++                          onBlur={() => setConfirmingId(null)}
++                          onClick={() => removeEntry(entry)}
++                          size="xs"
++                          type="button"
++                          variant="destructive"
++                        >
++                          삭제 확인
++                        </Button>
++                      ) : (
++                        <Button
++                          aria-label={`${entry.title} 삭제`}
++                          disabled={saving}
++                          onClick={() => removeEntry(entry)}
++                          size="icon-xs"
++                          type="button"
++                          variant="ghost"
++                        >
++                          <Trash2 />
++                        </Button>
++                      )}
++                    </div>
++                    {entry.note ? (
++                      <p className="mt-1 whitespace-pre-wrap break-words text-xs text-muted-foreground">
++                        {entry.note}
++                      </p>
++                    ) : null}
++                  </li>
++                ))}
++              </ul>
++            )}
++          </section>
++        </div>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
+new file mode 100644
+index 0000000..d601433
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
+@@ -0,0 +1,43 @@
++import { CalendarDays } from "lucide-react";
++import * as React from "react";
++
++import { SidebarMenuButton, SidebarMenuItem } from "@/shared/ui/sidebar";
++import { SidebarMenuLabel } from "@/shared/ui/sidebar-menu-label";
++import { TeamCalendarDialog } from "./TeamCalendarDialog";
++
++/**
++ * Sidebar entry for the team calendar (team patch). The dialog is mounted
++ * only while open, so the calendar's relay subscription exists only then.
++ */
++export function TeamCalendarSidebarEntry({
++  pubkey,
++  relayUrl,
++}: {
++  pubkey?: string;
++  relayUrl?: string;
++}) {
++  const [open, setOpen] = React.useState(false);
++  if (!pubkey || !relayUrl) return null;
++
++  return (
++    <SidebarMenuItem data-no-translate="">
++      <SidebarMenuButton
++        data-testid="open-team-calendar"
++        onClick={() => setOpen(true)}
++        tooltip="팀 캘린더"
++        type="button"
++      >
++        <CalendarDays className="h-4 w-4" />
++        <SidebarMenuLabel>캘린더</SidebarMenuLabel>
++      </SidebarMenuButton>
++      {open ? (
++        <TeamCalendarDialog
++          onOpenChange={setOpen}
++          open={open}
++          pubkey={pubkey}
++          relayUrl={relayUrl}
++        />
++      ) : null}
++    </SidebarMenuItem>
++  );
++}

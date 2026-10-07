@@ -27,6 +27,10 @@ on:
         description: "Send to team apps as an update. Leave OFF for a test build."
         type: boolean
         default: false
+      check_only:
+        description: "Only apply the patches and run typecheck + tests (about 7 minutes). Builds and publishes nothing."
+        type: boolean
+        default: false
 
 concurrency:
   group: team-release
@@ -157,6 +161,7 @@ jobs:
   build:
     name: Build macOS (${{ matrix.arch }})
     needs: [setup, check]
+    if: ${{ !inputs.check_only }}
     runs-on: macos-latest
     timeout-minutes: 90
     strategy:
