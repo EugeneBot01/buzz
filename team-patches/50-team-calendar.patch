@@ -1,5 +1,5 @@
 diff --git a/desktop/src/features/sidebar/ui/AppSidebar.tsx b/desktop/src/features/sidebar/ui/AppSidebar.tsx
-index 22f10c6..a434db3 100644
+index 22f10c68d..a434db37f 100644
 --- a/desktop/src/features/sidebar/ui/AppSidebar.tsx
 +++ b/desktop/src/features/sidebar/ui/AppSidebar.tsx
 @@ -18,6 +18,7 @@ import {
@@ -24,7 +24,7 @@ index 22f10c6..a434db3 100644
                  onSelectAgents={onSelectAgents}
                  onSelectHome={onSelectHome}
 diff --git a/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx b/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
-index 660f7d9..4605704 100644
+index 660f7d9a8..460570469 100644
 --- a/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
 +++ b/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
 @@ -1,4 +1,5 @@
@@ -60,25 +60,33 @@ index 660f7d9..4605704 100644
        <SidebarProjectsSection />
 diff --git a/desktop/src/features/team-calendar/lib/teamCalendar.test.mjs b/desktop/src/features/team-calendar/lib/teamCalendar.test.mjs
 new file mode 100644
-index 0000000..9f0e54a
+index 000000000..82fb933fd
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/teamCalendar.test.mjs
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,415 @@
 +import assert from "node:assert/strict";
 +import test from "node:test";
 +
 +import {
++  MAX_SPAN_DAYS,
 +  MAX_TEAM_CALENDAR_CONTENT_BYTES,
++  addDays,
++  combineMonths,
++  daysBetween,
 +  decodeMonth,
 +  encodeForPublish,
 +  encodeMonth,
 +  entriesByDate,
++  entriesOnDate,
 +  hasNewerEntries,
 +  mergeMonthEvents,
 +  mergeMonths,
 +  monthGrid,
++  monthsAround,
 +  shiftMonth,
 +  teamCalendarDTag,
++  validateRange,
++  weekSegments,
 +} from "./teamCalendar.ts";
 +
 +const ALICE = "a".repeat(64);
@@ -140,12 +148,38 @@ index 0000000..9f0e54a
 +  const raw = JSON.stringify({
 +    v: 1,
 +    entries: {
-+      ok: { title: " Trim me ", date: "2026-10-01", updatedAt: 5, updatedBy: BOB },
-+      wrongMonth: { title: "x", date: "2026-11-01", updatedAt: 5, updatedBy: BOB },
++      ok: {
++        title: " Trim me ",
++        date: "2026-10-01",
++        updatedAt: 5,
++        updatedBy: BOB,
++      },
++      wrongMonth: {
++        title: "x",
++        date: "2026-11-01",
++        updatedAt: 5,
++        updatedBy: BOB,
++      },
 +      badDate: { title: "x", date: "2026-10-32", updatedAt: 5, updatedBy: BOB },
-+      noTitle: { title: "  ", date: "2026-10-01", updatedAt: 5, updatedBy: BOB },
-+      badAuthor: { title: "x", date: "2026-10-01", updatedAt: 5, updatedBy: "me" },
-+      badTime: { title: "x", date: "2026-10-01", time: "25:00", updatedAt: 5, updatedBy: BOB },
++      noTitle: {
++        title: "  ",
++        date: "2026-10-01",
++        updatedAt: 5,
++        updatedBy: BOB,
++      },
++      badAuthor: {
++        title: "x",
++        date: "2026-10-01",
++        updatedAt: 5,
++        updatedBy: "me",
++      },
++      badTime: {
++        title: "x",
++        date: "2026-10-01",
++        time: "25:00",
++        updatedAt: 5,
++        updatedBy: BOB,
++      },
 +    },
 +  });
 +  const decoded = decodeMonth(raw, "2026-10");
@@ -172,7 +206,10 @@ index 0000000..9f0e54a
 +  );
 +  assert.equal(mergeMonths(merged, deleted).a.deleted, true);
 +  assert.equal(mergeMonths(deleted, merged).a.deleted, true);
-+  assert.deepEqual(entriesByDate(mergeMonths(merged, deleted))["2026-10-07"].map((e) => e.id), ["b"]);
++  assert.deepEqual(
++    entriesByDate(mergeMonths(merged, deleted))["2026-10-07"].map((e) => e.id),
++    ["b"],
++  );
 +});
 +
 +test("entries are listed by date, timed before all-day", () => {
@@ -183,8 +220,14 @@ index 0000000..9f0e54a
 +    entry("first", { date: "2026-10-01" }),
 +  );
 +  const grouped = entriesByDate(month);
-+  assert.deepEqual(grouped["2026-10-07"].map((e) => e.id), ["early", "late", "allday"]);
-+  assert.deepEqual(grouped["2026-10-01"].map((e) => e.id), ["first"]);
++  assert.deepEqual(
++    grouped["2026-10-07"].map((e) => e.id),
++    ["early", "late", "allday"],
++  );
++  assert.deepEqual(
++    grouped["2026-10-01"].map((e) => e.id),
++    ["first"],
++  );
 +});
 +
 +test("every member's newest event is merged and my own is tracked", () => {
@@ -196,7 +239,12 @@ index 0000000..9f0e54a
 +    ev(BOB, monthOf(entry("b", { updatedBy: BOB })), 150, dTag),
 +    ev(BOB, monthOf(entry("elsewhere", { updatedBy: BOB })), 999, other),
 +  ];
-+  const { merged, own, ownCreatedAt } = mergeMonthEvents(events, dTag, "2026-10", ALICE);
++  const { merged, own, ownCreatedAt } = mergeMonthEvents(
++    events,
++    dTag,
++    "2026-10",
++    ALICE,
++  );
 +  assert.deepEqual(Object.keys(merged).sort(), ["a", "b"]);
 +  assert.equal(merged.a.title, "Mine");
 +  assert.equal(ownCreatedAt, 200);
@@ -221,21 +269,222 @@ index 0000000..9f0e54a
 +  );
 +  const content = encodeForPublish(monthOf(...live, ...deletions));
 +  assert.ok(content);
-+  assert.ok(new TextEncoder().encode(content).length <= MAX_TEAM_CALENDAR_CONTENT_BYTES);
++  assert.ok(
++    new TextEncoder().encode(content).length <= MAX_TEAM_CALENDAR_CONTENT_BYTES,
++  );
 +  const kept = decodeMonth(content, "2026-10");
 +  assert.equal(Object.values(kept).filter((e) => !e.deleted).length, 30);
 +  assert.ok(!kept["gone-00"], "oldest deletion dropped first");
 +  assert.ok(kept["gone-59"], "newest deletion kept");
 +
-+  const tooMany = Array.from({ length: 80 }, (_, i) => entry(`x-${i}`, { note }));
++  const tooMany = Array.from({ length: 80 }, (_, i) =>
++    entry(`x-${i}`, { note }),
++  );
 +  assert.equal(encodeForPublish(monthOf(...tooMany)), null);
++});
++
++const WEEK = [
++  "2026-10-04",
++  "2026-10-05",
++  "2026-10-06",
++  "2026-10-07",
++  "2026-10-08",
++  "2026-10-09",
++  "2026-10-10",
++];
++
++test("day arithmetic crosses month, year and daylight-saving changes", () => {
++  assert.equal(addDays("2026-10-30", 3), "2026-11-02");
++  assert.equal(addDays("2026-12-31", 1), "2027-01-01");
++  assert.equal(addDays("2026-03-01", -1), "2026-02-28");
++  assert.equal(daysBetween("2026-03-28", "2026-03-30"), 2);
++  assert.equal(daysBetween("2026-10-31", "2026-11-02"), 2);
++  assert.equal(daysBetween("2026-10-05", "2026-10-04"), -1);
++  assert.deepEqual(monthsAround("2026-01"), ["2025-12", "2026-01", "2026-02"]);
++});
++
++test("range, end time and color survive a round trip", () => {
++  const trip = entry("t", {
++    time: "14:00",
++    endDate: "2026-10-09",
++    endTime: "11:30",
++    color: "green",
++  });
++  const back = decodeMonth(encodeMonth(monthOf(trip)), "2026-10").t;
++  assert.equal(back.endDate, "2026-10-09");
++  assert.equal(back.endTime, "11:30");
++  assert.equal(back.color, "green");
++});
++
++test("an entry without a range or color reads as before", () => {
++  const plain = decodeMonth(encodeMonth(monthOf(entry("p"))), "2026-10").p;
++  assert.equal(plain.endDate, undefined);
++  assert.equal(plain.endTime, undefined);
++  assert.equal(plain.color, undefined);
++});
++
++test("a bad range is dropped but the entry stays on its start day", () => {
++  const bad = (overrides) =>
++    decodeMonth(encodeMonth(monthOf(entry("b", overrides))), "2026-10").b;
++  // Ends before it starts, is not a date, is too long, or is the same day.
++  for (const endDate of ["2026-10-06", "nope", "2026-12-25", "2026-10-07"]) {
++    const read = bad({ endDate });
++    assert.ok(read, endDate);
++    assert.equal(read.endDate, undefined, endDate);
++  }
++  assert.equal(
++    bad({ endDate: addDays("2026-10-07", MAX_SPAN_DAYS - 1) }).endDate,
++    "2026-11-03",
++  );
++  assert.equal(
++    bad({ endDate: addDays("2026-10-07", MAX_SPAN_DAYS) }).endDate,
++    undefined,
++  );
++  // An end time needs a start time; an unknown color is ignored.
++  assert.equal(bad({ endTime: "10:00" }).endTime, undefined);
++  assert.equal(bad({ color: "chartreuse" }).color, undefined);
++});
++
++test("the copy that kept the range wins over a stripped copy of the same edit", () => {
++  const full = entry("r", { endDate: "2026-10-09", color: "red" });
++  const stripped = entry("r");
++  assert.equal(
++    mergeMonths(monthOf(stripped), monthOf(full)).r.endDate,
++    "2026-10-09",
++  );
++  assert.equal(
++    mergeMonths(monthOf(full), monthOf(stripped)).r.endDate,
++    "2026-10-09",
++  );
++  // A real later edit still wins even without the range.
++  const later = entry("r", { updatedAt: 2_000 });
++  assert.equal(mergeMonths(monthOf(full), monthOf(later)).r.endDate, undefined);
++  assert.equal(hasNewerEntries(monthOf(full), monthOf(stripped)), true);
++});
++
++test("a moved entry is not hidden by the deletion left in its old month", () => {
++  const moved = entry("m", { date: "2026-11-02", updatedAt: 1_000 });
++  const left = {
++    id: "m",
++    title: "",
++    date: "2026-10-30",
++    updatedAt: 2_000,
++    updatedBy: ALICE,
++    deleted: true,
++  };
++  const listed = combineMonths([monthOf(left), monthOf(moved)]);
++  assert.deepEqual(
++    listed.map((value) => value.date),
++    ["2026-11-02"],
++  );
++  // An interrupted move leaves two live copies: the newer one is kept.
++  const older = entry("d", { date: "2026-10-30", updatedAt: 1_000 });
++  const newer = entry("d", { date: "2026-11-02", updatedAt: 2_000 });
++  assert.deepEqual(
++    combineMonths([monthOf(older), monthOf(newer)]).map((value) => value.date),
++    ["2026-11-02"],
++  );
++});
++
++test("an entry covers every day from its start to its end", () => {
++  const trip = entry("t", { date: "2026-10-05", endDate: "2026-10-07" });
++  const one = entry("o", { date: "2026-10-06" });
++  const all = [trip, one];
++  assert.deepEqual(
++    entriesOnDate(all, "2026-10-04").map((v) => v.id),
++    [],
++  );
++  assert.deepEqual(
++    entriesOnDate(all, "2026-10-05").map((v) => v.id),
++    ["t"],
++  );
++  assert.deepEqual(
++    entriesOnDate(all, "2026-10-06").map((v) => v.id),
++    ["t", "o"],
++  );
++  assert.deepEqual(
++    entriesOnDate(all, "2026-10-07").map((v) => v.id),
++    ["t"],
++  );
++  assert.deepEqual(
++    entriesOnDate(all, "2026-10-08").map((v) => v.id),
++    [],
++  );
++});
++
++test("week bars start in the right column and are cut at the week edges", () => {
++  const trip = entry("t", { date: "2026-10-01", endDate: "2026-10-06" });
++  const next = entry("n", { date: "2026-10-09", endDate: "2026-10-14" });
++  const out = entry("x", { date: "2026-10-20" });
++  const bars = weekSegments([trip, next, out], WEEK);
++  assert.equal(bars.length, 2);
++  const [a, b] = bars;
++  assert.deepEqual(
++    [a.entry.id, a.startColumn, a.span, a.continuesBefore, a.continuesAfter],
++    ["t", 0, 3, true, false],
++  );
++  assert.deepEqual(
++    [b.entry.id, b.startColumn, b.span, b.continuesBefore, b.continuesAfter],
++    ["n", 5, 2, false, true],
++  );
++});
++
++test("overlapping bars take different lanes and a free lane is reused", () => {
++  const long = entry("a", { date: "2026-10-04", endDate: "2026-10-08" });
++  const mid = entry("b", { date: "2026-10-05", endDate: "2026-10-06" });
++  const late = entry("c", { date: "2026-10-09" });
++  const lane = Object.fromEntries(
++    weekSegments([mid, late, long], WEEK).map((bar) => [
++      bar.entry.id,
++      bar.lane,
++    ]),
++  );
++  // The longer entry sits on top; the later one slides into the free lane 0.
++  assert.deepEqual(lane, { a: 0, b: 1, c: 0 });
++});
++
++test("the range is checked before it is saved", () => {
++  assert.equal(validateRange({ date: "2026-10-07" }), null);
++  assert.equal(
++    validateRange({ date: "2026-10-07", endDate: "2026-10-09" }),
++    null,
++  );
++  assert.equal(
++    validateRange({
++      date: "2026-10-07",
++      time: "09:00",
++      endDate: "2026-10-09",
++      endTime: "08:00",
++    }),
++    null,
++  );
++  assert.match(
++    validateRange({ date: "2026-10-07", endDate: "2026-10-06" }),
++    /빠를 수 없/,
++  );
++  assert.match(
++    validateRange({ date: "2026-10-07", time: "09:00", endTime: "09:00" }),
++    /늦어야/,
++  );
++  assert.match(
++    validateRange({ date: "2026-10-07", endTime: "09:00" }),
++    /시작 시간/,
++  );
++  assert.match(
++    validateRange({ date: "2026-10-07", endDate: "2026-12-01" }),
++    /최대 28일/,
++  );
++  assert.equal(
++    validateRange({ date: "2026-10-07", endDate: "2026-11-03" }),
++    null,
++  );
 +});
 diff --git a/desktop/src/features/team-calendar/lib/teamCalendar.ts b/desktop/src/features/team-calendar/lib/teamCalendar.ts
 new file mode 100644
-index 0000000..a31e84d
+index 000000000..9c32bbe2c
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/teamCalendar.ts
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,501 @@
 +import type { RelayEvent } from "@/shared/api/types";
 +import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
 +
@@ -264,13 +513,42 @@ index 0000000..a31e84d
 +export const MAX_TITLE_LENGTH = 120;
 +export const MAX_NOTE_LENGTH = 1_000;
 +
++/**
++ * Longest entry, in days. An entry is stored in the month it starts in and the
++ * calendar reads the month before and after the visible one, so a span this
++ * short can never start outside what is read (a 28-day span that starts in
++ * month M-2 ends before month M begins).
++ */
++export const MAX_SPAN_DAYS = 28;
++
++/** Bar colors an entry can have. No color is the default look. */
++export const CALENDAR_COLORS = [
++  "red",
++  "orange",
++  "green",
++  "blue",
++  "purple",
++  "pink",
++  "gray",
++] as const;
++export type CalendarColor = (typeof CALENDAR_COLORS)[number];
++
++const isCalendarColor = (value: unknown): value is CalendarColor =>
++  typeof value === "string" &&
++  (CALENDAR_COLORS as readonly string[]).includes(value);
++
 +export type CalendarEntry = {
 +  id: string;
 +  title: string;
-+  /** Local calendar date, `YYYY-MM-DD`. */
++  /** Local start date, `YYYY-MM-DD`. */
 +  date: string;
 +  /** Optional local start time, `HH:MM` (24h). */
 +  time?: string;
++  /** Last day of a multi-day entry, `YYYY-MM-DD`; absent for a one-day entry. */
++  endDate?: string;
++  /** Optional local end time on the last day, `HH:MM`; needs `time`. */
++  endTime?: string;
++  color?: CalendarColor;
 +  note?: string;
 +  /** Milliseconds since epoch of the last edit. */
 +  updatedAt: number;
@@ -303,6 +581,43 @@ index 0000000..a31e84d
 +export function todayKey(now: Date = new Date()): string {
 +  return dateKey(now.getFullYear(), now.getMonth() + 1, now.getDate());
 +}
++
++const dayNumber = (date: string) => {
++  const [year, month, day] = date.split("-").map(Number) as [
++    number,
++    number,
++    number,
++  ];
++  // UTC so a daylight-saving change never makes a day 23 or 25 hours long.
++  return Math.round(Date.UTC(year, month - 1, day) / 86_400_000);
++};
++
++/** Whole days from `from` to `to` (negative when `to` is earlier). */
++export const daysBetween = (from: string, to: string) =>
++  dayNumber(to) - dayNumber(from);
++
++/** The date `count` days after (or, when negative, before) `date`. */
++export function addDays(date: string, count: number): string {
++  const [year, month, day] = date.split("-").map(Number) as [
++    number,
++    number,
++    number,
++  ];
++  const shifted = new Date(Date.UTC(year, month - 1, day + count));
++  return dateKey(
++    shifted.getUTCFullYear(),
++    shifted.getUTCMonth() + 1,
++    shifted.getUTCDate(),
++  );
++}
++
++/** The last day of an entry (its start day for a one-day entry). */
++export const entryEndDate = (entry: CalendarEntry) =>
++  entry.endDate ?? entry.date;
++
++/** The months a month view reads: the one before, the month itself, the next. */
++export const monthsAround = (month: string) =>
++  [shiftMonth(month, -1), month, shiftMonth(month, 1)] as const;
 +
 +/** The month before (`step = -1`) or after (`step = 1`) a `YYYY-MM` key. */
 +export function shiftMonth(month: string, step: number): string {
@@ -374,6 +689,22 @@ index 0000000..a31e84d
 +  };
 +  if (typeof value.time === "string" && TIME_PATTERN.test(value.time))
 +    entry.time = value.time;
++  // A bad range is dropped, not the entry: it still shows on its start day.
++  if (
++    typeof value.endDate === "string" &&
++    DATE_PATTERN.test(value.endDate) &&
++    daysBetween(value.date, value.endDate) > 0 &&
++    daysBetween(value.date, value.endDate) < MAX_SPAN_DAYS
++  ) {
++    entry.endDate = value.endDate;
++  }
++  if (
++    entry.time &&
++    typeof value.endTime === "string" &&
++    TIME_PATTERN.test(value.endTime)
++  )
++    entry.endTime = value.endTime;
++  if (isCalendarColor(value.color)) entry.color = value.color;
 +  if (typeof value.note === "string" && value.note.trim().length > 0)
 +    entry.note = value.note.trim().slice(0, MAX_NOTE_LENGTH);
 +  if (deleted) entry.deleted = true;
@@ -409,13 +740,24 @@ index 0000000..a31e84d
 +  return JSON.stringify({ v: 1, entries });
 +}
 +
-+/** True when `candidate` replaces `current` (later edit, then higher pubkey). */
++/** How many of the range and color fields an entry carries. */
++const richness = (entry: CalendarEntry) =>
++  (entry.endDate ? 1 : 0) + (entry.endTime ? 1 : 0) + (entry.color ? 1 : 0);
++
++/**
++ * True when `candidate` replaces `current` (later edit, then higher pubkey).
++ * For the very same edit, the copy that kept the range and color wins: an app
++ * from before those fields existed republishes entries without them, and its
++ * copy must not hide the real one.
++ */
 +function wins(candidate: CalendarEntry, current: CalendarEntry): boolean {
 +  if (candidate.updatedAt !== current.updatedAt)
 +    return candidate.updatedAt > current.updatedAt;
 +  if (candidate.updatedBy !== current.updatedBy)
 +    return candidate.updatedBy > current.updatedBy;
-+  return candidate.deleted === true && current.deleted !== true;
++  if (candidate.deleted !== current.deleted)
++    return candidate.deleted === true && current.deleted !== true;
++  return richness(candidate) > richness(current);
 +}
 +
 +/** Merges month copies entry by entry. Returns `base` when nothing changed. */
@@ -446,17 +788,126 @@ index 0000000..a31e84d
 +  });
 +}
 +
++const byDisplayOrder = (a: CalendarEntry, b: CalendarEntry) =>
++  a.date.localeCompare(b.date) ||
++  (a.time ?? "99:99").localeCompare(b.time ?? "99:99") ||
++  a.title.localeCompare(b.title) ||
++  a.id.localeCompare(b.id);
++
 +/** Live entries, ordered by date, then timed before all-day by time, then title. */
 +export function liveEntries(month: CalendarMonth): CalendarEntry[] {
 +  return Object.values(month)
 +    .filter((entry) => !entry.deleted)
-+    .sort(
-+      (a, b) =>
-+        a.date.localeCompare(b.date) ||
-+        (a.time ?? "99:99").localeCompare(b.time ?? "99:99") ||
-+        a.title.localeCompare(b.title) ||
-+        a.id.localeCompare(b.id),
-+    );
++    .sort(byDisplayOrder);
++}
++
++/**
++ * Live entries of several months as one list. An entry that was moved to
++ * another month leaves a deletion behind in the old one, so months are not
++ * merged by id (the deletion would hide the moved entry); deletions are just
++ * dropped, and if an interrupted move left a live copy in both months the
++ * newer one is kept.
++ */
++export function combineMonths(months: CalendarMonth[]): CalendarEntry[] {
++  const byId = new Map<string, CalendarEntry>();
++  for (const month of months) {
++    for (const entry of Object.values(month)) {
++      if (entry.deleted) continue;
++      const current = byId.get(entry.id);
++      if (!current || entry.updatedAt > current.updatedAt)
++        byId.set(entry.id, entry);
++    }
++  }
++  return [...byId.values()].sort(byDisplayOrder);
++}
++
++/** The entries that cover `date`, from the first day to the last. */
++export function entriesOnDate(
++  entries: CalendarEntry[],
++  date: string,
++): CalendarEntry[] {
++  return entries.filter(
++    (entry) => entry.date <= date && date <= entryEndDate(entry),
++  );
++}
++
++/** One entry's bar within one week row of the month grid. */
++export type WeekSegment = {
++  entry: CalendarEntry;
++  /** Column of the first day shown in this week, 0 (Sunday) to 6. */
++  startColumn: number;
++  /** Days shown in this week. */
++  span: number;
++  /** The entry started in an earlier week. */
++  continuesBefore: boolean;
++  /** The entry goes on into a later week. */
++  continuesAfter: boolean;
++  /** Row of the bar under the day numbers, 0 first. */
++  lane: number;
++};
++
++/**
++ * The bars of one week (`week` is its seven dates, Sunday first). Longer and
++ * earlier-starting entries get the upper lanes, and a bar takes the first lane
++ * that is free for all its days.
++ */
++export function weekSegments(
++  entries: CalendarEntry[],
++  week: string[],
++): WeekSegment[] {
++  const first = week[0] as string;
++  const last = week[6] as string;
++  const segments: Omit<WeekSegment, "lane">[] = [];
++  for (const entry of entries) {
++    const end = entryEndDate(entry);
++    if (end < first || entry.date > last) continue;
++    const startColumn = Math.max(0, daysBetween(first, entry.date));
++    const endColumn = Math.min(6, daysBetween(first, end));
++    segments.push({
++      entry,
++      startColumn,
++      span: endColumn - startColumn + 1,
++      continuesBefore: entry.date < first,
++      continuesAfter: end > last,
++    });
++  }
++  segments.sort(
++    (a, b) =>
++      a.startColumn - b.startColumn ||
++      b.span - a.span ||
++      byDisplayOrder(a.entry, b.entry),
++  );
++  const laneEnds: number[] = [];
++  return segments.map((segment) => {
++    let lane = laneEnds.findIndex((end) => end < segment.startColumn);
++    if (lane === -1) lane = laneEnds.length;
++    laneEnds[lane] = segment.startColumn + segment.span - 1;
++    return { ...segment, lane };
++  });
++}
++
++/** The fields of an entry that decide when it starts and ends. */
++export type CalendarRangeInput = {
++  date: string;
++  time?: string;
++  endDate?: string;
++  endTime?: string;
++};
++
++/** Why `range` cannot be saved (a message for the person), or `null`. */
++export function validateRange(range: CalendarRangeInput): string | null {
++  if (!DATE_PATTERN.test(range.date)) return "시작 날짜를 확인해 주세요.";
++  const endDate = range.endDate || range.date;
++  if (!DATE_PATTERN.test(endDate)) return "종료 날짜를 확인해 주세요.";
++  const span = daysBetween(range.date, endDate);
++  if (span < 0) return "종료 날짜는 시작 날짜보다 빠를 수 없습니다.";
++  if (span >= MAX_SPAN_DAYS)
++    return `일정은 최대 ${MAX_SPAN_DAYS}일까지 잡을 수 있습니다.`;
++  if (range.endTime && !range.time)
++    return "종료 시간을 정하려면 시작 시간도 정해 주세요.";
++  if (span === 0 && range.time && range.endTime && range.endTime <= range.time)
++    return "종료 시간은 시작 시간보다 늦어야 합니다.";
++  return null;
 +}
 +
 +/** Live entries of one month grouped by `YYYY-MM-DD`. */
@@ -537,10 +988,10 @@ index 0000000..a31e84d
 +}
 diff --git a/desktop/src/features/team-calendar/lib/useTeamCalendar.ts b/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
 new file mode 100644
-index 0000000..e01ed3e
+index 000000000..90befe105
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
-@@ -0,0 +1,324 @@
+@@ -0,0 +1,407 @@
 +import * as React from "react";
 +
 +import { relayClient } from "@/shared/api/relayClient";
@@ -548,19 +999,23 @@ index 0000000..e01ed3e
 +import type { RelayEvent } from "@/shared/api/types";
 +import { KIND_CHANNEL_SECTIONS } from "@/shared/constants/kinds";
 +import {
++  type CalendarColor,
 +  type CalendarEntry,
 +  type CalendarMonth,
 +  MAX_NOTE_LENGTH,
 +  MAX_TEAM_CALENDAR_AUTHORS,
 +  MAX_TITLE_LENGTH,
 +  TEAM_CALENDAR_D_TAG,
++  combineMonths,
 +  decodeMonth,
 +  encodeForPublish,
 +  hasNewerEntries,
 +  mergeMonthEvents,
 +  mergeMonths,
 +  monthOfDate,
++  monthsAround,
 +  teamCalendarDTag,
++  validateRange,
 +} from "./teamCalendar";
 +
 +/** kind 30078 (application data), the same kind team sections use. */
@@ -572,6 +1027,10 @@ index 0000000..e01ed3e
 +  title: string;
 +  date: string;
 +  time?: string;
++  /** Last day of a multi-day entry; leave out (or equal to `date`) for one day. */
++  endDate?: string;
++  endTime?: string;
++  color?: CalendarColor;
 +  note?: string;
 +};
 +
@@ -650,6 +1109,10 @@ index 0000000..e01ed3e
 +    updatedBy: pubkey,
 +  };
 +  if (input.time) entry.time = input.time;
++  if (input.endDate && input.endDate > input.date)
++    entry.endDate = input.endDate;
++  if (input.time && input.endTime) entry.endTime = input.endTime;
++  if (input.color) entry.color = input.color;
 +  const note = input.note?.trim().slice(0, MAX_NOTE_LENGTH);
 +  if (note) entry.note = note;
 +  return entry;
@@ -713,7 +1176,8 @@ index 0000000..e01ed3e
 +      setState((previous) => ({
 +        scope,
 +        entries: next,
-+        status: status ?? (previous.scope === scope ? previous.status : "ready"),
++        status:
++          status ?? (previous.scope === scope ? previous.status : "ready"),
 +      }));
 +    };
 +
@@ -811,6 +1275,8 @@ index 0000000..e01ed3e
 +  /** Creates or updates an entry. Moving it to another month is handled too. */
 +  const saveEntry = React.useCallback(
 +    async (input: CalendarEntryInput): Promise<void> => {
++      const problem = validateRange(input);
++      if (problem) throw new Error(problem);
 +      const live = liveRef.current;
 +      const previous = input.id ? live?.entries[input.id] : undefined;
 +      const entry = buildEntry(input, previous, pubkey);
@@ -852,10 +1318,7 @@ index 0000000..e01ed3e
 +  );
 +
 +  /** Publishes again after a failed save (nothing to do when all is saved). */
-+  const retry = React.useCallback(
-+    () => commit((entries) => entries),
-+    [commit],
-+  );
++  const retry = React.useCallback(() => commit((entries) => entries), [commit]);
 +
 +  return {
 +    entries: current.entries,
@@ -865,29 +1328,107 @@ index 0000000..e01ed3e
 +    retry,
 +  };
 +}
++
++type MonthHandle = ReturnType<typeof useTeamCalendarMonth>;
++
++/**
++ * What a month view shows: the month before, the month itself and the month
++ * after, so an entry that runs across a month edge is drawn on both sides. An
++ * entry is stored in the month it starts in; `saveEntry` and `deleteEntry`
++ * find the right month for it.
++ */
++export function useTeamCalendarRange(
++  pubkey: string,
++  relayUrl: string,
++  month: string,
++) {
++  const [before, here, after] = monthsAround(month);
++  const previous = useTeamCalendarMonth(pubkey, relayUrl, before);
++  const current = useTeamCalendarMonth(pubkey, relayUrl, here);
++  const following = useTeamCalendarMonth(pubkey, relayUrl, after);
++
++  const entries = React.useMemo(
++    () => combineMonths([previous.entries, current.entries, following.entries]),
++    [previous.entries, current.entries, following.entries],
++  );
++
++  const handles: Array<[string, MonthHandle]> = [
++    [before, previous],
++    [here, current],
++    [after, following],
++  ];
++  /** The month that holds the live copy of an entry. */
++  const ownerOf = (id: string) =>
++    handles.find(([, handle]) => {
++      const entry = handle.entries[id];
++      return entry !== undefined && !entry.deleted;
++    })?.[1];
++  const handleForMonth = (target: string) =>
++    handles.find(([key]) => key === target)?.[1];
++
++  const saveEntry = async (input: CalendarEntryInput): Promise<void> => {
++    const owner = input.id ? ownerOf(input.id) : undefined;
++    const target = handleForMonth(monthOfDate(input.date));
++    if (owner && target && owner !== target) {
++      // Moved to another month we have open: write it there first, then leave
++      // a deletion here, so a failure in between leaves a duplicate (the newer
++      // copy is shown), not a loss.
++      await target.saveEntry(input);
++      if (input.id) await owner.deleteEntry(input.id);
++      return;
++    }
++    // Otherwise the month that has it, else the month it starts in, else the
++    // visible month (which publishes into a month that is not open).
++    await (owner ?? target ?? current).saveEntry(input);
++  };
++
++  const deleteEntry = async (id: string): Promise<void> => {
++    await (ownerOf(id) ?? current).deleteEntry(id);
++  };
++
++  const retry = async (): Promise<void> => {
++    await Promise.all(handles.map(([, handle]) => handle.retry()));
++  };
++
++  return {
++    entries,
++    // A neighbouring month that is still loading only fills in later.
++    status: current.status,
++    saveEntry,
++    deleteEntry,
++    retry,
++  };
++}
 diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
 new file mode 100644
-index 0000000..3e568f4
+index 000000000..13e917725
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
-@@ -0,0 +1,469 @@
+@@ -0,0 +1,671 @@
 +import { ChevronLeft, ChevronRight, Pencil, Plus, Trash2 } from "lucide-react";
 +import * as React from "react";
 +import { toast } from "sonner";
 +
 +import {
++  type CalendarColor,
 +  type CalendarEntry,
++  CALENDAR_COLORS,
++  addDays,
++  daysBetween,
 +  MAX_NOTE_LENGTH,
 +  MAX_TITLE_LENGTH,
-+  entriesByDate,
++  entriesOnDate,
++  entryEndDate,
 +  monthGrid,
 +  monthOfDate,
 +  shiftMonth,
 +  todayKey,
++  validateRange,
++  weekSegments,
 +} from "@/features/team-calendar/lib/teamCalendar";
 +import {
 +  type CalendarEntryInput,
-+  useTeamCalendarMonth,
++  useTeamCalendarRange,
 +} from "@/features/team-calendar/lib/useTeamCalendar";
 +import { cn } from "@/shared/lib/cn";
 +import { Button } from "@/shared/ui/button";
@@ -902,15 +1443,73 @@ index 0000000..3e568f4
 +import { Textarea } from "@/shared/ui/textarea";
 +
 +const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"] as const;
-+const MAX_TITLES_PER_CELL = 2;
++/** Bars drawn under the day number; more are counted as "+N" in the cell. */
++const MAX_LANES = 3;
++
++/** An empty color is the default look. */
++type ColorChoice = CalendarColor | "";
++
++// Tailwind only keeps class names it can read in full, so they are spelled out.
++const COLOR_STYLES: Record<
++  ColorChoice,
++  { label: string; bar: string; dot: string }
++> = {
++  "": { label: "기본", bar: "bg-primary/15", dot: "bg-primary" },
++  red: { label: "빨강", bar: "bg-red-500/25", dot: "bg-red-500" },
++  orange: { label: "주황", bar: "bg-orange-500/25", dot: "bg-orange-500" },
++  green: { label: "초록", bar: "bg-green-500/25", dot: "bg-green-500" },
++  blue: { label: "파랑", bar: "bg-blue-500/25", dot: "bg-blue-500" },
++  purple: { label: "보라", bar: "bg-purple-500/25", dot: "bg-purple-500" },
++  pink: { label: "분홍", bar: "bg-pink-500/25", dot: "bg-pink-500" },
++  gray: { label: "회색", bar: "bg-gray-500/25", dot: "bg-gray-500" },
++};
++const COLOR_CHOICES: ColorChoice[] = ["", ...CALENDAR_COLORS];
 +
 +type Draft = {
 +  id?: string;
 +  title: string;
 +  date: string;
 +  time: string;
++  endDate: string;
++  endTime: string;
++  color: ColorChoice;
 +  note: string;
 +};
++
++const emptyDraft = (date: string): Draft => ({
++  title: "",
++  date,
++  time: "",
++  endDate: date,
++  endTime: "",
++  color: "",
++  note: "",
++});
++
++const draftOf = (entry: CalendarEntry): Draft => ({
++  id: entry.id,
++  title: entry.title,
++  date: entry.date,
++  time: entry.time ?? "",
++  endDate: entryEndDate(entry),
++  endTime: entry.endTime ?? "",
++  color: entry.color ?? "",
++  note: entry.note ?? "",
++});
++
++/** The end date once the start moves to `date`: an entry keeps its length. */
++function endAfterStartMove(draft: Draft, date: string): string {
++  if (!date || !draft.date || !draft.endDate) return date || draft.endDate;
++  return addDays(date, Math.max(0, daysBetween(draft.date, draft.endDate)));
++}
++
++/** The seven days of each of the grid's six weeks. */
++function weeksOf<T>(cells: T[]): T[][] {
++  const weeks: T[][] = [];
++  for (let start = 0; start < cells.length; start += 7)
++    weeks.push(cells.slice(start, start + 7));
++  return weeks;
++}
 +
 +function monthLabel(month: string): string {
 +  const [year, value] = month.split("-").map(Number);
@@ -925,6 +1524,23 @@ index 0000000..3e568f4
 +  ];
 +  const weekday = WEEKDAYS[new Date(year, month - 1, day).getDay()];
 +  return `${month}월 ${day}일 (${weekday})`;
++}
++
++function shortDateLabel(date: string): string {
++  const [, month, day] = date.split("-").map(Number);
++  return `${month}월 ${day}일`;
++}
++
++/** When an entry happens: its time, or its first and last day for a span. */
++function rangeLabel(entry: CalendarEntry): string {
++  const end = entryEndDate(entry);
++  if (end === entry.date) {
++    if (!entry.time) return "하루 종일";
++    return entry.endTime ? `${entry.time} ~ ${entry.endTime}` : entry.time;
++  }
++  const from = `${shortDateLabel(entry.date)}${entry.time ? ` ${entry.time}` : ""}`;
++  const to = `${shortDateLabel(end)}${entry.endTime ? ` ${entry.endTime}` : ""}`;
++  return `${from} ~ ${to}`;
 +}
 +
 +function errorMessage(error: unknown, fallback: string): string {
@@ -957,12 +1573,19 @@ index 0000000..3e568f4
 +  const [confirmingId, setConfirmingId] = React.useState<string | null>(null);
 +
 +  const { entries, status, saveEntry, deleteEntry, retry } =
-+    useTeamCalendarMonth(pubkey, relayUrl, month);
++    useTeamCalendarRange(pubkey, relayUrl, month);
 +
-+  const byDate = React.useMemo(() => entriesByDate(entries), [entries]);
-+  const cells = React.useMemo(() => monthGrid(month), [month]);
++  const weeks = React.useMemo(() => weeksOf(monthGrid(month)), [month]);
 +  const today = todayKey();
-+  const selectedEntries = byDate[selectedDate] ?? [];
++  const selectedEntries = entriesOnDate(entries, selectedDate);
++  const rangeError = draft
++    ? validateRange({
++        date: draft.date,
++        time: draft.time || undefined,
++        endDate: draft.endDate || undefined,
++        endTime: draft.endTime || undefined,
++      })
++    : null;
 +
 +  const goToMonth = (next: string) => {
 +    setMonth(next);
@@ -1003,12 +1626,15 @@ index 0000000..3e568f4
 +    event.preventDefault();
 +    if (!draft || saving) return;
 +    const title = draft.title.trim();
-+    if (title.length === 0 || draft.date.length === 0) return;
++    if (title.length === 0 || rangeError) return;
 +    const input: CalendarEntryInput = {
 +      id: draft.id,
 +      title,
 +      date: draft.date,
 +      time: draft.time || undefined,
++      endDate: draft.endDate || undefined,
++      endTime: draft.endTime || undefined,
++      color: draft.color || undefined,
 +      note: draft.note.trim() || undefined,
 +    };
 +    const saved = await run(
@@ -1089,47 +1715,92 @@ index 0000000..3e568f4
 +                </div>
 +              ))}
 +            </div>
-+            <div className="grid grid-cols-7 gap-px overflow-hidden rounded-lg border border-border/60 bg-border/60">
-+              {cells.map((cell) => {
-+                const dayEntries = byDate[cell.date] ?? [];
-+                const isSelected = cell.date === selectedDate;
++            <div className="flex flex-col gap-px overflow-hidden rounded-lg border border-border/60 bg-border/60">
++              {weeks.map((week) => {
++                const bars = weekSegments(
++                  entries,
++                  week.map((cell) => cell.date),
++                );
++                const shown = bars.filter((bar) => bar.lane < MAX_LANES);
++                // Bars that did not fit, counted on each day they cover.
++                const hidden = week.map(
++                  (_, column) =>
++                    bars.filter(
++                      (bar) =>
++                        bar.lane >= MAX_LANES &&
++                        bar.startColumn <= column &&
++                        column < bar.startColumn + bar.span,
++                    ).length,
++                );
 +                return (
-+                  <button
-+                    aria-label={`${dateLabel(cell.date)}, 일정 ${dayEntries.length}개`}
-+                    aria-pressed={isSelected}
-+                    className={cn(
-+                      "flex h-20 min-w-0 flex-col items-stretch gap-0.5 bg-background p-1 text-left transition-colors hover:bg-muted/70 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring",
-+                      !cell.inMonth && "text-muted-foreground/50",
-+                      isSelected && "bg-accent hover:bg-accent",
-+                    )}
-+                    data-testid={`team-calendar-day-${cell.date}`}
-+                    key={cell.date}
-+                    onClick={() => selectDate(cell.date)}
-+                    type="button"
-+                  >
-+                    <span
-+                      className={cn(
-+                        "flex h-5 w-5 items-center justify-center self-start rounded-full text-xs",
-+                        cell.date === today &&
-+                          "bg-primary font-semibold text-primary-foreground",
-+                      )}
++                  <div className="relative" key={week[0]?.date}>
++                    <div className="grid grid-cols-7 gap-px">
++                      {week.map((cell, column) => {
++                        const count = entriesOnDate(entries, cell.date).length;
++                        const isSelected = cell.date === selectedDate;
++                        return (
++                          <button
++                            aria-label={`${dateLabel(cell.date)}, 일정 ${count}개`}
++                            aria-pressed={isSelected}
++                            className={cn(
++                              "flex h-20 min-w-0 flex-col items-stretch gap-0.5 bg-background p-1 text-left transition-colors hover:bg-muted/70 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring",
++                              !cell.inMonth && "text-muted-foreground/50",
++                              isSelected && "bg-accent hover:bg-accent",
++                            )}
++                            data-testid={`team-calendar-day-${cell.date}`}
++                            key={cell.date}
++                            onClick={() => selectDate(cell.date)}
++                            type="button"
++                          >
++                            <span className="flex items-center justify-between">
++                              <span
++                                className={cn(
++                                  "flex h-5 w-5 items-center justify-center rounded-full text-xs",
++                                  cell.date === today &&
++                                    "bg-primary font-semibold text-primary-foreground",
++                                )}
++                              >
++                                {cell.day}
++                              </span>
++                              {hidden[column] ? (
++                                <span className="px-1 text-2xs text-muted-foreground">
++                                  +{hidden[column]}
++                                </span>
++                              ) : null}
++                            </span>
++                          </button>
++                        );
++                      })}
++                    </div>
++                    {/* Bars sit over the day buttons; clicks go through to them. */}
++                    <div
++                      aria-hidden="true"
++                      className="pointer-events-none absolute inset-x-0 top-6 grid auto-rows-[1rem] grid-cols-7 gap-x-px gap-y-0.5"
 +                    >
-+                      {cell.day}
-+                    </span>
-+                    {dayEntries.slice(0, MAX_TITLES_PER_CELL).map((entry) => (
-+                      <span
-+                        className="truncate rounded bg-primary/15 px-1 text-2xs text-foreground"
-+                        key={entry.id}
-+                      >
-+                        {entry.title}
-+                      </span>
-+                    ))}
-+                    {dayEntries.length > MAX_TITLES_PER_CELL ? (
-+                      <span className="px-1 text-2xs text-muted-foreground">
-+                        +{dayEntries.length - MAX_TITLES_PER_CELL}
-+                      </span>
-+                    ) : null}
-+                  </button>
++                      {shown.map((bar) => (
++                        <span
++                          className={cn(
++                            "truncate text-2xs leading-4 text-foreground",
++                            COLOR_STYLES[bar.entry.color ?? ""].bar,
++                            bar.continuesBefore
++                              ? "rounded-l-none pl-1.5"
++                              : "ml-0.5 rounded-l pl-1",
++                            bar.continuesAfter
++                              ? "rounded-r-none"
++                              : "mr-0.5 rounded-r",
++                          )}
++                          data-testid="team-calendar-bar"
++                          key={`${bar.entry.id}-${week[0]?.date}`}
++                          style={{
++                            gridColumn: `${bar.startColumn + 1} / span ${bar.span}`,
++                            gridRow: bar.lane + 1,
++                          }}
++                        >
++                          {bar.entry.title}
++                        </span>
++                      ))}
++                    </div>
++                  </div>
 +                );
 +              })}
 +            </div>
@@ -1155,14 +1826,7 @@ index 0000000..3e568f4
 +              {draft ? null : (
 +                <Button
 +                  data-testid="team-calendar-add"
-+                  onClick={() =>
-+                    setDraft({
-+                      title: "",
-+                      date: selectedDate,
-+                      time: "",
-+                      note: "",
-+                    })
-+                  }
++                  onClick={() => setDraft(emptyDraft(selectedDate))}
 +                  size="sm"
 +                  type="button"
 +                >
@@ -1177,9 +1841,7 @@ index 0000000..3e568f4
 +                <span>저장되지 않은 변경이 있습니다.</span>
 +                <Button
 +                  disabled={saving}
-+                  onClick={() =>
-+                    void run(retry, "다시 저장하지 못했습니다.")
-+                  }
++                  onClick={() => void run(retry, "다시 저장하지 못했습니다.")}
 +                  size="xs"
 +                  type="button"
 +                  variant="outline"
@@ -1210,27 +1872,98 @@ index 0000000..3e568f4
 +                </label>
 +                <div className="flex gap-2">
 +                  <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
-+                    날짜
++                    시작 날짜
 +                    <Input
-+                      onChange={(event) =>
-+                        setDraft({ ...draft, date: event.target.value })
-+                      }
++                      onChange={(event) => {
++                        const date = event.target.value;
++                        setDraft({
++                          ...draft,
++                          date,
++                          endDate: endAfterStartMove(draft, date),
++                        });
++                      }}
 +                      required
 +                      type="date"
 +                      value={draft.date}
 +                    />
 +                  </label>
 +                  <label className="flex w-28 flex-col gap-1 text-xs">
-+                    시간 (선택)
++                    시작 시간 (선택)
 +                    <Input
 +                      onChange={(event) =>
-+                        setDraft({ ...draft, time: event.target.value })
++                        setDraft({
++                          ...draft,
++                          time: event.target.value,
++                          // An end time means nothing without a start time.
++                          endTime: event.target.value ? draft.endTime : "",
++                        })
 +                      }
 +                      type="time"
 +                      value={draft.time}
 +                    />
 +                  </label>
 +                </div>
++                <div className="flex gap-2">
++                  <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
++                    종료 날짜
++                    <Input
++                      min={draft.date || undefined}
++                      onChange={(event) =>
++                        setDraft({ ...draft, endDate: event.target.value })
++                      }
++                      required
++                      type="date"
++                      value={draft.endDate}
++                    />
++                  </label>
++                  <label className="flex w-28 flex-col gap-1 text-xs">
++                    종료 시간 (선택)
++                    <Input
++                      disabled={!draft.time}
++                      onChange={(event) =>
++                        setDraft({ ...draft, endTime: event.target.value })
++                      }
++                      type="time"
++                      value={draft.endTime}
++                    />
++                  </label>
++                </div>
++                {rangeError ? (
++                  <p
++                    className="text-xs text-destructive"
++                    data-testid="team-calendar-range-error"
++                    role="alert"
++                  >
++                    {rangeError}
++                  </p>
++                ) : null}
++                <fieldset className="flex min-w-0 flex-col gap-1 text-xs">
++                  <legend className="mb-1">색상</legend>
++                  <div className="flex flex-wrap gap-1.5">
++                    {COLOR_CHOICES.map((choice) => {
++                      const { label, dot } = COLOR_STYLES[choice];
++                      const checked = draft.color === choice;
++                      return (
++                        <button
++                          aria-label={label}
++                          aria-pressed={checked}
++                          className={cn(
++                            "h-5 w-5 rounded-full border-2 transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
++                            dot,
++                            checked
++                              ? "border-foreground"
++                              : "border-transparent",
++                          )}
++                          data-testid={`team-calendar-color-${choice || "default"}`}
++                          key={choice || "default"}
++                          onClick={() => setDraft({ ...draft, color: choice })}
++                          title={label}
++                          type="button"
++                        />
++                      );
++                    })}
++                  </div>
++                </fieldset>
 +                <label className="flex flex-col gap-1 text-xs">
 +                  메모 (선택)
 +                  <Textarea
@@ -1253,7 +1986,11 @@ index 0000000..3e568f4
 +                    취소
 +                  </Button>
 +                  <Button
-+                    disabled={saving || draft.title.trim().length === 0}
++                    disabled={
++                      saving ||
++                      draft.title.trim().length === 0 ||
++                      rangeError !== null
++                    }
 +                    size="sm"
 +                    type="submit"
 +                  >
@@ -1275,25 +2012,24 @@ index 0000000..3e568f4
 +                  >
 +                    <div className="flex items-start gap-2">
 +                      <div className="min-w-0 flex-1">
-+                        <p className="break-words text-sm font-medium">
++                        <p className="flex items-start gap-1.5 break-words text-sm font-medium">
++                          <span
++                            aria-hidden="true"
++                            className={cn(
++                              "mt-1.5 h-2 w-2 shrink-0 rounded-full",
++                              COLOR_STYLES[entry.color ?? ""].dot,
++                            )}
++                          />
 +                          {entry.title}
 +                        </p>
 +                        <p className="text-xs text-muted-foreground">
-+                          {entry.time ?? "하루 종일"}
++                          {rangeLabel(entry)}
 +                        </p>
 +                      </div>
 +                      <Button
 +                        aria-label={`${entry.title} 수정`}
 +                        disabled={saving}
-+                        onClick={() =>
-+                          setDraft({
-+                            id: entry.id,
-+                            title: entry.title,
-+                            date: entry.date,
-+                            time: entry.time ?? "",
-+                            note: entry.note ?? "",
-+                          })
-+                        }
++                        onClick={() => setDraft(draftOf(entry))}
 +                        size="icon-xs"
 +                        type="button"
 +                        variant="ghost"
@@ -1342,7 +2078,7 @@ index 0000000..3e568f4
 +}
 diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
 new file mode 100644
-index 0000000..d601433
+index 000000000..d601433e6
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
 @@ -0,0 +1,43 @@
