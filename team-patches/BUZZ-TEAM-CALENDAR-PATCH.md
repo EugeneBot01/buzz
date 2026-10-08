@@ -27,7 +27,7 @@
 - 참석자: 일정의 `attendees`(pubkey 목록). 없으면 팀 전체다. 달력의 "내 일정만"은 내가 참석자인 일정만 보여 준다(따로 저장하는 개인 캘린더는 없다).
 - 반복: `repeat: { every: daily|weekly|biweekly|monthly, until? }`. 반복 일정은 모든 달에 보여야 하므로 달 문서가 아니라 `d = "team-calendar:<릴레이>:repeat"` 문서에 둔다. 화면이 보는 범위만큼 펼쳐 그린다(`expandRepeats`). "이 날만 삭제"는 `skip`에 그 날짜를 더한다. 수정은 반복 전체에 적용된다. 반복 간격보다 긴 일정은 반복할 수 없다.
 - 알림: 참석자에게 기본으로 하루 전·30분 전·10분 전(시간 없는 일정은 하루 전 오전 9시 기준 1개). 사람마다 일정별로 바꿀 수 있고, 그 선택은 이 기기의 localStorage에만 둔다. 앱이 켜져 있는 동안 30초마다 확인해 토스트와 데스크톱 알림을 띄운다(`useTeamCalendarReminders`, 사이드바 항목에서 한 번 마운트). 서버가 보내는 알림이 아니라서 앱이 꺼져 있으면 울리지 않고, 다시 켰을 때 아직 시작 전인 일정의 가장 가까운 알림 하나만 띄운다. 지금 보고 있는 커뮤니티의 일정만 알린다.
-- 모임 날짜 투표: `d = "team-calendar-polls:<릴레이>"` 문서 하나에 멤버마다 `{ polls, answers }`를 올린다. `polls`(제목, 후보 기간, 선택적으로 시간 범위)는 일정처럼 last-writer-wins로 합치고, `answers`는 **작성자 본인의 이벤트에서만** 읽는다(남의 답을 대신 쓸 수 없다). 날짜만 고르는 투표는 최대 31일, 시간대까지 고르는 투표는 최대 14일. 끝난 지 30일이 지난 투표는 올리는 사본에서 뺀다. 가장 많이 되는 날에서 "일정으로 만들기"를 누르면 그 날짜·시간·되는 사람이 채워진 일정 입력 화면이 열린다.
+- 모임 날짜 투표: `d = "team-calendar-polls:<릴레이>"` 문서 하나에 멤버마다 `{ polls, answers }`를 올린다. `polls`(제목, 후보 기간, 선택적으로 시간 범위)는 일정처럼 last-writer-wins로 합치고, `answers`는 **작성자 본인의 이벤트에서만** 읽는다(남의 답을 대신 쓸 수 없다). 날짜만 고르는 투표는 최대 31일, 시간대까지 고르는 투표는 최대 14일. 끝난 지 30일이 지난 투표는 올리는 사본에서 뺀다. 답하는 화면에서는 되는 때를 누르고 "확인"을 눌러야 저장된다. 저장한 뒤에는 표 대신 글로 보여 준다: 가장 많은 사람이 되는 때(같은 사람들이 되는 이어진 시간은 "14시~17시"처럼 한 줄로 묶는다, `rankPollRanges`), 사람별 되는 때(`mergeOptions`), 아직 답하지 않은 사람. 되는 때 옆의 "일정으로 만들기"를 누르면 그 날짜·시작/종료 시간·되는 사람이 채워진 일정 입력 화면이 열린다.
 - 메시지에서 추가: 메시지 더보기 메뉴의 "캘린더에 추가"(`MessageActionBar.tsx`). 메시지 글에서 날짜·시간을 읽어(`parseSchedule`, 한국어 표현) 확인 창을 띄우고, 참석자 기본값은 그 채널의 사람 멤버다. 일정 id를 메시지 id에서 만들어(`msg-…`) 같은 메시지를 다시 추가하면 새로 생기지 않고 그 일정이 고쳐진다. 메뉴와 캘린더가 화면에서 멀리 떨어져 있어 window 이벤트로 요청을 넘긴다(`addFromMessage.ts`). 에이전트가 알아서 제안하는 기능은 없다.
 
 ## 2. 파일
@@ -36,7 +36,7 @@
 - `desktop/src/features/team-calendar/lib/useTeamCalendar.ts` — 한 달치 읽기·구독·발행 훅(`useTeamCalendarMonth`)과, 앞·현재·뒤 3개월을 묶어 보여주는 훅(`useTeamCalendarRange`).
 - `desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx` — 달력 창(주 단위 행 위에 막대를 겹쳐 그린다. 한 칸에 막대가 3줄을 넘으면 `+N`으로 접는다).
 - `desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx` — 사이드바 메뉴 항목. 달력 창은 열려 있을 때만 마운트한다. 알림 확인과 "메시지에서 추가" 창도 여기서 띄운다.
-- `lib/teamPolls.ts`, `lib/useTeamPolls.ts`, `ui/PollsPanel.tsx` — 모임 날짜 투표.
+- `lib/teamPolls.ts`, `lib/useTeamPolls.ts`, `ui/PollsPanel.tsx`, `ui/PollDetail.tsx` — 모임 날짜 투표.
 - `lib/teamReminders.ts`, `lib/useTeamCalendarReminders.ts` — 알림.
 - `lib/parseSchedule.ts`, `lib/addFromMessage.ts`, `ui/AddFromMessageDialog.tsx` — 메시지에서 일정 만들기.
 - `lib/useTeamMembers.ts`, `ui/MemberPicker.tsx`, `ui/EntryForm.tsx` — 멤버 이름, 참석자 고르기, 일정 입력 폼.
