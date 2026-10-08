@@ -144,10 +144,10 @@ index 3363002..0997d7b 100644
            <TooltipTrigger asChild>
 diff --git a/desktop/src/features/team-links/lib/mcpCatalog.ts b/desktop/src/features/team-links/lib/mcpCatalog.ts
 new file mode 100644
-index 0000000..c119d34
+index 0000000..75adfa9
 --- /dev/null
 +++ b/desktop/src/features/team-links/lib/mcpCatalog.ts
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,174 @@
 +/**
 + * MCP servers for agents (team patch). The agent harness (`buzz-acp`) reads
 + * this environment variable and hands the servers to the agent together with
@@ -191,12 +191,23 @@ index 0000000..c119d34
 +  description: string;
 +};
 +
-+/** Servers offered as a tick box. All sign in through the browser. */
++/**
++ * Servers offered as a tick box. Notion, Atlassian and Linear sign in through
++ * the browser the first time. Figma's hosted server only admits clients Figma
++ * has approved (it refuses `mcp-remote`), so Figma goes through the server the
++ * Figma desktop app runs on this computer once it is switched on there.
++ */
 +export const MCP_PRESETS: McpPreset[] = [
 +  {
-+    server: remoteMcpServer("figma", "https://mcp.figma.com/mcp"),
-+    label: "피그마",
-+    description: "디자인 파일을 읽고 설명합니다.",
++    server: {
++      name: "figma",
++      command: "npx",
++      args: ["-y", "mcp-remote", "http://127.0.0.1:3845/mcp", "--allow-http"],
++      env: {},
++    },
++    label: "피그마 (데스크톱 앱)",
++    description:
++      "피그마 앱을 켜고, 앱 설정에서 MCP 서버를 켜 두어야 합니다.",
 +  },
 +  {
 +    server: remoteMcpServer("notion", "https://mcp.notion.com/mcp"),
@@ -233,6 +244,19 @@ index 0000000..c119d34
 +      if (typeof item === "string") env[key] = item;
 +  }
 +  return { name: value.name, command: value.command.trim(), args, env };
++}
++
++/**
++ * `servers` with every server that shares a preset's name replaced by the
++ * preset as it is today, so a preset whose address was corrected reaches
++ * agents that ticked the old one the next time they are saved.
++ */
++export function withCurrentPresets(servers: McpServerSpec[]): McpServerSpec[] {
++  return servers.map(
++    (server) =>
++      MCP_PRESETS.find((preset) => preset.server.name === server.name)
++        ?.server ?? server,
++  );
 +}
 +
 +/** The servers stored in an agent's environment variable. */
@@ -300,10 +324,10 @@ index 0000000..c119d34
 +}
 diff --git a/desktop/src/features/team-links/lib/teamLinks.test.mjs b/desktop/src/features/team-links/lib/teamLinks.test.mjs
 new file mode 100644
-index 0000000..c3f0adf
+index 0000000..666abe7
 --- /dev/null
 +++ b/desktop/src/features/team-links/lib/teamLinks.test.mjs
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,122 @@
 +import assert from "node:assert/strict";
 +import test from "node:test";
 +
@@ -315,6 +339,7 @@ index 0000000..c3f0adf
 +  parseMcpServers,
 +  remoteUrlOf,
 +  serializeMcpServers,
++  withCurrentPresets,
 +} from "./mcpCatalog.ts";
 +import {
 +  decodeTeamLinks,
@@ -397,8 +422,15 @@ index 0000000..c3f0adf
 +});
 +
 +test("MCP servers are stored in one environment variable", () => {
-+  const figma = MCP_PRESETS[0].server;
-+  assert.equal(remoteUrlOf(figma), "https://mcp.figma.com/mcp");
++  const figma = MCP_PRESETS[1].server;
++  assert.equal(remoteUrlOf(figma), "https://mcp.notion.com/mcp");
++  // The Figma preset is the desktop app's local server, not a hosted address.
++  assert.equal(remoteUrlOf(MCP_PRESETS[0].server), null);
++  const stale = { name: "figma", command: "npx", args: ["-y", "mcp-remote", "https://mcp.figma.com/mcp"], env: {} };
++  assert.deepEqual(withCurrentPresets([stale, { name: "mine", command: "x", args: [], env: {} }]), [
++    MCP_PRESETS[0].server,
++    { name: "mine", command: "x", args: [], env: {} },
++  ]);
 +  const env = envWithMcpServers({ OTHER: "1" }, [figma]);
 +  assert.equal(env.OTHER, "1");
 +  assert.deepEqual(parseMcpServers(env[TEAM_MCP_SERVERS_ENV]), [figma]);
@@ -881,10 +913,10 @@ index 0000000..65c18ef
 +}
 diff --git a/desktop/src/features/team-links/ui/AgentMcpSection.tsx b/desktop/src/features/team-links/ui/AgentMcpSection.tsx
 new file mode 100644
-index 0000000..17f24e9
+index 0000000..6015d8b
 --- /dev/null
 +++ b/desktop/src/features/team-links/ui/AgentMcpSection.tsx
-@@ -0,0 +1,271 @@
+@@ -0,0 +1,275 @@
 +import * as React from "react";
 +import { toast } from "sonner";
 +
@@ -904,6 +936,7 @@ index 0000000..17f24e9
 +  envWithMcpServers,
 +  parseMcpServers,
 +  remoteUrlOf,
++  withCurrentPresets,
 +} from "@/features/team-links/lib/mcpCatalog";
 +import type { ManagedAgent } from "@/shared/api/types";
 +import { Button } from "@/shared/ui/button";
@@ -923,7 +956,10 @@ index 0000000..17f24e9
 +    () => parseMcpServers(agent.envVars[TEAM_MCP_SERVERS_ENV]),
 +    [agent.envVars],
 +  );
-+  const [servers, setServers] = React.useState(saved);
++  // Opens on today's presets: a corrected preset shows as an unsaved change.
++  const [servers, setServers] = React.useState(() =>
++    withCurrentPresets(saved),
++  );
 +  const [name, setName] = React.useState("");
 +  const [target, setTarget] = React.useState("");
 +  const [busy, setBusy] = React.useState(false);
