@@ -1,0 +1,96 @@
+diff --git a/desktop/src/features/projects/projectCreation.ts b/desktop/src/features/projects/projectCreation.ts
+index 38bd452..0fd2953 100644
+--- a/desktop/src/features/projects/projectCreation.ts
++++ b/desktop/src/features/projects/projectCreation.ts
+@@ -29,11 +29,29 @@ export function isUnsupportedProjectKindError(error: unknown): boolean {
+   );
+ }
+ 
++/** FNV-1a of the text as 8 hex digits: a short, stable tag for a name. */
++function shortNameHash(text: string): string {
++  let hash = 0x811c9dc5;
++  for (const byte of new TextEncoder().encode(text)) {
++    hash ^= byte;
++    hash = Math.imul(hash, 0x01000193);
++  }
++  return (hash >>> 0).toString(16).padStart(8, "0");
++}
++
+ export function projectDtagFromName(name: string): string {
+-  return name
+-    .toLowerCase()
+-    .replace(/[^a-z0-9]+/g, "-")
+-    .replace(/^-+|-+$/g, "");
++  const lowered = name.trim().toLowerCase();
++  const slug = lowered.replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
++  // Team patch: the slug keeps only a-z and 0-9, so a name written in Korean
++  // (or any other script) used to come out empty and the project could not be
++  // created, and "버즈 app" and "다른 app" both came out as "app". When the
++  // name has letters or digits the slug dropped, a short hash of the whole
++  // name is appended: the id stays ASCII, is the same every time for the same
++  // name, and differs between different names.
++  const dropped = lowered.replace(/[a-z0-9]/g, "");
++  if (!/[\p{L}\p{N}]/u.test(dropped)) return slug;
++  const hash = shortNameHash(lowered);
++  return slug ? `${slug}-${hash}` : `project-${hash}`;
+ }
+ 
+ export type ListedProjectIdentity = {
+diff --git a/desktop/src/features/projects/projectDtagTeamNames.test.mjs b/desktop/src/features/projects/projectDtagTeamNames.test.mjs
+new file mode 100644
+index 0000000..45c6df5
+--- /dev/null
++++ b/desktop/src/features/projects/projectDtagTeamNames.test.mjs
+@@ -0,0 +1,20 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import { projectDtagFromName } from "./projectCreation.ts";
++
++test("names in Korean get a stable ASCII id instead of an empty one", () => {
++  // Plain ASCII names are unchanged.
++  assert.equal(projectDtagFromName("bee-garden game"), "bee-garden-game");
++  assert.equal(projectDtagFromName("  My App 2 "), "my-app-2");
++  assert.equal(projectDtagFromName("a & b"), "a-b");
++  // A name with nothing to keep still has no id (the caller reports it).
++  assert.equal(projectDtagFromName("!!!"), "");
++  const korean = projectDtagFromName("버즈 프로젝트");
++  assert.match(korean, /^project-[0-9a-f]{8}$/);
++  assert.equal(projectDtagFromName(" 버즈 프로젝트 "), korean);
++  assert.notEqual(projectDtagFromName("다른 프로젝트"), korean);
++  // Mixed names keep the ASCII part and stay distinct from each other.
++  assert.match(projectDtagFromName("버즈 app"), /^app-[0-9a-f]{8}$/);
++  assert.notEqual(projectDtagFromName("버즈 app"), projectDtagFromName("다른 app"));
++});
+diff --git a/desktop/src/features/projects/ui/CreateProjectFormContent.tsx b/desktop/src/features/projects/ui/CreateProjectFormContent.tsx
+index 16ec9a5..dbba62b 100644
+--- a/desktop/src/features/projects/ui/CreateProjectFormContent.tsx
++++ b/desktop/src/features/projects/ui/CreateProjectFormContent.tsx
+@@ -81,6 +81,17 @@ export function CreateProjectFormContent({
+       headerSubtitle="A project starts as a channel with a repository. People in the channel can talk, clone, and open tasks here."
+       footer={
+         <div className="flex w-full items-center justify-end gap-3">
++          {/* Team patch: the error used to sit at the end of a long form, out
++              of sight, so a failed create looked like a dead button. */}
++          {errorMessage ? (
++            <p
++              className="mr-auto min-w-0 break-words text-sm text-destructive"
++              data-testid="create-project-error"
++              role="alert"
++            >
++              {errorMessage}
++            </p>
++          ) : null}
+           <Button
+             data-testid="create-project-submit"
+             disabled={isCreating || name.trim().length === 0}
+@@ -181,9 +192,6 @@ export function CreateProjectFormContent({
+ 
+         <CreateProjectFormSettings disabled={isCreating} {...settings} />
+ 
+-        {errorMessage ? (
+-          <p className="text-sm text-destructive">{errorMessage}</p>
+-        ) : null}
+       </form>
+     </ChooserDialogContent>
+   );
