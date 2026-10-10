@@ -20,6 +20,7 @@ with `git apply --3way`.
 | `35-call-notifications.patch` | Readable call (huddle) and wave notifications instead of raw JSON / HTML markers; Korean notification copy on Korean Macs | `BUZZ-NOTIFY-PATCH.md` §5 |
 | `36-korean-transcripts.patch` | Korean live huddle transcripts (SenseVoice model) with a 한/EN toggle, and remote speech attributed to the actual speaker | `BUZZ-KOREAN-TRANSCRIPT-PATCH.md` |
 | `37-huddle-invites.patch` | Discord-style huddle invites: ring a person into the running call (DM huddle card), optionally add them to the channel | `BUZZ-HUDDLE-INVITE-PATCH.md` |
+| `90-render-when-covered.patch` | Opt-in per Mac (`BuzzRenderWhenCovered`): keep web views painting while covered so window captures stay current | `BUZZ-RENDER-WHEN-COVERED-PATCH.md` |
 
 
 If a patch stops applying to a new upstream tag, re-implement it from section 3

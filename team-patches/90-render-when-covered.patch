@@ -1,0 +1,82 @@
+diff --git a/desktop/src-tauri/src/lib.rs b/desktop/src-tauri/src/lib.rs
+index cc63c610e..b16b34dfd 100644
+--- a/desktop/src-tauri/src/lib.rs
++++ b/desktop/src-tauri/src/lib.rs
+@@ -41,6 +41,7 @@ mod prevent_sleep;
+ mod ptt_shortcut;
+ mod relay;
+ mod relay_admission;
++mod render_when_covered;
+ mod reset;
+ mod secret_store;
+ mod shutdown;
+@@ -149,6 +150,9 @@ pub fn run() {
+         .plugin(
+             tauri::plugin::Builder::<_, ()>::new("initial-window-reveal")
+                 .on_webview_ready(|webview| {
++                    // Opt-in per Mac: keep painting while covered so window
++                    // captures stay current (see render_when_covered.rs).
++                    render_when_covered::apply(&webview);
+                     if webview.label() != "main" {
+                         return;
+                     }
+diff --git a/desktop/src-tauri/src/render_when_covered.rs b/desktop/src-tauri/src/render_when_covered.rs
+new file mode 100644
+index 000000000..6f611656d
+--- /dev/null
++++ b/desktop/src-tauri/src/render_when_covered.rs
+@@ -0,0 +1,54 @@
++//! Opt-in: keep web views painting while their window is covered.
++//!
++//! WebKit stops rendering a `WKWebView` whose window is occluded, so window
++//! captures of a covered Buzz (screenshots, automated UI checks) return a
++//! stale frame. Setting the per-user default
++//! `defaults write xyz.block.buzz.app BuzzRenderWhenCovered -bool YES`
++//! turns occlusion detection off for every Buzz web view on that Mac only.
++//! It costs some extra power while covered, so it is off by default.
++
++#[cfg(target_os = "macos")]
++pub fn apply<R: tauri::Runtime>(webview: &tauri::Webview<R>) {
++    use objc2::runtime::{AnyClass, AnyObject, Bool};
++    use objc2::{msg_send, sel};
++    use objc2_foundation::NSString;
++
++    // SAFETY: plain Foundation calls on the main thread's standard defaults.
++    let enabled: bool = unsafe {
++        let Some(cls) = AnyClass::get(c"NSUserDefaults") else {
++            return;
++        };
++        let defaults: *mut AnyObject = msg_send![cls, standardUserDefaults];
++        if defaults.is_null() {
++            return;
++        }
++        let key = NSString::from_str("BuzzRenderWhenCovered");
++        let value: Bool = msg_send![defaults, boolForKey: &*key];
++        value.as_bool()
++    };
++    if !enabled {
++        return;
++    }
++
++    let result = webview.with_webview(|platform| {
++        let wk = platform.inner() as *mut AnyObject;
++        if wk.is_null() {
++            return;
++        }
++        // SAFETY: `wk` is the live WKWebView; the private setter is probed
++        // with respondsToSelector: first so an OS that drops it is a no-op.
++        unsafe {
++            let selector = sel!(_setWindowOcclusionDetectionEnabled:);
++            let responds: Bool = msg_send![wk, respondsToSelector: selector];
++            if responds.as_bool() {
++                let _: () = msg_send![wk, _setWindowOcclusionDetectionEnabled: Bool::NO];
++            }
++        }
++    });
++    if let Err(error) = result {
++        eprintln!("buzz-desktop: render-when-covered setup failed: {error}");
++    }
++}
++
++#[cfg(not(target_os = "macos"))]
++pub fn apply<R: tauri::Runtime>(_webview: &tauri::Webview<R>) {}
