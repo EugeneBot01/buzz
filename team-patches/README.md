@@ -14,8 +14,10 @@ with `git apply --3way`.
 | `40-korean.patch` | Korean UI (display-layer translation, toggle in Settings → Appearance; message bodies/inputs never translated) | `BUZZ-KOREAN-PATCH.md` |
 | `50-team-calendar.patch` | Team calendar: a month grid shared by, and editable by, every member of a community (sidebar → 캘린더) | `BUZZ-TEAM-CALENDAR-PATCH.md` |
 | `60-channel-files.patch` | Channel files: list a channel's attachments, select several and save them into one folder; raises the single-file download cap from 50 MiB to 512 MiB | `BUZZ-CHANNEL-FILES-PATCH.md` |
+| `65-upload-pack-refused.patch` | Uploads: audio files and images other than JPEG/PNG/GIF/WebP, which the relay refuses as attachments, are packed into a one-entry zip before upload (`media_team_zip.rs`). The safety deny-list (executables, disk images) is left as it is | (this row) |
 | `70-channel-connections.patch` | Channel connections: one-click shortcuts (Google Meet, Figma, any https link) in the channel header, and MCP servers for the channel's agents (passed by `buzz-acp` to any runtime) | `BUZZ-CHANNEL-CONNECTIONS-PATCH.md` |
 | `80-project-names.patch` | Projects: a name written in Korean (or any non-ASCII script) gets a stable ASCII id instead of an empty one, so the project can be created; the create error shows next to the button instead of below the fold | (this row) |
+| `85-send-scope.patch` | Sending: the composer and the inbox reply pass the active community as the expected relay scope, so a send is refused instead of published to another community's relay (block/buzz#7518); the two resulting errors get a Korean message that says to restart | (this row) |
 
 | `35-call-notifications.patch` | Readable call (huddle) and wave notifications instead of raw JSON / HTML markers; Korean notification copy on Korean Macs | `BUZZ-NOTIFY-PATCH.md` §5 |
 | `36-korean-transcripts.patch` | Korean live huddle transcripts (SenseVoice model) with a 한/EN toggle, and remote speech attributed to the actual speaker | `BUZZ-KOREAN-TRANSCRIPT-PATCH.md` |

@@ -1,0 +1,200 @@
+diff --git a/desktop/src-tauri/src/commands/media.rs b/desktop/src-tauri/src/commands/media.rs
+index 20924147f..954651b47 100644
+--- a/desktop/src-tauri/src/commands/media.rs
++++ b/desktop/src-tauri/src/commands/media.rs
+@@ -505,8 +505,14 @@ pub async fn upload_media(
+     }
+ 
+     let mime = detect_and_validate_mime(&body)?;
++    // Team patch: pack types the relay refuses (audio, uncommon images).
++    let (body, mime, packed) = super::media_team_zip::wrap_if_refused(body, mime, None)?;
+     let body = sanitize_image_for_upload(body, &mime)?;
+-    do_upload(body, &mime, &state, None, None).await
++    let mut descriptor = do_upload(body, &mime, &state, None, None).await?;
++    if packed {
++        descriptor.filename = Some("file.zip".to_string());
++    }
++    Ok(descriptor)
+ }
+ 
+ /// Read a picked path through the TOCTOU-safe pipeline (fd pin → sniff →
+@@ -577,6 +583,14 @@ async fn process_picked_path(
+         .map_err(|e| format!("transcode task failed: {e}"))??;
+ 
+     let mime = detect_and_validate_mime(&body)?;
++    // Team patch: pack types the relay refuses (audio, uncommon images). Not on
++    // image-only surfaces, which must keep rejecting what is not an image.
++    let picked_name = path.file_name().and_then(|n| n.to_str());
++    let (body, mime, packed) = if images_only {
++        (body, mime, false)
++    } else {
++        super::media_team_zip::wrap_if_refused(body, mime, picked_name)?
++    };
+     let body = sanitize_image_for_upload(body, &mime)?;
+ 
+     // Image-only surfaces (e.g. "Send feedback"): reject anything that didn't
+@@ -598,7 +612,8 @@ async fn process_picked_path(
+     descriptor.filename = path
+         .file_name()
+         .and_then(|n| n.to_str())
+-        .map(sanitize_filename);
++        .map(sanitize_filename)
++        .map(|name| super::media_team_zip::shown_filename(name, packed));
+ 
+     Ok(descriptor)
+ }
+@@ -762,6 +777,13 @@ pub(super) async fn upload_media_bytes_inner(
+     };
+ 
+     let mime = detect_and_validate_mime(&body)?;
++    // Team patch: pack types the relay refuses (audio, uncommon images). A
++    // voice note is audio the relay does accept in its own container.
++    let (body, mime, packed) = if is_voice_note {
++        (body, mime, false)
++    } else {
++        super::media_team_zip::wrap_if_refused(body, mime, filename.as_deref())?
++    };
+     let body = sanitize_image_for_upload(body, &mime)?;
+ 
+     // Upload video first, then poster (best-effort).
+@@ -785,7 +807,7 @@ pub(super) async fn upload_media_bytes_inner(
+         } else {
+             name.to_string()
+         };
+-        sanitize_filename(&upload_name)
++        super::media_team_zip::shown_filename(sanitize_filename(&upload_name), packed)
+     });
+ 
+     Ok(descriptor)
+diff --git a/desktop/src-tauri/src/commands/media_team_zip.rs b/desktop/src-tauri/src/commands/media_team_zip.rs
+new file mode 100644
+index 000000000..c1629e21b
+--- /dev/null
++++ b/desktop/src-tauri/src/commands/media_team_zip.rs
+@@ -0,0 +1,114 @@
++//! Team patch: upload file types the relay refuses, packed in a zip.
++//!
++//! The relay stores a generic attachment only when its bytes do not sniff as
++//! audio, and stores an image only as JPEG, PNG, GIF or WebP (see
++//! `buzz-media/src/validation.rs`). An MP3, WAV, PSD, TIFF or BMP is therefore
++//! refused with "content type not allowed", which people read as "this
++//! extension is blocked". A zip is accepted, so those files are packed into a
++//! one-entry zip before the upload, exactly what a person would do by hand.
++//!
++//! Executables, disk images and the other types in `BLOCKED_MIME` are NOT
++//! packed: that list exists for safety and is left as it is.
++
++/// Images the relay stores as images. Anything else under `image/` is refused.
++const RELAY_IMAGE_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
++
++/// True when the relay refuses bytes of this sniffed type as an attachment.
++pub(super) fn relay_refuses_media(mime: &str) -> bool {
++    mime.starts_with("audio/")
++        || (mime.starts_with("image/") && !RELAY_IMAGE_TYPES.contains(&mime))
++}
++
++/// The name of the single entry inside the zip: the original file name when
++/// there is one, else `file.<sniffed extension>`.
++fn entry_name(body: &[u8], original_name: Option<&str>) -> String {
++    match original_name.map(str::trim) {
++        Some(name) if !name.is_empty() => name.to_string(),
++        _ => {
++            let ext = infer::get(body).map(|kind| kind.extension()).unwrap_or("bin");
++            format!("file.{ext}")
++        }
++    }
++}
++
++/// Packs `body` into a one-entry zip when the relay would refuse `mime`.
++///
++/// Returns the bytes and type to upload and whether they were packed (the
++/// caller then adds `.zip` to the file name it shows).
++pub(super) fn wrap_if_refused(
++    body: Vec<u8>,
++    mime: String,
++    original_name: Option<&str>,
++) -> Result<(Vec<u8>, String, bool), String> {
++    if !relay_refuses_media(&mime) {
++        return Ok((body, mime, false));
++    }
++    let name = entry_name(&body, original_name);
++    let mut packed: Vec<u8> = Vec::new();
++    {
++        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut packed));
++        let options = zip::write::SimpleFileOptions::default();
++        writer
++            .start_file(name, options)
++            .map_err(|e| format!("failed to pack file: {e}"))?;
++        std::io::Write::write_all(&mut writer, &body)
++            .map_err(|e| format!("failed to pack file: {e}"))?;
++        writer
++            .finish()
++            .map_err(|e| format!("failed to pack file: {e}"))?;
++    }
++    Ok((packed, "application/zip".to_string(), true))
++}
++
++/// The file name to show for an upload: `.zip` is added when it was packed.
++pub(super) fn shown_filename(name: String, packed: bool) -> String {
++    if packed {
++        format!("{name}.zip")
++    } else {
++        name
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn only_refused_media_is_packed() {
++        assert!(relay_refuses_media("audio/mpeg"));
++        assert!(relay_refuses_media("image/tiff"));
++        assert!(relay_refuses_media("image/vnd.adobe.photoshop"));
++        assert!(!relay_refuses_media("image/png"));
++        assert!(!relay_refuses_media("application/pdf"));
++        assert!(!relay_refuses_media("application/x-apple-diskimage"));
++        assert!(!relay_refuses_media("video/mp4"));
++    }
++
++    #[test]
++    fn a_refused_file_becomes_a_one_entry_zip() {
++        // "ID3" is how an MP3 with tags starts.
++        let body = b"ID3\x03\x00\x00\x00\x00\x00\x00rest".to_vec();
++        let (packed, mime, was_packed) =
++            wrap_if_refused(body.clone(), "audio/mpeg".to_string(), Some("song.mp3")).unwrap();
++        assert!(was_packed);
++        assert_eq!(mime, "application/zip");
++        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(packed)).unwrap();
++        assert_eq!(archive.len(), 1);
++        let mut entry = archive.by_index(0).unwrap();
++        assert_eq!(entry.name(), "song.mp3");
++        let mut unpacked = Vec::new();
++        std::io::Read::read_to_end(&mut entry, &mut unpacked).unwrap();
++        assert_eq!(unpacked, body);
++        assert_eq!(shown_filename("song.mp3".to_string(), true), "song.mp3.zip");
++    }
++
++    #[test]
++    fn an_accepted_file_is_left_alone() {
++        let body = b"%PDF-1.7".to_vec();
++        let (same, mime, was_packed) =
++            wrap_if_refused(body.clone(), "application/pdf".to_string(), None).unwrap();
++        assert!(!was_packed);
++        assert_eq!(mime, "application/pdf");
++        assert_eq!(same, body);
++    }
++}
+diff --git a/desktop/src-tauri/src/commands/mod.rs b/desktop/src-tauri/src/commands/mod.rs
+index 01b1ddc88..ac874e466 100644
+--- a/desktop/src-tauri/src/commands/mod.rs
++++ b/desktop/src-tauri/src/commands/mod.rs
+@@ -37,6 +37,7 @@ mod media_filename;
+ mod media_gif;
+ mod media_raw;
+ mod media_snapshot_png;
++mod media_team_zip;
+ mod media_transcode;
+ mod media_upload_progress;
+ mod media_voice_note;
