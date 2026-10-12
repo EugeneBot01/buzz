@@ -1,0 +1,511 @@
+diff --git a/desktop/src-tauri/src/commands/media_download.rs b/desktop/src-tauri/src/commands/media_download.rs
+index 4e5e432..f45140f 100644
+--- a/desktop/src-tauri/src/commands/media_download.rs
++++ b/desktop/src-tauri/src/commands/media_download.rs
+@@ -135,12 +135,6 @@ pub async fn download_file(
+     // so directory traversal / control characters can never reach the dialog.
+     let filename = sanitize_filename(&filename);
+ 
+-    // Derive extension for the save dialog filter from the supplied filename.
+-    let ext = std::path::Path::new(&filename)
+-        .extension()
+-        .and_then(|e| e.to_str())
+-        .map(|e| e.to_string());
+-
+     let bytes = fetch_blob_bytes_with_cap(&url, &state, MAX_FILE_DOWNLOAD_BYTES, None).await?;
+ 
+     // Reuse the upload-side allow/deny policy: rejects executables, HTML, and
+@@ -148,6 +142,20 @@ pub async fn download_file(
+     // arbitrary `application/octet-stream` / text payloads that uploads allow.
+     detect_and_validate_mime(&bytes)?;
+ 
++    // Team patch: a file the app zipped only to get past the relay is saved as
++    // the original (`song.m4a`, not `song.m4a.zip`).
++    let (bytes, filename) =
++        match super::media_team_zip::unpack_team_zip(&bytes, &filename, MAX_FILE_DOWNLOAD_BYTES) {
++            Some((unpacked, original)) => (unpacked, sanitize_filename(&original)),
++            None => (bytes, filename),
++        };
++
++    // Derive extension for the save dialog filter from the saved filename.
++    let ext = std::path::Path::new(&filename)
++        .extension()
++        .and_then(|e| e.to_str())
++        .map(|e| e.to_string());
++
+     // Generic filter: an arbitrary attachment is not necessarily an image.
+     let extensions: Vec<&str> = ext.as_deref().into_iter().collect();
+     save_bytes_with_dialog(&app, &filename, "All Files", &extensions, &bytes).await
+@@ -569,10 +577,7 @@ fn unique_destination(folder: &std::path::Path, filename: &str) -> std::path::Pa
+         return candidate;
+     }
+     let path = std::path::Path::new(filename);
+-    let stem = path
+-        .file_stem()
+-        .and_then(|s| s.to_str())
+-        .unwrap_or("file");
++    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+     let ext = path.extension().and_then(|e| e.to_str());
+     for n in 2..10_000u32 {
+         let name = match ext {
+@@ -640,7 +645,15 @@ pub async fn download_files_to_folder(
+             let bytes =
+                 fetch_blob_bytes_with_cap(&item.url, &state, MAX_FILE_DOWNLOAD_BYTES, None).await?;
+             detect_and_validate_mime(&bytes)?;
+-            let dest = unique_destination(&folder, &filename);
++            let (bytes, name) = match super::media_team_zip::unpack_team_zip(
++                &bytes,
++                &filename,
++                MAX_FILE_DOWNLOAD_BYTES,
++            ) {
++                Some((unpacked, original)) => (unpacked, sanitize_filename(&original)),
++                None => (bytes, filename.clone()),
++            };
++            let dest = unique_destination(&folder, &name);
+             std::fs::write(&dest, &bytes).map_err(|e| format!("Failed to write file: {e}"))
+         }
+         .await;
+diff --git a/desktop/src-tauri/src/commands/media_team_zip.rs b/desktop/src-tauri/src/commands/media_team_zip.rs
+index c1629e2..b9c219d 100644
+--- a/desktop/src-tauri/src/commands/media_team_zip.rs
++++ b/desktop/src-tauri/src/commands/media_team_zip.rs
+@@ -15,8 +15,7 @@ const RELAY_IMAGE_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "im
+ 
+ /// True when the relay refuses bytes of this sniffed type as an attachment.
+ pub(super) fn relay_refuses_media(mime: &str) -> bool {
+-    mime.starts_with("audio/")
+-        || (mime.starts_with("image/") && !RELAY_IMAGE_TYPES.contains(&mime))
++    mime.starts_with("audio/") || (mime.starts_with("image/") && !RELAY_IMAGE_TYPES.contains(&mime))
+ }
+ 
+ /// The name of the single entry inside the zip: the original file name when
+@@ -25,7 +24,9 @@ fn entry_name(body: &[u8], original_name: Option<&str>) -> String {
+     match original_name.map(str::trim) {
+         Some(name) if !name.is_empty() => name.to_string(),
+         _ => {
+-            let ext = infer::get(body).map(|kind| kind.extension()).unwrap_or("bin");
++            let ext = infer::get(body)
++                .map(|kind| kind.extension())
++                .unwrap_or("bin");
+             format!("file.{ext}")
+         }
+     }
+@@ -47,7 +48,11 @@ pub(super) fn wrap_if_refused(
+     let mut packed: Vec<u8> = Vec::new();
+     {
+         let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut packed));
+-        let options = zip::write::SimpleFileOptions::default();
++        // Stored, not deflated: audio and image files are already compressed,
++        // and a stored entry can be read back by slicing (see `unpack_team_zip`
++        // and the in-chat player).
++        let options = zip::write::SimpleFileOptions::default()
++            .compression_method(zip::CompressionMethod::Stored);
+         writer
+             .start_file(name, options)
+             .map_err(|e| format!("failed to pack file: {e}"))?;
+@@ -69,6 +74,40 @@ pub(super) fn shown_filename(name: String, packed: bool) -> String {
+     }
+ }
+ 
++/// The original file inside a zip `wrap_if_refused` made, for saving it as
++/// what was sent (`song.m4a`, not `song.m4a.zip`).
++///
++/// `filename` is the shown name (`<original>.zip`). Only a one-entry zip whose
++/// entry sniffs as a type the relay refuses, and is at most `max` bytes, is
++/// unpacked; anything else (a zip someone made by hand) returns `None` and is
++/// saved as it is.
++pub(super) fn unpack_team_zip(bytes: &[u8], filename: &str, max: u64) -> Option<(Vec<u8>, String)> {
++    let lower = filename.to_ascii_lowercase();
++    let inner = filename.get(..filename.len().checked_sub(4)?)?;
++    if !lower.ends_with(".zip") || inner.is_empty() || !inner.contains('.') {
++        return None;
++    }
++    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
++    if archive.len() != 1 {
++        return None;
++    }
++    let entry = archive.by_index(0).ok()?;
++    if entry.is_dir() || entry.size() > max {
++        return None;
++    }
++    let mut unpacked = Vec::new();
++    // `take` bounds the read even if the declared size lies.
++    std::io::Read::read_to_end(&mut std::io::Read::take(entry, max + 1), &mut unpacked).ok()?;
++    if unpacked.len() as u64 > max {
++        return None;
++    }
++    let mime = infer::get(&unpacked)?.mime_type();
++    if !relay_refuses_media(mime) {
++        return None;
++    }
++    Some((unpacked, inner.to_string()))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -111,4 +150,46 @@ mod tests {
+         assert_eq!(mime, "application/pdf");
+         assert_eq!(same, body);
+     }
++
++    #[test]
++    fn a_team_zip_unpacks_to_the_original_file() {
++        let body = b"ID3\x03\x00\x00\x00\x00\x00\x00rest".to_vec();
++        let (packed, _, _) =
++            wrap_if_refused(body.clone(), "audio/mpeg".to_string(), Some("song.mp3")).unwrap();
++        let (unpacked, name) = unpack_team_zip(&packed, "song.mp3.zip", 1_000).unwrap();
++        assert_eq!(unpacked, body);
++        assert_eq!(name, "song.mp3");
++        // Too big for the cap: saved as the zip instead.
++        assert!(unpack_team_zip(&packed, "song.mp3.zip", 4).is_none());
++        // Not shown as a packed name (`<name>.<ext>.zip`): left as a zip.
++        assert!(unpack_team_zip(&packed, "song.zip", 1_000).is_none());
++        assert!(unpack_team_zip(&packed, "archive", 1_000).is_none());
++    }
++
++    #[test]
++    fn other_zips_are_left_alone() {
++        let mut two = Vec::new();
++        {
++            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut two));
++            let options = zip::write::SimpleFileOptions::default();
++            for name in ["a.mp3", "b.mp3"] {
++                writer.start_file(name, options).unwrap();
++                std::io::Write::write_all(&mut writer, b"ID3\x03\x00\x00\x00").unwrap();
++            }
++            writer.finish().unwrap();
++        }
++        assert!(unpack_team_zip(&two, "a.mp3.zip", 1_000).is_none());
++
++        let mut text = Vec::new();
++        {
++            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut text));
++            writer
++                .start_file("notes.txt", zip::write::SimpleFileOptions::default())
++                .unwrap();
++            std::io::Write::write_all(&mut writer, b"hello").unwrap();
++            writer.finish().unwrap();
++        }
++        assert!(unpack_team_zip(&text, "notes.txt.zip", 1_000).is_none());
++        assert!(unpack_team_zip(b"not a zip", "x.mp3.zip", 1_000).is_none());
++    }
+ }
+diff --git a/desktop/src/features/messages/lib/teamZipAudio.test.mjs b/desktop/src/features/messages/lib/teamZipAudio.test.mjs
+new file mode 100644
+index 0000000..5c521d7
+--- /dev/null
++++ b/desktop/src/features/messages/lib/teamZipAudio.test.mjs
+@@ -0,0 +1,88 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import { deflateRawSync } from "node:zlib";
++
++import { teamZipAudioOf, unpackSingleEntry } from "./teamZipAudio.ts";
++
++/** A minimal zip writer for fixtures: one or more entries, stored or deflated. */
++function makeZip(files, method = 0) {
++  const parts = [];
++  const central = [];
++  let offset = 0;
++  for (const [name, data] of files) {
++    const nameBytes = Buffer.from(name);
++    const body = method === 8 ? deflateRawSync(data) : Buffer.from(data);
++    const local = Buffer.alloc(30);
++    local.writeUInt32LE(0x04034b50, 0);
++    local.writeUInt16LE(method, 8);
++    local.writeUInt32LE(body.length, 18);
++    local.writeUInt32LE(data.length, 22);
++    local.writeUInt16LE(nameBytes.length, 26);
++    const dir = Buffer.alloc(46);
++    dir.writeUInt32LE(0x02014b50, 0);
++    dir.writeUInt16LE(method, 10);
++    dir.writeUInt32LE(body.length, 20);
++    dir.writeUInt32LE(data.length, 24);
++    dir.writeUInt16LE(nameBytes.length, 28);
++    dir.writeUInt32LE(offset, 42);
++    parts.push(local, nameBytes, body);
++    central.push(dir, nameBytes);
++    offset += local.length + nameBytes.length + body.length;
++  }
++  const dirBytes = Buffer.concat(central);
++  const end = Buffer.alloc(22);
++  end.writeUInt32LE(0x06054b50, 0);
++  end.writeUInt16LE(files.length, 8);
++  end.writeUInt16LE(files.length, 10);
++  end.writeUInt32LE(dirBytes.length, 12);
++  end.writeUInt32LE(offset, 16);
++  return new Uint8Array(Buffer.concat([...parts, dirBytes, end]));
++}
++
++const audio = Buffer.from("ID3\x03\x00\x00\x00 some audio bytes ".repeat(20));
++
++test("recognises packed audio by its shown name", () => {
++  assert.deepEqual(
++    teamZipAudioOf({ filename: "1절가사없음.m4a.zip", m: "application/zip" }),
++    { name: "1절가사없음.m4a", type: "audio/mp4" },
++  );
++  assert.equal(
++    teamZipAudioOf({ filename: "song.mp3.zip", m: "audio/mpeg" }),
++    null,
++  );
++  assert.equal(
++    teamZipAudioOf({ filename: "photos.zip", m: "application/zip" }),
++    null,
++  );
++  assert.equal(
++    teamZipAudioOf({ filename: "doc.pdf.zip", m: "application/zip" }),
++    null,
++  );
++  assert.equal(teamZipAudioOf(undefined), null);
++});
++
++test("unpacks a stored entry", async () => {
++  const out = await unpackSingleEntry(makeZip([["a.m4a", audio]]));
++  assert.deepEqual(Buffer.from(out), audio);
++});
++
++test("unpacks a deflated entry (zips made before the stored change)", async () => {
++  const out = await unpackSingleEntry(makeZip([["a.m4a", audio]], 8));
++  assert.deepEqual(Buffer.from(out), audio);
++});
++
++test("refuses several entries and non-zips", async () => {
++  await assert.rejects(
++    unpackSingleEntry(
++      makeZip([
++        ["a.mp3", audio],
++        ["b.mp3", audio],
++      ]),
++    ),
++    /여러 개/,
++  );
++  await assert.rejects(
++    unpackSingleEntry(new Uint8Array(40)),
++    /zip 파일이 아닙니다/,
++  );
++});
+diff --git a/desktop/src/features/messages/lib/teamZipAudio.ts b/desktop/src/features/messages/lib/teamZipAudio.ts
+new file mode 100644
+index 0000000..12f735c
+--- /dev/null
++++ b/desktop/src/features/messages/lib/teamZipAudio.ts
+@@ -0,0 +1,87 @@
++/**
++ * Team patch: audio the app zipped before upload (the relay refuses audio as
++ * an attachment, see `media_team_zip.rs`) is shown as `<name>.<ext>.zip`.
++ * These helpers recognise such an attachment and take the original file back
++ * out of the zip so it can be played in the chat.
++ */
++
++const AUDIO_TYPES: Record<string, string> = {
++  aac: "audio/aac",
++  aif: "audio/aiff",
++  aiff: "audio/aiff",
++  flac: "audio/flac",
++  m4a: "audio/mp4",
++  mp3: "audio/mpeg",
++  ogg: "audio/ogg",
++  opus: "audio/ogg",
++  wav: "audio/wav",
++};
++
++/** Largest packed audio the player will open in memory. */
++export const MAX_TEAM_ZIP_AUDIO_BYTES = 200 * 1024 * 1024;
++
++/** The original name and audio type of a packed audio attachment, or `null`. */
++export function teamZipAudioOf(
++  entry:
++    | {
++        filename?: string;
++        m?: string;
++      }
++    | undefined,
++): { name: string; type: string } | null {
++  const filename = entry?.filename;
++  if (!filename || entry?.m?.toLowerCase() !== "application/zip") return null;
++  const match = /^(.+\.([a-z0-9]+))\.zip$/i.exec(filename);
++  const ext = match?.[2]?.toLowerCase();
++  const type = ext ? AUDIO_TYPES[ext] : undefined;
++  return match?.[1] && type ? { name: match[1], type } : null;
++}
++
++const u16 = (view: DataView, at: number) => view.getUint16(at, true);
++const u32 = (view: DataView, at: number) => view.getUint32(at, true);
++
++/**
++ * The bytes of the single entry of a zip, read through its central directory.
++ * Stored and deflated entries are supported; anything else throws.
++ */
++export async function unpackSingleEntry(
++  zip: Uint8Array<ArrayBuffer>,
++): Promise<Uint8Array<ArrayBuffer>> {
++  const view = new DataView(zip.buffer, zip.byteOffset, zip.byteLength);
++  // End of central directory: 22 bytes plus a comment of up to 65535.
++  let end = -1;
++  for (
++    let at = zip.byteLength - 22;
++    at >= Math.max(0, zip.byteLength - 22 - 65_535);
++    at--
++  ) {
++    if (u32(view, at) === 0x06054b50) {
++      end = at;
++      break;
++    }
++  }
++  if (end < 0) throw new Error("zip 파일이 아닙니다.");
++  if (u16(view, end + 10) !== 1) throw new Error("파일이 여러 개인 zip입니다.");
++  const central = u32(view, end + 16);
++  if (central + 46 > zip.byteLength || u32(view, central) !== 0x02014b50)
++    throw new Error("zip 파일이 손상되었습니다.");
++  const method = u16(view, central + 10);
++  const packedSize = u32(view, central + 20);
++  const size = u32(view, central + 24);
++  const local = u32(view, central + 42);
++  if (local + 30 > zip.byteLength || u32(view, local) !== 0x04034b50)
++    throw new Error("zip 파일이 손상되었습니다.");
++  const start = local + 30 + u16(view, local + 26) + u16(view, local + 28);
++  if (size > MAX_TEAM_ZIP_AUDIO_BYTES || start + packedSize > zip.byteLength)
++    throw new Error("파일이 너무 크거나 손상되었습니다.");
++  const packed = zip.subarray(start, start + packedSize);
++  if (method === 0) return packed;
++  if (method !== 8) throw new Error("지원하지 않는 압축 방식입니다.");
++  const stream = new Blob([packed])
++    .stream()
++    .pipeThrough(new DecompressionStream("deflate-raw"));
++  const unpacked = new Uint8Array(await new Response(stream).arrayBuffer());
++  if (unpacked.byteLength !== size)
++    throw new Error("zip 파일이 손상되었습니다.");
++  return unpacked;
++}
+diff --git a/desktop/src/shared/ui/markdown.tsx b/desktop/src/shared/ui/markdown.tsx
+index 747a5de..bcb21d2 100644
+--- a/desktop/src/shared/ui/markdown.tsx
++++ b/desktop/src/shared/ui/markdown.tsx
+@@ -8,6 +8,7 @@ import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+ import { requestOpenSnapshotImport } from "@/features/agents/openSnapshotImportFromUrlEvent";
+ import { parseChannelLink } from "@/features/messages/lib/channelLink";
+ import { isAudioAttachment } from "@/features/messages/lib/audioAttachment";
++import { teamZipAudioOf } from "@/features/messages/lib/teamZipAudio";
+ import {
+   parseMessageLink,
+   resolveMessageLinkRenderTarget,
+@@ -54,6 +55,7 @@ import {
+ import { EntityLinkAnchor, useOpenEntityLink } from "./markdown/entityLinks";
+ import { ExternalLinkAnchor } from "./markdown/ExternalLinkAnchor";
+ import { FileCard } from "./markdown/FileCard";
++import { TeamZipAudioCard } from "./markdown/TeamZipAudioCard";
+ import {
+   AuthoredDeepLinkAnchor,
+   ChannelDeepLinkAnchor,
+@@ -1280,6 +1282,21 @@ export function createMarkdownComponents(
+       );
+     }
+ 
++    // Team patch: audio the app zipped for upload plays in place.
++    const packedAudio = teamZipAudioOf(
++      href ? imetaByUrl?.get(href) : undefined,
++    );
++    if (href && packedAudio) {
++      return (
++        <TeamZipAudioCard
++          href={href}
++          name={packedAudio.name}
++          size={imetaByUrl?.get(href)?.size}
++          type={packedAudio.type}
++        />
++      );
++    }
++
+     // Render non-media imeta links as download cards; media uses `img`.
+     const card = resolveFileCard(
+       href ? imetaByUrl?.get(href) : undefined,
+diff --git a/desktop/src/shared/ui/markdown/TeamZipAudioCard.tsx b/desktop/src/shared/ui/markdown/TeamZipAudioCard.tsx
+new file mode 100644
+index 0000000..12e8255
+--- /dev/null
++++ b/desktop/src/shared/ui/markdown/TeamZipAudioCard.tsx
+@@ -0,0 +1,83 @@
++import { Loader2, Play } from "lucide-react";
++import * as React from "react";
++import { toast } from "sonner";
++
++import { unpackSingleEntry } from "@/features/messages/lib/teamZipAudio";
++import { fetchMediaBytes } from "@/shared/api/tauriMedia";
++import { FileCard } from "./FileCard";
++
++/**
++ * Team patch: an audio file the app zipped to get past the relay. The card
++ * saves the original file (the download command unpacks it), and "바로 듣기"
++ * plays it here without saving.
++ */
++export function TeamZipAudioCard({
++  href,
++  name,
++  type,
++  size,
++}: {
++  href: string;
++  /** Original file name, without `.zip`. */
++  name: string;
++  type: string;
++  size?: number;
++}) {
++  const [state, setState] = React.useState<
++    { kind: "idle" } | { kind: "loading" } | { kind: "ready"; url: string }
++  >({ kind: "idle" });
++  const url = state.kind === "ready" ? state.url : null;
++  React.useEffect(
++    () => () => {
++      if (url) URL.revokeObjectURL(url);
++    },
++    [url],
++  );
++
++  const load = async () => {
++    setState({ kind: "loading" });
++    try {
++      const audio = await unpackSingleEntry(await fetchMediaBytes(href));
++      setState({
++        kind: "ready",
++        url: URL.createObjectURL(new Blob([audio], { type })),
++      });
++    } catch (error) {
++      setState({ kind: "idle" });
++      toast.error(
++        error instanceof Error && error.message
++          ? `재생하지 못했습니다: ${error.message}`
++          : "재생하지 못했습니다.",
++      );
++    }
++  };
++
++  return (
++    <span className="my-1 flex max-w-sm flex-col gap-1" data-no-translate="">
++      <span className="flex items-center gap-2">
++        <FileCard filename={name} href={href} size={size} />
++        {state.kind === "ready" ? null : (
++          <button
++            aria-label={`${name} 바로 듣기`}
++            className="inline-flex h-9 shrink-0 items-center gap-1 rounded-full border border-border/70 px-3 text-xs text-muted-foreground hover:bg-muted/70 disabled:opacity-60"
++            data-testid="team-zip-audio-play"
++            disabled={state.kind === "loading"}
++            onClick={() => void load()}
++            type="button"
++          >
++            {state.kind === "loading" ? (
++              <Loader2 className="h-3.5 w-3.5 animate-spin" />
++            ) : (
++              <Play className="h-3.5 w-3.5" />
++            )}
++            바로 듣기
++          </button>
++        )}
++      </span>
++      {url ? (
++        // biome-ignore lint/a11y/useMediaCaption: a music file has no captions.
++        <audio autoPlay className="w-full" controls src={url} />
++      ) : null}
++    </span>
++  );
++}

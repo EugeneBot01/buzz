@@ -1,0 +1,81 @@
+diff --git a/desktop/src/features/messages/lib/hideDeleteTombstone.test.mjs b/desktop/src/features/messages/lib/hideDeleteTombstone.test.mjs
+new file mode 100644
+index 000000000..f3b7eba3a
+--- /dev/null
++++ b/desktop/src/features/messages/lib/hideDeleteTombstone.test.mjs
+@@ -0,0 +1,39 @@
++import assert from "node:assert/strict";
++import { test } from "node:test";
++
++import { isSelfDeleteTombstone } from "./timelineItems.ts";
++
++test("hides a member's own delete tombstone", () => {
++  assert.equal(
++    isSelfDeleteTombstone({
++      kind: 40099,
++      body: JSON.stringify({ type: "message_deleted", actor: "a" }),
++    }),
++    true,
++  );
++});
++
++test("keeps moderator removals and other system rows", () => {
++  assert.equal(
++    isSelfDeleteTombstone({
++      kind: 40099,
++      body: JSON.stringify({ type: "message_deleted", public_reason: "spam" }),
++    }),
++    false,
++  );
++  assert.equal(
++    isSelfDeleteTombstone({
++      kind: 40099,
++      body: JSON.stringify({ type: "member_joined" }),
++    }),
++    false,
++  );
++  assert.equal(
++    isSelfDeleteTombstone({
++      kind: 9,
++      body: JSON.stringify({ type: "message_deleted" }),
++    }),
++    false,
++  );
++  assert.equal(isSelfDeleteTombstone({ kind: 40099, body: "not json" }), false);
++});
+diff --git a/desktop/src/features/messages/lib/timelineItems.ts b/desktop/src/features/messages/lib/timelineItems.ts
+index 917350733..dc835087d 100644
+--- a/desktop/src/features/messages/lib/timelineItems.ts
++++ b/desktop/src/features/messages/lib/timelineItems.ts
+@@ -171,10 +171,31 @@ function buildMembershipGroups(
+  * at each calendar-day boundary and an unread-divider above the first unread
+  * message, then the message/system row itself.
+  */
++/**
++ * Team build: a member's own delete leaves no "removed a message" row. Only
++ * moderator removals (relay-stamped `public_reason`) stay visible.
++ */
++export function isSelfDeleteTombstone(message: {
++  kind?: number;
++  body: string;
++}): boolean {
++  if (message.kind !== KIND_SYSTEM_MESSAGE) return false;
++  try {
++    const payload = JSON.parse(message.body) as {
++      type?: string;
++      public_reason?: string;
++    };
++    return payload?.type === "message_deleted" && !payload.public_reason;
++  } catch {
++    return false;
++  }
++}
++
+ export function buildTimelineItems(
+   entries: MainTimelineEntry[],
+   firstUnreadMessageId: string | null,
+ ): TimelineItemsResult {
++  entries = entries.filter((entry) => !isSelfDeleteTombstone(entry.message));
+   const items: TimelineItem[] = [];
+   let previousGroupEntry: MainTimelineEntry | null = null;
+   let previousMessageItemIndex: number | null = null;

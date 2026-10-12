@@ -1,0 +1,1074 @@
+diff --git a/desktop/src/features/team-calendar/lib/useWeeklyDigest.ts b/desktop/src/features/team-calendar/lib/useWeeklyDigest.ts
+new file mode 100644
+index 000000000..5b946b8a4
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/useWeeklyDigest.ts
+@@ -0,0 +1,309 @@
++import * as React from "react";
++import { toast } from "sonner";
++
++import { getChannelMessagesBefore } from "@/shared/api/tauriChannels";
++import { relayClient } from "@/shared/api/relayClient";
++import { signRelayEvent } from "@/shared/api/tauri";
++import { sendChannelMessage } from "@/shared/api/tauriMessages";
++import { KIND_CHANNEL_SECTIONS } from "@/shared/constants/kinds";
++import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
++import {
++  REPEAT_DOC,
++  TEAM_CALENDAR_D_TAG,
++  addDays,
++  combineMonths,
++  expandRepeats,
++  monthOfDate,
++  shiftMonth,
++  todayKey,
++} from "./teamCalendar";
++import { useTeamCalendarMonth } from "./useTeamCalendar";
++import { useTeamMembers } from "./useTeamMembers";
++import {
++  type DigestSettings,
++  DEFAULT_DIGEST,
++  alreadyPosted,
++  dailyHeader,
++  dailyNotices,
++  dailyNoticesDue,
++  decodeDigest,
++  digestDTag,
++  digestHeader,
++  digestText,
++  dueDigestWeek,
++  encodeDigest,
++  latestDigest,
++  postDelaySeconds,
++  weekStartOf,
++} from "./weeklyDigest";
++
++const CHECK_INTERVAL_MS = 60_000;
++const REFRESH_SETTINGS_MS = 5 * 60_000;
++/** Recent posts scanned to see whether a notice already went out. */
++const DEDUPE_SCAN = 50;
++const POSTED_PREFIX = "buzz-team-calendar-digest-posted.v1";
++
++async function fetchDigest(relayUrl: string): Promise<DigestSettings> {
++  const events = await relayClient.fetchEvents({
++    kinds: [KIND_CHANNEL_SECTIONS],
++    "#d": [digestDTag(relayUrl)],
++    limit: 200,
++  });
++  return latestDigest(events.map((event) => decodeDigest(event.content)));
++}
++
++/** The community's shared weekly-digest settings, and a way to change them. */
++export function useDigestSettings(pubkey: string, relayUrl: string) {
++  const [settings, setSettings] =
++    React.useState<DigestSettings>(DEFAULT_DIGEST);
++  const [ready, setReady] = React.useState(false);
++
++  React.useEffect(() => {
++    let cancelled = false;
++    setReady(false);
++    const load = () =>
++      void fetchDigest(relayUrl).then(
++        (next) => {
++          if (cancelled) return;
++          setSettings((previous) => latestDigest([previous, next]));
++          setReady(true);
++        },
++        () => {},
++      );
++    setSettings(DEFAULT_DIGEST);
++    load();
++    const interval = window.setInterval(load, REFRESH_SETTINGS_MS);
++    const unsubscribe = relayClient.subscribeToReconnects(load);
++    return () => {
++      cancelled = true;
++      window.clearInterval(interval);
++      unsubscribe();
++    };
++  }, [relayUrl]);
++
++  const save = React.useCallback(
++    async (
++      change: Partial<Omit<DigestSettings, "updatedAt" | "updatedBy">>,
++    ) => {
++      const next: DigestSettings = {
++        ...settings,
++        ...change,
++        updatedAt: Math.max(Date.now(), settings.updatedAt + 1),
++        updatedBy: pubkey,
++      };
++      const event = await signRelayEvent({
++        kind: KIND_CHANNEL_SECTIONS,
++        content: encodeDigest(next),
++        createdAt: Math.floor(Date.now() / 1_000),
++        tags: [
++          ["d", digestDTag(relayUrl)],
++          ["t", TEAM_CALENDAR_D_TAG],
++        ],
++      });
++      await relayClient.publishEvent(
++        event,
++        "주간 공지 설정을 저장하는 데 시간이 너무 오래 걸립니다.",
++        "주간 공지 설정을 저장하지 못했습니다.",
++      );
++      setSettings(next);
++    },
++    [pubkey, relayUrl, settings],
++  );
++
++  return { settings, ready, save };
++}
++
++async function recentPosts(channelId: string) {
++  const page = await getChannelMessagesBefore(
++    channelId,
++    { createdAt: Math.floor(Date.now() / 1_000) + 60, eventId: "" },
++    DEDUPE_SCAN,
++  );
++  return page.events;
++}
++
++function markPosted(pubkey: string, relayUrl: string, key: string): boolean {
++  const storageKey = `${POSTED_PREFIX}:${pubkey}:${relayUrl}`;
++  try {
++    const done = new Set<string>(
++      JSON.parse(window.localStorage.getItem(storageKey) ?? "[]"),
++    );
++    if (done.has(key)) return false;
++    done.add(key);
++    window.localStorage.setItem(
++      storageKey,
++      JSON.stringify([...done].slice(-60)),
++    );
++  } catch {
++    // Without storage the channel scan still prevents a second post.
++  }
++  return true;
++}
++
++function wasPosted(pubkey: string, relayUrl: string, key: string): boolean {
++  try {
++    const done: string[] = JSON.parse(
++      window.localStorage.getItem(`${POSTED_PREFIX}:${pubkey}:${relayUrl}`) ??
++        "[]",
++    );
++    return done.includes(key);
++  } catch {
++    return false;
++  }
++}
++
++/** Calendar occurrences from four weeks before `weekStart` to its Sunday. */
++export function useWeekOccurrences(
++  pubkey: string,
++  relayUrl: string,
++  weekStart: string,
++) {
++  const firstMonth = monthOfDate(weekStart);
++  const here = useTeamCalendarMonth(pubkey, relayUrl, firstMonth);
++  const next = useTeamCalendarMonth(
++    pubkey,
++    relayUrl,
++    shiftMonth(firstMonth, 1),
++  );
++  const repeating = useTeamCalendarMonth(pubkey, relayUrl, REPEAT_DOC);
++  const occurrences = React.useMemo(
++    () =>
++      expandRepeats(
++        combineMonths([here.entries, next.entries, repeating.entries]),
++        addDays(weekStart, -28),
++        addDays(weekStart, 6),
++      ),
++    [here.entries, next.entries, repeating.entries, weekStart],
++  );
++  const ready =
++    here.status === "ready" &&
++    next.status === "ready" &&
++    repeating.status === "ready";
++  return { occurrences, ready };
++}
++
++/** Posts this week's digest now, without the de-duplication check (manual send). */
++export async function postDigestNow(
++  relayUrl: string,
++  channelId: string,
++  text: string,
++): Promise<void> {
++  await sendChannelMessage(
++    channelId,
++    text,
++    null,
++    undefined,
++    undefined,
++    undefined,
++    undefined,
++    undefined,
++    undefined,
++    undefined,
++    normalizeRelayUrl(relayUrl),
++  );
++}
++
++/**
++ * Posts the weekly digest and the same-day notices while the app runs (team
++ * patch 55). Mount once per community, next to the calendar reminders.
++ */
++export function useWeeklyDigest(pubkey: string, relayUrl: string) {
++  const { settings, ready } = useDigestSettings(pubkey, relayUrl);
++  const weekStart = weekStartOf(todayKey());
++  const { occurrences, ready: calendarReady } = useWeekOccurrences(
++    pubkey,
++    relayUrl,
++    weekStart,
++  );
++  const { nameOf } = useTeamMembers();
++
++  // The interval below reads the newest values without restarting.
++  const latest = React.useRef({
++    settings,
++    ready,
++    occurrences,
++    nameOf,
++    calendarReady,
++  });
++  latest.current = { settings, ready, occurrences, nameOf, calendarReady };
++
++  React.useEffect(() => {
++    const scope = normalizeRelayUrl(relayUrl);
++    const delayMs = postDelaySeconds(pubkey) * 1_000;
++    let busy = false;
++
++    const post = async (
++      channelId: string,
++      header: string,
++      text: string,
++      mentions: string[],
++      key: string,
++    ) => {
++      if (wasPosted(pubkey, relayUrl, key)) return;
++      if (alreadyPosted(await recentPosts(channelId), header)) {
++        markPosted(pubkey, relayUrl, key);
++        return;
++      }
++      if (!markPosted(pubkey, relayUrl, key)) return;
++      await sendChannelMessage(
++        channelId,
++        text,
++        null,
++        undefined,
++        mentions.length ? mentions : undefined,
++        undefined,
++        undefined,
++        undefined,
++        undefined,
++        undefined,
++        scope,
++      );
++    };
++
++    const check = async () => {
++      const state = latest.current;
++      if (busy || !state.ready || !state.calendarReady) return;
++      busy = true;
++      try {
++        const now = Date.now() - delayMs;
++        const day = todayKey();
++        const week = dueDigestWeek(state.settings, day, now);
++        if (week && state.settings.channelId) {
++          const header = digestHeader(week);
++          await post(
++            state.settings.channelId,
++            header,
++            digestText(state.occurrences, week, state.nameOf),
++            [],
++            `week:${week}:${state.settings.channelId}`,
++          ).catch(() =>
++            toast.error("이번 주 일정 공지를 채널에 올리지 못했습니다."),
++          );
++        }
++        if (dailyNoticesDue(state.settings, day, now)) {
++          for (const notice of dailyNotices(
++            state.occurrences,
++            day,
++            state.nameOf,
++          )) {
++            await post(
++              notice.channelId,
++              dailyHeader(day),
++              notice.text,
++              notice.mentions,
++              `day:${day}:${notice.channelId}`,
++            ).catch(() =>
++              toast.error("오늘 일정 공지를 채널에 올리지 못했습니다."),
++            );
++          }
++        }
++      } finally {
++        busy = false;
++      }
++    };
++
++    void check();
++    const interval = window.setInterval(() => void check(), CHECK_INTERVAL_MS);
++    return () => window.clearInterval(interval);
++  }, [pubkey, relayUrl]);
++}
+diff --git a/desktop/src/features/team-calendar/lib/weeklyDigest.test.mjs b/desktop/src/features/team-calendar/lib/weeklyDigest.test.mjs
+new file mode 100644
+index 000000000..a6830e295
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/weeklyDigest.test.mjs
+@@ -0,0 +1,194 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import {
++  DEFAULT_DIGEST,
++  alreadyPosted,
++  dailyNotices,
++  decodeDigest,
++  digestHeader,
++  digestText,
++  dueDigestWeek,
++  encodeDigest,
++  latestDigest,
++  postDelaySeconds,
++  weekStartOf,
++} from "./weeklyDigest.ts";
++
++const on = {
++  ...DEFAULT_DIGEST,
++  enabled: true,
++  channelId: "ch",
++  updatedAt: 1,
++  updatedBy: "a",
++};
++const at = (date, hour, minute = 0) => {
++  const [y, m, d] = date.split("-").map(Number);
++  return new Date(y, m - 1, d, hour, minute).getTime();
++};
++const names = (pubkey) => ({ a: "구윤", b: "은서" })[pubkey] ?? pubkey;
++
++test("weekStartOf finds Monday", () => {
++  assert.equal(weekStartOf("2026-10-13"), "2026-10-12"); // Tue
++  assert.equal(weekStartOf("2026-10-12"), "2026-10-12"); // Mon
++  assert.equal(weekStartOf("2026-10-18"), "2026-10-12"); // Sun
++});
++
++test("digest is due from Monday 9:00 for two days, not before or when off", () => {
++  assert.equal(dueDigestWeek(on, "2026-10-12", at("2026-10-12", 8, 59)), null);
++  assert.equal(
++    dueDigestWeek(on, "2026-10-12", at("2026-10-12", 9)),
++    "2026-10-12",
++  );
++  assert.equal(
++    dueDigestWeek(on, "2026-10-14", at("2026-10-14", 20)),
++    "2026-10-12",
++  );
++  assert.equal(dueDigestWeek(on, "2026-10-15", at("2026-10-15", 9)), null);
++  assert.equal(
++    dueDigestWeek(
++      { ...on, enabled: false },
++      "2026-10-12",
++      at("2026-10-12", 10),
++    ),
++    null,
++  );
++  assert.equal(
++    dueDigestWeek(
++      { ...on, channelId: null },
++      "2026-10-12",
++      at("2026-10-12", 10),
++    ),
++    null,
++  );
++});
++
++test("a Sunday schedule belongs to the same Monday-start week", () => {
++  const sunday = { ...on, weekday: 0, hour: 20 };
++  assert.equal(
++    dueDigestWeek(sunday, "2026-10-18", at("2026-10-18", 21)),
++    "2026-10-12",
++  );
++  assert.equal(dueDigestWeek(sunday, "2026-10-13", at("2026-10-13", 21)), null);
++});
++
++test("digest text lists the week by day with attendees and multi-day ranges", () => {
++  const text = digestText(
++    [
++      {
++        id: "1",
++        title: "촬영 회의",
++        date: "2026-10-13",
++        time: "14:00",
++        endTime: "16:00",
++        attendees: ["a", "b"],
++        updatedAt: 1,
++        updatedBy: "a",
++      },
++      {
++        id: "2",
++        title: "로케 답사",
++        date: "2026-10-15",
++        endDate: "2026-10-16",
++        updatedAt: 1,
++        updatedBy: "a",
++      },
++      {
++        id: "3",
++        title: "지난주부터",
++        date: "2026-10-10",
++        endDate: "2026-10-12",
++        updatedAt: 1,
++        updatedBy: "a",
++      },
++      {
++        id: "4",
++        title: "지움",
++        date: "2026-10-13",
++        deleted: true,
++        updatedAt: 1,
++        updatedBy: "a",
++      },
++      {
++        id: "5",
++        title: "다음주",
++        date: "2026-10-19",
++        updatedAt: 1,
++        updatedBy: "a",
++      },
++    ],
++    "2026-10-12",
++    names,
++  );
++  assert.equal(text.split("\n")[0], digestHeader("2026-10-12"));
++  assert.match(text, /\*\*10\/12 월\*\*\n- ~10\/12 월 지난주부터/);
++  assert.match(
++    text,
++    /\*\*10\/13 화\*\*\n- 14:00~16:00 촬영 회의 \(구윤, 은서\)/,
++  );
++  assert.match(text, /- ~10\/16 금 로케 답사/);
++  assert.doesNotMatch(text, /지움|다음주/);
++});
++
++test("an empty week says so", () => {
++  assert.match(digestText([], "2026-10-12", names), /등록된 일정이 없습니다/);
++});
++
++test("daily notices group by channel and mention attendees", () => {
++  const notices = dailyNotices(
++    [
++      {
++        id: "1",
++        title: "A",
++        date: "2026-10-13",
++        time: "10:00",
++        notify: { channelId: "x" },
++        attendees: ["a"],
++        updatedAt: 1,
++        updatedBy: "a",
++      },
++      {
++        id: "2",
++        title: "B",
++        date: "2026-10-12",
++        endDate: "2026-10-14",
++        notify: { channelId: "x" },
++        attendees: ["b"],
++        updatedAt: 1,
++        updatedBy: "a",
++      },
++      { id: "3", title: "C", date: "2026-10-13", updatedAt: 1, updatedBy: "a" },
++      {
++        id: "4",
++        title: "D",
++        date: "2026-10-14",
++        notify: { channelId: "y" },
++        updatedAt: 1,
++        updatedBy: "a",
++      },
++    ],
++    "2026-10-13",
++    names,
++  );
++  assert.equal(notices.length, 1);
++  assert.equal(notices[0].channelId, "x");
++  assert.deepEqual(notices[0].mentions.sort(), ["a", "b"]);
++  assert.match(notices[0].text, /@구윤/);
++});
++
++test("settings round-trip and the newest wins", () => {
++  const encoded = encodeDigest({ ...on, hour: 8 });
++  assert.equal(decodeDigest(encoded).hour, 8);
++  assert.equal(decodeDigest("{bad"), null);
++  const newer = { ...on, updatedAt: 5, updatedBy: "b", hour: 7 };
++  assert.equal(latestDigest([on, null, newer]).hour, 7);
++  assert.equal(latestDigest([]).enabled, false);
++});
++
++test("an existing notice is recognised by its first line, and delays are stable", () => {
++  const header = digestHeader("2026-10-12");
++  assert.equal(alreadyPosted([{ content: `${header}\n- x` }], header), true);
++  assert.equal(alreadyPosted([{ content: "다른 글" }], header), false);
++  assert.equal(postDelaySeconds("abc"), postDelaySeconds("abc"));
++  assert.ok(postDelaySeconds("f".repeat(64)) < 120);
++});
+diff --git a/desktop/src/features/team-calendar/lib/weeklyDigest.ts b/desktop/src/features/team-calendar/lib/weeklyDigest.ts
+new file mode 100644
+index 000000000..20b90dfd8
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/weeklyDigest.ts
+@@ -0,0 +1,279 @@
++/**
++ * Weekly calendar digest and same-day channel notices (team patch 55).
++ *
++ * Settings are one shared document per community (kind 30078,
++ * `d = team-calendar:<relay>:digest`), last-writer-wins like calendar entries,
++ * so every member's app agrees on where and when to post.
++ *
++ * There is no server: the first member app that is running at the scheduled
++ * time posts, after a per-member delay, and only if the channel does not
++ * already hold that week's (or day's) notice — the notice's first line is the
++ * de-duplication key.
++ */
++import {
++  type CalendarEntry,
++  type CalendarOccurrence,
++  addDays,
++  daysBetween,
++  teamCalendarDTag,
++} from "./teamCalendar";
++import { entryWhenText } from "./teamReminders";
++
++export const DIGEST_DOC = "digest";
++
++export type DigestSettings = {
++  /** Weekly summary of the team calendar. */
++  enabled: boolean;
++  channelId: string | null;
++  /** 0 = Sunday … 6 = Saturday (local time), like Date#getDay. */
++  weekday: number;
++  /** Local hour, 0–23. */
++  hour: number;
++  /** Morning notice "today's entries" to each entry's notice channel. */
++  daily: boolean;
++  updatedAt: number;
++  updatedBy: string;
++};
++
++export const DEFAULT_DIGEST: DigestSettings = {
++  enabled: false,
++  channelId: null,
++  weekday: 1,
++  hour: 9,
++  daily: false,
++  updatedAt: 0,
++  updatedBy: "",
++};
++
++/** Posting more than this late (e.g. app first opened on Thursday) is skipped. */
++export const DIGEST_LATE_LIMIT_DAYS = 2;
++/** The longest a member's app waits after the due time before posting. */
++export const MAX_POST_DELAY_SECONDS = 120;
++
++const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"];
++
++export const digestDTag = (relayUrl: string) =>
++  teamCalendarDTag(relayUrl, DIGEST_DOC);
++
++const clampInt = (
++  value: unknown,
++  min: number,
++  max: number,
++  fallback: number,
++) =>
++  typeof value === "number" &&
++  Number.isInteger(value) &&
++  value >= min &&
++  value <= max
++    ? value
++    : fallback;
++
++export function decodeDigest(content: string): DigestSettings | null {
++  let raw: unknown;
++  try {
++    raw = JSON.parse(content);
++  } catch {
++    return null;
++  }
++  if (!raw || typeof raw !== "object") return null;
++  const value = raw as Record<string, unknown>;
++  if (value.v !== 1 || typeof value.updatedAt !== "number") return null;
++  return {
++    enabled: value.enabled === true,
++    channelId: typeof value.channelId === "string" ? value.channelId : null,
++    weekday: clampInt(value.weekday, 0, 6, DEFAULT_DIGEST.weekday),
++    hour: clampInt(value.hour, 0, 23, DEFAULT_DIGEST.hour),
++    daily: value.daily === true,
++    updatedAt: value.updatedAt,
++    updatedBy: typeof value.updatedBy === "string" ? value.updatedBy : "",
++  };
++}
++
++export const encodeDigest = (settings: DigestSettings) =>
++  JSON.stringify({ v: 1, ...settings });
++
++/** The newest settings (ties broken by author so every app picks the same). */
++export function latestDigest(
++  candidates: Array<DigestSettings | null>,
++): DigestSettings {
++  let best = DEFAULT_DIGEST;
++  for (const candidate of candidates) {
++    if (!candidate) continue;
++    if (
++      candidate.updatedAt > best.updatedAt ||
++      (candidate.updatedAt === best.updatedAt &&
++        candidate.updatedBy > best.updatedBy)
++    )
++      best = candidate;
++  }
++  return best;
++}
++
++const weekdayOf = (date: string) => {
++  const [year, month, day] = date.split("-").map(Number) as [
++    number,
++    number,
++    number,
++  ];
++  return new Date(year, month - 1, day).getDay();
++};
++
++/** Monday of the week containing `date`. */
++export const weekStartOf = (date: string) =>
++  addDays(date, -((weekdayOf(date) + 6) % 7));
++
++const shortDay = (date: string) => {
++  const [, month, day] = date.split("-").map(Number);
++  return `${month}/${day} ${WEEKDAYS[weekdayOf(date)]}`;
++};
++
++/** First line of a weekly digest — also how an existing one is recognised. */
++export const digestHeader = (weekStart: string) =>
++  `📅 이번 주 팀 일정 (${shortDay(weekStart)} ~ ${shortDay(addDays(weekStart, 6))})`;
++
++/** First line of a same-day notice. */
++export const dailyHeader = (date: string) => `📌 오늘 일정 (${shortDay(date)})`;
++
++const localMs = (date: string, hour: number) => {
++  const [year, month, day] = date.split("-").map(Number) as [
++    number,
++    number,
++    number,
++  ];
++  return new Date(year, month - 1, day, hour, 0, 0).getTime();
++};
++
++/**
++ * The week whose digest is due at `nowMs` (its Monday), or null. Due from the
++ * scheduled weekday/hour of that week until DIGEST_LATE_LIMIT_DAYS later.
++ */
++export function dueDigestWeek(
++  settings: DigestSettings,
++  today: string,
++  nowMs: number,
++): string | null {
++  if (!settings.enabled || !settings.channelId) return null;
++  const weekStart = weekStartOf(today);
++  const scheduledDay = addDays(weekStart, (settings.weekday + 6) % 7);
++  const dueMs = localMs(scheduledDay, settings.hour);
++  if (nowMs < dueMs) return null;
++  if (daysBetween(scheduledDay, today) > DIGEST_LATE_LIMIT_DAYS) return null;
++  return weekStart;
++}
++
++/** True once the same-day notices for `today` are due (same hour, same day). */
++export const dailyNoticesDue = (
++  settings: DigestSettings,
++  today: string,
++  nowMs: number,
++) => settings.daily && nowMs >= localMs(today, settings.hour);
++
++/** A stable per-member delay so not every running app posts at once. */
++export function postDelaySeconds(pubkey: string): number {
++  let hash = 0;
++  for (const char of pubkey) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
++  return hash % MAX_POST_DELAY_SECONDS;
++}
++
++const startsOn = (entry: CalendarOccurrence, from: string) =>
++  entry.date < from ? from : entry.date;
++
++const lineOf = (
++  entry: CalendarOccurrence,
++  nameOf: (pubkey: string) => string,
++) => {
++  const end = entry.endDate ?? entry.date;
++  const when =
++    end !== entry.date
++      ? `${entry.time ?? ""}${entry.time ? " " : ""}~${shortDay(end)}${entry.endTime ? ` ${entry.endTime}` : ""}`
++      : entry.time
++        ? `${entry.time}${entry.endTime ? `~${entry.endTime}` : ""}`
++        : "하루 종일";
++  const who = entry.attendees?.length
++    ? ` (${entry.attendees.map(nameOf).join(", ")})`
++    : "";
++  return `- ${when} ${entry.title}${who}`;
++};
++
++const byStart = (a: CalendarOccurrence, b: CalendarOccurrence) =>
++  `${a.date} ${a.time ?? ""}`.localeCompare(`${b.date} ${b.time ?? ""}`);
++
++const live = (entries: CalendarOccurrence[]) =>
++  entries.filter((entry) => !entry.deleted);
++
++/** The weekly digest text for the Monday `weekStart`. */
++export function digestText(
++  occurrences: CalendarOccurrence[],
++  weekStart: string,
++  nameOf: (pubkey: string) => string,
++): string {
++  const weekEnd = addDays(weekStart, 6);
++  const inWeek = live(occurrences)
++    .filter(
++      (entry) =>
++        entry.date <= weekEnd && (entry.endDate ?? entry.date) >= weekStart,
++    )
++    .sort(byStart);
++  const lines = [digestHeader(weekStart)];
++  if (inWeek.length === 0) {
++    lines.push("이번 주에 등록된 일정이 없습니다.");
++    return lines.join("\n");
++  }
++  for (let offset = 0; offset < 7; offset += 1) {
++    const day = addDays(weekStart, offset);
++    const todays = inWeek.filter((entry) => startsOn(entry, weekStart) === day);
++    if (todays.length === 0) continue;
++    lines.push(
++      "",
++      `**${shortDay(day)}**`,
++      ...todays.map((entry) => lineOf(entry, nameOf)),
++    );
++  }
++  return lines.join("\n");
++}
++
++export type DailyNotice = {
++  channelId: string;
++  text: string;
++  mentions: string[];
++};
++
++/**
++ * Same-day notices: entries happening on `today` that have a notice channel,
++ * one message per channel, mentioning the attendees.
++ */
++export function dailyNotices(
++  occurrences: CalendarOccurrence[],
++  today: string,
++  nameOf: (pubkey: string) => string,
++): DailyNotice[] {
++  const byChannel = new Map<string, CalendarOccurrence[]>();
++  for (const entry of live(occurrences)) {
++    const channelId = entry.notify?.channelId;
++    if (!channelId) continue;
++    if (entry.date > today || (entry.endDate ?? entry.date) < today) continue;
++    byChannel.set(channelId, [...(byChannel.get(channelId) ?? []), entry]);
++  }
++  return [...byChannel.entries()].map(([channelId, entries]) => {
++    const sorted = entries.sort(byStart);
++    const mentions = [
++      ...new Set(sorted.flatMap((entry) => entry.attendees ?? [])),
++    ];
++    const lines = [dailyHeader(today)];
++    for (const entry of sorted) {
++      lines.push(`- ${entryWhenText(entry)} ${entry.title}`);
++      const who = (entry.attendees ?? []).map((pubkey) => `@${nameOf(pubkey)}`);
++      if (who.length) lines.push(`  ${who.join(" ")}`);
++    }
++    return { channelId, text: lines.join("\n"), mentions };
++  });
++}
++
++/** True when `messages` (recent channel posts) already hold a notice starting with `header`. */
++export const alreadyPosted = (
++  messages: Array<{ content: string }>,
++  header: string,
++) => messages.some((message) => message.content.trimStart().startsWith(header));
++
++/** Entries of the calendar to feed the digest (helper for typing). */
++export type DigestSource = CalendarEntry[];
+diff --git a/desktop/src/features/team-calendar/ui/DigestPanel.tsx b/desktop/src/features/team-calendar/ui/DigestPanel.tsx
+new file mode 100644
+index 000000000..92a8df989
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/DigestPanel.tsx
+@@ -0,0 +1,195 @@
++import * as React from "react";
++import { toast } from "sonner";
++
++import { todayKey } from "@/features/team-calendar/lib/teamCalendar";
++import { useNoticeChannels } from "@/features/team-calendar/lib/useNoticeChannels";
++import { useTeamMembers } from "@/features/team-calendar/lib/useTeamMembers";
++import {
++  postDigestNow,
++  useDigestSettings,
++  useWeekOccurrences,
++} from "@/features/team-calendar/lib/useWeeklyDigest";
++import {
++  digestText,
++  weekStartOf,
++} from "@/features/team-calendar/lib/weeklyDigest";
++import { Button } from "@/shared/ui/button";
++import { SELECT_CLASS } from "./EntryForm";
++
++const WEEKDAY_OPTIONS = [
++  [1, "월요일"],
++  [2, "화요일"],
++  [3, "수요일"],
++  [4, "목요일"],
++  [5, "금요일"],
++  [6, "토요일"],
++  [0, "일요일"],
++] as const;
++
++const HOURS = Array.from({ length: 24 }, (_, hour) => hour);
++
++/**
++ * Weekly-digest settings (team patch 55): where and when this week's calendar
++ * summary is posted, plus same-day notices. Shared by every member.
++ */
++export function DigestPanel({
++  pubkey,
++  relayUrl,
++}: {
++  pubkey: string;
++  relayUrl: string;
++}) {
++  const { settings, ready, save } = useDigestSettings(pubkey, relayUrl);
++  const channels = useNoticeChannels();
++  const { nameOf } = useTeamMembers();
++  const weekStart = weekStartOf(todayKey());
++  const { occurrences, ready: calendarReady } = useWeekOccurrences(
++    pubkey,
++    relayUrl,
++    weekStart,
++  );
++  const [saving, setSaving] = React.useState(false);
++  const preview = React.useMemo(
++    () => digestText(occurrences, weekStart, nameOf),
++    [occurrences, weekStart, nameOf],
++  );
++
++  const change = async (patch: Parameters<typeof save>[0]) => {
++    setSaving(true);
++    try {
++      await save(patch);
++    } catch (error) {
++      toast.error(
++        error instanceof Error ? error.message : "설정을 저장하지 못했습니다.",
++      );
++    } finally {
++      setSaving(false);
++    }
++  };
++
++  const sendNow = async () => {
++    if (!settings.channelId) return;
++    try {
++      await postDigestNow(relayUrl, settings.channelId, preview);
++      toast("이번 주 일정 공지를 올렸습니다.");
++    } catch {
++      toast.error("이번 주 일정 공지를 올리지 못했습니다.");
++    }
++  };
++
++  if (!ready) {
++    return (
++      <p className="py-6 text-sm text-muted-foreground">설정을 불러오는 중…</p>
++    );
++  }
++
++  return (
++    <div
++      className="flex flex-col gap-4 md:flex-row"
++      data-testid="team-calendar-digest"
++    >
++      <section
++        aria-label="주간 공지 설정"
++        className="flex min-w-0 flex-1 flex-col gap-3 text-sm"
++      >
++        <p className="text-xs text-muted-foreground">
++          정한 요일·시각에 그 주(월~일) 팀 일정을 채널에 한 번 정리해 올립니다.
++          서버가 아니라 그 시각에 켜져 있는 멤버의 Buzz가 올리고, 이미 올라와
++          있으면 다시 올리지 않습니다. 이 설정은 팀 전체에 같이 적용됩니다.
++        </p>
++        <label className="flex items-center gap-2">
++          <input
++            checked={settings.enabled}
++            data-testid="team-calendar-digest-enabled"
++            disabled={saving || (!settings.channelId && !settings.enabled)}
++            onChange={(event) => void change({ enabled: event.target.checked })}
++            type="checkbox"
++          />
++          매주 일정 공지 켜기
++        </label>
++        <div className="flex flex-wrap items-center gap-2">
++          <select
++            aria-label="공지할 채널"
++            className={SELECT_CLASS}
++            data-testid="team-calendar-digest-channel"
++            disabled={saving}
++            onChange={(event) =>
++              void change({ channelId: event.target.value || null })
++            }
++            value={settings.channelId ?? ""}
++          >
++            <option value="">채널 고르기</option>
++            {channels.map((channel) => (
++              <option key={channel.id} value={channel.id}>
++                #{channel.name}
++              </option>
++            ))}
++          </select>
++          <select
++            aria-label="요일"
++            className={SELECT_CLASS}
++            disabled={saving}
++            onChange={(event) =>
++              void change({ weekday: Number(event.target.value) })
++            }
++            value={settings.weekday}
++          >
++            {WEEKDAY_OPTIONS.map(([value, label]) => (
++              <option key={value} value={value}>
++                {label}
++              </option>
++            ))}
++          </select>
++          <select
++            aria-label="시각"
++            className={SELECT_CLASS}
++            disabled={saving}
++            onChange={(event) =>
++              void change({ hour: Number(event.target.value) })
++            }
++            value={settings.hour}
++          >
++            {HOURS.map((hour) => (
++              <option key={hour} value={hour}>
++                {hour}시
++              </option>
++            ))}
++          </select>
++        </div>
++        <label className="flex items-start gap-2">
++          <input
++            checked={settings.daily}
++            className="mt-0.5"
++            data-testid="team-calendar-digest-daily"
++            disabled={saving}
++            onChange={(event) => void change({ daily: event.target.checked })}
++            type="checkbox"
++          />
++          <span>
++            일정이 있는 날 아침(같은 시각)에, 일정마다 정해 둔 "채널 알림"
++            채널에 오늘 일정을 올리고 참석자를 부르기
++          </span>
++        </label>
++        <div>
++          <Button
++            disabled={!settings.channelId || !calendarReady}
++            onClick={() => void sendNow()}
++            size="sm"
++            type="button"
++            variant="outline"
++          >
++            이번 주 공지 지금 올리기
++          </Button>
++        </div>
++      </section>
++      <section aria-label="미리 보기" className="min-w-0 flex-1">
++        <p className="mb-2 text-xs text-muted-foreground">
++          이번 주 공지 미리 보기
++        </p>
++        <pre className="max-h-80 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/30 p-3 text-xs">
++          {calendarReady ? preview : "일정을 불러오는 중…"}
++        </pre>
++      </section>
++    </div>
++  );
++}
+diff --git a/desktop/src/features/team-calendar/ui/EntryForm.tsx b/desktop/src/features/team-calendar/ui/EntryForm.tsx
+index 3dea2dd90..b440c6443 100644
+--- a/desktop/src/features/team-calendar/ui/EntryForm.tsx
++++ b/desktop/src/features/team-calendar/ui/EntryForm.tsx
+@@ -187,7 +187,7 @@ function endAfterStartMove(draft: Draft, date: string): string {
+   return addDays(date, Math.max(0, daysBetween(draft.date, draft.endDate)));
+ }
+ 
+-const SELECT_CLASS =
++export const SELECT_CLASS =
+   "h-9 rounded-md border border-input bg-background px-2 text-sm focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring";
+ 
+ /** The add/edit form of one calendar entry. */
+diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+index b6a127f8e..dc10e9eff 100644
+--- a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
++++ b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+@@ -58,6 +58,7 @@ import {
+   emptyDraft,
+   inputOfDraft,
+ } from "./EntryForm";
++import { DigestPanel } from "./DigestPanel";
+ import { type PollPick, PollsPanel } from "./PollsPanel";
+ 
+ const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"] as const;
+@@ -125,7 +126,7 @@ export function TeamCalendarDialog({
+   pubkey,
+   relayUrl,
+ }: TeamCalendarDialogProps) {
+-  const [tab, setTab] = React.useState<"calendar" | "polls">("calendar");
++  const [tab, setTab] = React.useState<"calendar" | "polls" | "digest">("calendar");
+   const [selectedDate, setSelectedDate] = React.useState(() => todayKey());
+   const [month, setMonth] = React.useState(() => monthOfDate(todayKey()));
+   const [draft, setDraft] = React.useState<Draft | null>(null);
+@@ -270,6 +271,7 @@ export function TeamCalendarDialog({
+             [
+               ["calendar", "달력"],
+               ["polls", "모임 날짜 투표"],
++              ["digest", "주간 공지"],
+             ] as const
+           ).map(([value, label]) => (
+             <Button
+@@ -287,7 +289,9 @@ export function TeamCalendarDialog({
+           ))}
+         </div>
+ 
+-        {tab === "polls" ? (
++        {tab === "digest" ? (
++          <DigestPanel pubkey={pubkey} relayUrl={relayUrl} />
++        ) : tab === "polls" ? (
+           <PollsPanel
+             members={members}
+             nameOf={nameOf}
+diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
+index 92e1eb5b2..1f6199ec5 100644
+--- a/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
++++ b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
+@@ -6,6 +6,7 @@ import {
+   onAddFromMessage,
+ } from "@/features/team-calendar/lib/addFromMessage";
+ import { useTeamCalendarReminders } from "@/features/team-calendar/lib/useTeamCalendarReminders";
++import { useWeeklyDigest } from "@/features/team-calendar/lib/useWeeklyDigest";
+ import { SidebarMenuButton, SidebarMenuItem } from "@/shared/ui/sidebar";
+ import { SidebarMenuLabel } from "@/shared/ui/sidebar-menu-label";
+ import { AddFromMessageDialog } from "./AddFromMessageDialog";
+@@ -40,6 +41,7 @@ function TeamCalendarEntry({
+     null,
+   );
+   useTeamCalendarReminders(pubkey, relayUrl);
++  useWeeklyDigest(pubkey, relayUrl);
+   React.useEffect(() => onAddFromMessage(setRequest), []);
+ 
+   return (
