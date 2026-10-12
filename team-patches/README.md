@@ -29,6 +29,7 @@ with `git apply --3way`.
 | `93-hide-delete-tombstone.patch` | A member's own deleted message leaves no "removed a message" row (moderator removals still show) | `BUZZ-HIDE-DELETE-TOMBSTONE-PATCH.md` |
 | `94-settings-ui-clarity.patch` | Weekly digest, Google Calendar and shortcut dialogs laid out as numbered steps with an on/off status line; MCP tools folded under "고급" | `BUZZ-SETTINGS-UI-CLARITY-PATCH.md` |
 | `95-update-check-30min.patch` | Background update check every 30 min and on window focus (at most every 10 min) instead of every 6 h | `BUZZ-UPDATE-CHECK-PATCH.md` |
+| `96-agent-status-bar.patch` | One line above the composer showing which channel agents can answer now (presence) and which are resting because their maker's Mac is off | `BUZZ-AGENT-STATUS-BAR-PATCH.md` |
 
 
 If a patch stops applying to a new upstream tag, re-implement it from section 3
