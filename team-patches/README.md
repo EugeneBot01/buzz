@@ -16,7 +16,6 @@ with `git apply --3way`.
 | `55-weekly-digest.patch` | Weekly team-calendar digest to a channel (default Mon 9:00) and same-day notices to each entry's channel with attendee mentions | `BUZZ-WEEKLY-DIGEST-PATCH.md` |
 | `60-channel-files.patch` | Channel files: list a channel's attachments, select several and save them into one folder; raises the single-file download cap from 50 MiB to 512 MiB | `BUZZ-CHANNEL-FILES-PATCH.md` |
 | `65-upload-pack-refused.patch` | Uploads: audio files and images other than JPEG/PNG/GIF/WebP, which the relay refuses as attachments, are packed into a one-entry zip before upload (`media_team_zip.rs`). The safety deny-list (executables, disk images) is left as it is | (this row) |
-| `66-team-zip-audio.patch` | Play and save audio uploaded as a one-file team zip (`song.m4a.zip`) right in the message | `BUZZ-TEAM-ZIP-AUDIO-PATCH.md` |
 | `70-channel-connections.patch` | Channel connections: one-click shortcuts (Google Meet, Figma, any https link) in the channel header, and MCP servers for the channel's agents (passed by `buzz-acp` to any runtime) | `BUZZ-CHANNEL-CONNECTIONS-PATCH.md` |
 | `80-project-names.patch` | Projects: a name written in Korean (or any non-ASCII script) gets a stable ASCII id instead of an empty one, so the project can be created; the create error shows next to the button instead of below the fold | (this row) |
 | `85-send-scope.patch` | Sending: the composer and the inbox reply pass the active community as the expected relay scope, so a send is refused instead of published to another community's relay (block/buzz#7518); the two resulting errors get a Korean message that says to restart | (this row) |
@@ -25,6 +24,8 @@ with `git apply --3way`.
 | `36-korean-transcripts.patch` | Korean live huddle transcripts (SenseVoice model) with a 한/EN toggle, and remote speech attributed to the actual speaker | `BUZZ-KOREAN-TRANSCRIPT-PATCH.md` |
 | `37-huddle-invites.patch` | Discord-style huddle invites: ring a person into the running call (DM huddle card), optionally add them to the channel | `BUZZ-HUDDLE-INVITE-PATCH.md` |
 | `90-render-when-covered.patch` | Opt-in per Mac (`BuzzRenderWhenCovered`): keep web views painting while covered so window captures stay current | `BUZZ-RENDER-WHEN-COVERED-PATCH.md` |
+| `91-google-calendar-push.patch` | Team calendar "구글 캘린더" tab: one device pushes Buzz calendar adds/edits/deletes to a Google Calendar through an Apps Script web app (one way) | `BUZZ-GOOGLE-CALENDAR-PUSH-PATCH.md` |
+| `92-zip-audio.patch` | Packed audio (`song.m4a.zip`) shows as `song.m4a` with in-chat play, and saves as the original file | `BUZZ-ZIP-AUDIO-PATCH.md` |
 
 
 If a patch stops applying to a new upstream tag, re-implement it from section 3
