@@ -1,0 +1,39 @@
+diff --git a/desktop/src/features/settings/hooks/use-updater.ts b/desktop/src/features/settings/hooks/use-updater.ts
+index 70f2544a8..48b6c035d 100644
+--- a/desktop/src/features/settings/hooks/use-updater.ts
++++ b/desktop/src/features/settings/hooks/use-updater.ts
+@@ -20,7 +20,11 @@ export type UpdateStatus =
+       releaseUrl: string;
+     };
+ 
+-const BACKGROUND_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
++// Team build (patch 95): check every 30 minutes and when the window comes back
++// into focus (at most every 10 minutes), so a team release reaches people who
++// keep Buzz open all day the same afternoon.
++const BACKGROUND_UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
++const FOCUS_UPDATE_CHECK_MIN_GAP_MS = 10 * 60 * 1000;
+ const BACKGROUND_BLOCKED_STATES = new Set<UpdateStatus["state"]>([
+   "checking",
+   "available",
+@@ -212,12 +216,21 @@ export function useUpdater() {
+   useEffect(() => {
+     void checkForUpdateInBackground();
+ 
++    let lastCheck = Date.now();
+     const intervalId = window.setInterval(() => {
++      lastCheck = Date.now();
+       void checkForUpdateInBackground();
+     }, BACKGROUND_UPDATE_CHECK_INTERVAL_MS);
++    const onFocus = () => {
++      if (Date.now() - lastCheck < FOCUS_UPDATE_CHECK_MIN_GAP_MS) return;
++      lastCheck = Date.now();
++      void checkForUpdateInBackground();
++    };
++    window.addEventListener("focus", onFocus);
+ 
+     return () => {
+       window.clearInterval(intervalId);
++      window.removeEventListener("focus", onFocus);
+       closeUpdate();
+     };
+   }, [checkForUpdateInBackground, closeUpdate]);

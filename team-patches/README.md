@@ -27,6 +27,8 @@ with `git apply --3way`.
 | `91-google-calendar-push.patch` | Team calendar "구글 캘린더" tab: one device pushes Buzz calendar adds/edits/deletes to a Google Calendar through an Apps Script web app (one way) | `BUZZ-GOOGLE-CALENDAR-PUSH-PATCH.md` |
 | `92-zip-audio.patch` | Packed audio (`song.m4a.zip`) shows as `song.m4a` with in-chat play, and saves as the original file | `BUZZ-ZIP-AUDIO-PATCH.md` |
 | `93-hide-delete-tombstone.patch` | A member's own deleted message leaves no "removed a message" row (moderator removals still show) | `BUZZ-HIDE-DELETE-TOMBSTONE-PATCH.md` |
+| `94-settings-ui-clarity.patch` | Weekly digest, Google Calendar and shortcut dialogs laid out as numbered steps with an on/off status line; MCP tools folded under "고급" | `BUZZ-SETTINGS-UI-CLARITY-PATCH.md` |
+| `95-update-check-30min.patch` | Background update check every 30 min and on window focus (at most every 10 min) instead of every 6 h | `BUZZ-UPDATE-CHECK-PATCH.md` |
 
 
 If a patch stops applying to a new upstream tag, re-implement it from section 3
