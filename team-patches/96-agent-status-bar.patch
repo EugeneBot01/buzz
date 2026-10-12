@@ -1,0 +1,97 @@
+diff --git a/desktop/src/features/messages/ui/ChannelAgentStatusBar.tsx b/desktop/src/features/messages/ui/ChannelAgentStatusBar.tsx
+new file mode 100644
+index 000000000..58e3fafd6
+--- /dev/null
++++ b/desktop/src/features/messages/ui/ChannelAgentStatusBar.tsx
+@@ -0,0 +1,71 @@
++import * as React from "react";
++
++import { useAgentAvailabilityLookup } from "@/features/agents/lib/useAgentAvailability";
++import { useChannelMembersQuery } from "@/features/channels/hooks";
++
++const MAX_NAMES = 3;
++
++const nameList = (names: string[]) =>
++  names.length > MAX_NAMES
++    ? `${names.slice(0, MAX_NAMES).join(", ")} 외 ${names.length - MAX_NAMES}`
++    : names.join(", ");
++
++/**
++ * Team patch 96: one line above the composer saying which of this channel's
++ * agents can answer right now. Agents run on their maker's Mac, so an agent
++ * whose presence lapsed (Mac off or asleep) is shown as resting instead of
++ * leaving people waiting for a reply that will not come.
++ */
++export function ChannelAgentStatusBar({
++  channelId,
++}: {
++  channelId: string | null;
++}) {
++  const membersQuery = useChannelMembersQuery(channelId);
++  const agents = React.useMemo(
++    () => (membersQuery.data ?? []).filter((member) => member.isAgent),
++    [membersQuery.data],
++  );
++  const pubkeys = React.useMemo(
++    () => agents.map((agent) => agent.pubkey),
++    [agents],
++  );
++  const { getAvailability } = useAgentAvailabilityLookup(pubkeys, {
++    enabled: pubkeys.length > 0,
++  });
++
++  if (agents.length === 0) return null;
++
++  const online: string[] = [];
++  const resting: string[] = [];
++  let unknown = false;
++  for (const agent of agents) {
++    const name = agent.displayName?.trim() || "에이전트";
++    const status = getAvailability(agent.pubkey);
++    if (status === undefined) unknown = true;
++    else if (status === "online" || status === "away") online.push(name);
++    else resting.push(name);
++  }
++  if (unknown && online.length === 0 && resting.length === 0) return null;
++
++  return (
++    <div
++      className="mb-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 px-1 text-xs text-muted-foreground"
++      data-testid="channel-agent-status"
++    >
++      {online.length > 0 ? (
++        <span>
++          <span className="mr-1 inline-block h-2 w-2 rounded-full bg-emerald-500 align-middle" />
++          <span className="text-foreground">{nameList(online)}</span> 지금 답할
++          수 있어요
++        </span>
++      ) : null}
++      {resting.length > 0 ? (
++        <span>
++          <span className="mr-1 inline-block h-2 w-2 rounded-full bg-muted-foreground/40 align-middle" />
++          {nameList(resting)} 쉬는 중 (만든 사람 맥이 꺼져 있으면 답하지 않아요)
++        </span>
++      ) : null}
++    </div>
++  );
++}
+diff --git a/desktop/src/features/messages/ui/MessageComposer.tsx b/desktop/src/features/messages/ui/MessageComposer.tsx
+index 6286ebfb5..1d8e8897d 100644
+--- a/desktop/src/features/messages/ui/MessageComposer.tsx
++++ b/desktop/src/features/messages/ui/MessageComposer.tsx
+@@ -6,6 +6,7 @@ import {
+ } from "@/features/messages/lib/useChannelLinks";
+ import { useComposerAutofocus } from "@/features/messages/lib/useComposerAutofocus";
+ import { useDrafts } from "@/features/messages/lib/useDrafts";
++import { ChannelAgentStatusBar } from "./ChannelAgentStatusBar";
+ import { resolveSentDraftKey } from "@/features/messages/ui/draftSubmitKey";
+ import {
+   useEmojiAutocomplete,
+@@ -832,6 +833,7 @@ function MessageComposerImpl({
+           className="absolute inset-x-0 bottom-0 h-5 bg-transparent"
+         />
+         <div className="relative flex w-full flex-col gap-0">
++          <ChannelAgentStatusBar channelId={channelId} />
+           <ComposerReplyEditBanner
+             isEditing={editTarget != null}
+             isEditCancelDisabled={isDeferredEditPending}
