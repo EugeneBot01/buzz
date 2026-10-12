@@ -26,6 +26,7 @@ with `git apply --3way`.
 | `90-render-when-covered.patch` | Opt-in per Mac (`BuzzRenderWhenCovered`): keep web views painting while covered so window captures stay current | `BUZZ-RENDER-WHEN-COVERED-PATCH.md` |
 | `91-google-calendar-push.patch` | Team calendar "구글 캘린더" tab: one device pushes Buzz calendar adds/edits/deletes to a Google Calendar through an Apps Script web app (one way) | `BUZZ-GOOGLE-CALENDAR-PUSH-PATCH.md` |
 | `92-zip-audio.patch` | Packed audio (`song.m4a.zip`) shows as `song.m4a` with in-chat play, and saves as the original file | `BUZZ-ZIP-AUDIO-PATCH.md` |
+| `93-hide-delete-tombstone.patch` | A member's own deleted message leaves no "removed a message" row (moderator removals still show) | `BUZZ-HIDE-DELETE-TOMBSTONE-PATCH.md` |
 
 
 If a patch stops applying to a new upstream tag, re-implement it from section 3
