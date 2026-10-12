@@ -1,5 +1,5 @@
 diff --git a/desktop/src/features/messages/ui/MessageActionBar.tsx b/desktop/src/features/messages/ui/MessageActionBar.tsx
-index 082cb0b..848f3c5 100644
+index 082cb0b12..848f3c563 100644
 --- a/desktop/src/features/messages/ui/MessageActionBar.tsx
 +++ b/desktop/src/features/messages/ui/MessageActionBar.tsx
 @@ -1,6 +1,7 @@
@@ -42,7 +42,7 @@ index 082cb0b..848f3c5 100644
              <DropdownMenuItem
                aria-label="Send to channel"
 diff --git a/desktop/src/features/sidebar/ui/AppSidebar.tsx b/desktop/src/features/sidebar/ui/AppSidebar.tsx
-index 22f10c6..a434db3 100644
+index 22f10c68d..a434db37f 100644
 --- a/desktop/src/features/sidebar/ui/AppSidebar.tsx
 +++ b/desktop/src/features/sidebar/ui/AppSidebar.tsx
 @@ -18,6 +18,7 @@ import {
@@ -67,7 +67,7 @@ index 22f10c6..a434db3 100644
                  onSelectAgents={onSelectAgents}
                  onSelectHome={onSelectHome}
 diff --git a/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx b/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
-index 660f7d9..4605704 100644
+index 660f7d9a8..460570469 100644
 --- a/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
 +++ b/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
 @@ -1,4 +1,5 @@
@@ -103,7 +103,7 @@ index 660f7d9..4605704 100644
        <SidebarProjectsSection />
 diff --git a/desktop/src/features/team-calendar/lib/addFromMessage.ts b/desktop/src/features/team-calendar/lib/addFromMessage.ts
 new file mode 100644
-index 0000000..dc018c5
+index 000000000..dc018c5a9
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/addFromMessage.ts
 @@ -0,0 +1,30 @@
@@ -137,9 +137,42 @@ index 0000000..dc018c5
 +/** The calendar entry id for a message, so adding it twice edits one entry. */
 +export const entryIdForMessage = (eventId: string) =>
 +  `msg-${eventId.slice(0, 48)}`;
+diff --git a/desktop/src/features/team-calendar/lib/channelNotice.ts b/desktop/src/features/team-calendar/lib/channelNotice.ts
+new file mode 100644
+index 000000000..d86700b75
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/channelNotice.ts
+@@ -0,0 +1,27 @@
++import { sendChannelMessage } from "@/shared/api/tauriMessages";
++import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
++
++/**
++ * Posts a calendar notice to a channel as the current member (team patch).
++ * The relay URL is passed as the expected scope, so the message is refused
++ * rather than published elsewhere if the app is bound to another community.
++ */
++export async function postChannelNotice(
++  relayUrl: string,
++  channelId: string,
++  text: string,
++): Promise<void> {
++  await sendChannelMessage(
++    channelId,
++    text,
++    null,
++    undefined,
++    undefined,
++    undefined,
++    undefined,
++    undefined,
++    undefined,
++    undefined,
++    normalizeRelayUrl(relayUrl),
++  );
++}
 diff --git a/desktop/src/features/team-calendar/lib/parseSchedule.ts b/desktop/src/features/team-calendar/lib/parseSchedule.ts
 new file mode 100644
-index 0000000..2b38eab
+index 000000000..2b38eabed
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/parseSchedule.ts
 @@ -0,0 +1,183 @@
@@ -328,7 +361,7 @@ index 0000000..2b38eab
 +}
 diff --git a/desktop/src/features/team-calendar/lib/teamCalendar.test.mjs b/desktop/src/features/team-calendar/lib/teamCalendar.test.mjs
 new file mode 100644
-index 0000000..82fb933
+index 000000000..82fb933fd
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/teamCalendar.test.mjs
 @@ -0,0 +1,415 @@
@@ -749,10 +782,10 @@ index 0000000..82fb933
 +});
 diff --git a/desktop/src/features/team-calendar/lib/teamCalendar.ts b/desktop/src/features/team-calendar/lib/teamCalendar.ts
 new file mode 100644
-index 0000000..aa9dd61
+index 000000000..6d2693d8f
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/teamCalendar.ts
-@@ -0,0 +1,674 @@
+@@ -0,0 +1,710 @@
 +import type { RelayEvent } from "@/shared/api/types";
 +import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
 +
@@ -798,12 +831,43 @@ index 0000000..aa9dd61
 +  "purple",
 +  "pink",
 +  "gray",
++  "yellow",
++  "lime",
++  "teal",
++  "cyan",
++  "indigo",
++  "brown",
 +] as const;
 +export type CalendarColor = (typeof CALENDAR_COLORS)[number];
 +
 +const isCalendarColor = (value: unknown): value is CalendarColor =>
 +  typeof value === "string" &&
 +  (CALENDAR_COLORS as readonly string[]).includes(value);
++
++/** Minutes before the start a channel can be reminded at. */
++export const NOTIFY_BEFORE_CHOICES = [10, 30, 60, 180, 1_440] as const;
++
++/**
++ * A channel that hears about an entry. `before` (minutes) asks for a reminder
++ * message in that channel ahead of the start; it is posted by the app of the
++ * member who last saved the entry (`updatedBy`), while that app is running.
++ */
++export type CalendarNotify = { channelId: string; before?: number };
++
++function readNotify(raw: unknown): CalendarNotify | null {
++  if (!raw || typeof raw !== "object") return null;
++  const value = raw as Record<string, unknown>;
++  if (
++    typeof value.channelId !== "string" ||
++    value.channelId.length === 0 ||
++    value.channelId.length > 64
++  )
++    return null;
++  const notify: CalendarNotify = { channelId: value.channelId };
++  if ((NOTIFY_BEFORE_CHOICES as readonly unknown[]).includes(value.before))
++    notify.before = value.before as number;
++  return notify;
++}
 +
 +/** How often a repeating entry comes back. */
 +export const REPEAT_CHOICES = ["daily", "weekly", "biweekly", "monthly"] as const;
@@ -844,6 +908,8 @@ index 0000000..aa9dd61
 +  skip?: string[];
 +  /** Id of the chat message this entry was made from. */
 +  sourceEventId?: string;
++  /** A channel that is told about this entry (see `CalendarNotify`). */
++  notify?: CalendarNotify;
 +  /** Milliseconds since epoch of the last edit. */
 +  updatedAt: number;
 +  /** Pubkey of the member who made the last edit. */
@@ -1049,6 +1115,8 @@ index 0000000..aa9dd61
 +      if (skip.length > 0) entry.skip = skip.sort().slice(-MAX_SKIPPED_DAYS);
 +    }
 +  }
++  const notify = readNotify(value.notify);
++  if (notify) entry.notify = notify;
 +  if (
 +    typeof value.sourceEventId === "string" &&
 +    /^[0-9a-f]{64}$/.test(value.sourceEventId)
@@ -1093,7 +1161,8 @@ index 0000000..aa9dd61
 +  (entry.endTime ? 1 : 0) +
 +  (entry.color ? 1 : 0) +
 +  (entry.attendees ? 1 : 0) +
-+  (entry.sourceEventId ? 1 : 0);
++  (entry.sourceEventId ? 1 : 0) +
++  (entry.notify ? 1 : 0);
 +
 +/**
 + * True when `candidate` replaces `current` (later edit, then higher pubkey).
@@ -1429,10 +1498,10 @@ index 0000000..aa9dd61
 +}
 diff --git a/desktop/src/features/team-calendar/lib/teamExtras.test.mjs b/desktop/src/features/team-calendar/lib/teamExtras.test.mjs
 new file mode 100644
-index 0000000..0df6772
+index 000000000..a9958be79
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/teamExtras.test.mjs
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,328 @@
 +import assert from "node:assert/strict";
 +import test from "node:test";
 +
@@ -1721,9 +1790,49 @@ index 0000000..0df6772
 +  assert.equal(ranked.length, 4);
 +  assert.ok(ranked.slice(1).every((range) => range.members.length === 1));
 +});
++
++test("an entry can name a channel to tell, and only its last editor posts the reminder", async () => {
++  const { channelNoticeText, dueChannelNotices, entryWhenText } = await import("./teamReminders.ts");
++  const { CALENDAR_COLORS } = await import("./teamCalendar.ts");
++  assert.ok(CALENDAR_COLORS.includes("teal") && CALENDAR_COLORS.includes("brown"));
++  const stored = entry({
++    time: "15:00",
++    endTime: "17:00",
++    color: "teal",
++    note: "회의실 A",
++    notify: { channelId: "chan-1", before: 30 },
++  });
++  const decoded = decodeMonth(encodeMonth({ e1: stored }), "2026-10").e1;
++  assert.deepEqual(decoded.notify, { channelId: "chan-1", before: 30 });
++  assert.equal(decoded.color, "teal");
++  // A lead time that is not offered is dropped; the channel is kept.
++  const odd = decodeMonth(
++    encodeMonth({ e1: entry({ notify: { channelId: "chan-1", before: 7 } }) }),
++    "2026-10",
++  ).e1;
++  assert.deepEqual(odd.notify, { channelId: "chan-1" });
++  const start = occurrenceStartMs(stored);
++  const due = (pubkey, sinceMin, nowMin) =>
++    dueChannelNotices({
++      entries: [stored],
++      pubkey,
++      sinceMs: start - sinceMin * 60_000,
++      nowMs: start - nowMin * 60_000,
++    }).length;
++  assert.equal(due(A, 31, 29.5), 1);
++  assert.equal(due(A, 29.5, 29), 0);
++  assert.equal(due(B, 31, 29.5), 0);
++  assert.equal(due(A, 31, -1), 0);
++  assert.equal(entryWhenText(stored), "10월 12일 (월) 15:00 ~ 17:00");
++  assert.equal(entryWhenText(entry({})), "10월 12일 (월) 하루 종일");
++  assert.equal(
++    channelNoticeText(stored, "새 일정"),
++    "📅 새 일정: 회의\n10월 12일 (월) 15:00 ~ 17:00\n회의실 A",
++  );
++});
 diff --git a/desktop/src/features/team-calendar/lib/teamPolls.ts b/desktop/src/features/team-calendar/lib/teamPolls.ts
 new file mode 100644
-index 0000000..5a65579
+index 000000000..5a65579e5
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/teamPolls.ts
 @@ -0,0 +1,422 @@
@@ -2151,10 +2260,10 @@ index 0000000..5a65579
 +}
 diff --git a/desktop/src/features/team-calendar/lib/teamReminders.ts b/desktop/src/features/team-calendar/lib/teamReminders.ts
 new file mode 100644
-index 0000000..56078c0
+index 000000000..48bf562a3
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/teamReminders.ts
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,166 @@
 +import { type CalendarOccurrence, isAttendee } from "./teamCalendar";
 +
 +/**
@@ -2238,6 +2347,62 @@ index 0000000..56078c0
 +export type DueReminder = { entry: CalendarOccurrence; offset: number };
 +
 +/**
++ * The channel reminders that came due after `sinceMs` and up to `nowMs`.
++ * Only the member who last saved an entry posts its channel reminder, so a
++ * channel gets one message however many members have the app open.
++ */
++export function dueChannelNotices(input: {
++  entries: CalendarOccurrence[];
++  pubkey: string;
++  sinceMs: number;
++  nowMs: number;
++}): CalendarOccurrence[] {
++  return input.entries.filter((entry) => {
++    if (entry.deleted || entry.updatedBy !== input.pubkey) return false;
++    const before = entry.notify?.before;
++    if (!before) return false;
++    const start = occurrenceStartMs(entry);
++    if (start <= input.nowMs) return false;
++    const fireAt = start - before * 60_000;
++    return fireAt > input.sinceMs && fireAt <= input.nowMs;
++  });
++}
++
++/** The parts of an entry a channel notice mentions. */
++export type NoticeEntry = Pick<
++  CalendarOccurrence,
++  "title" | "date" | "time" | "endDate" | "endTime" | "note"
++>;
++
++/** "10월 12일 (월) 15:00 ~ 17:00" for a message about an entry. */
++export function entryWhenText(entry: NoticeEntry): string {
++  const day = (date: string) => {
++    const [year, month, dayOfMonth] = date.split("-").map(Number) as [
++      number,
++      number,
++      number,
++    ];
++    const weekday = ["일", "월", "화", "수", "목", "금", "토"][
++      new Date(year, month - 1, dayOfMonth).getDay()
++    ];
++    return `${month}월 ${dayOfMonth}일 (${weekday})`;
++  };
++  const end = entry.endDate ?? entry.date;
++  if (end === entry.date) {
++    if (!entry.time) return `${day(entry.date)} 하루 종일`;
++    return `${day(entry.date)} ${entry.time}${entry.endTime ? ` ~ ${entry.endTime}` : ""}`;
++  }
++  return `${day(entry.date)}${entry.time ? ` ${entry.time}` : ""} ~ ${day(end)}${entry.endTime ? ` ${entry.endTime}` : ""}`;
++}
++
++/** The text posted to a channel about an entry. */
++export function channelNoticeText(entry: NoticeEntry, lead: string): string {
++  const lines = [`📅 ${lead}: ${entry.title}`, entryWhenText(entry)];
++  if (entry.note) lines.push(entry.note);
++  return lines.join("\n");
++}
++
++/**
 + * The reminders that came due after `sinceMs` and up to `nowMs`, for entries
 + * `pubkey` attends that have not started yet. One per entry: when several
 + * came due together (the app was closed), only the nearest to the start.
@@ -2265,12 +2430,36 @@ index 0000000..56078c0
 +  }
 +  return due;
 +}
+diff --git a/desktop/src/features/team-calendar/lib/useNoticeChannels.ts b/desktop/src/features/team-calendar/lib/useNoticeChannels.ts
+new file mode 100644
+index 000000000..b598e5284
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/useNoticeChannels.ts
+@@ -0,0 +1,18 @@
++import * as React from "react";
++
++import { useChannelsQuery } from "@/features/channels/hooks";
++
++/** The channels of this community a calendar notice can be posted to. */
++export function useNoticeChannels(): Array<{ id: string; name: string }> {
++  const channels = useChannelsQuery().data;
++  return React.useMemo(
++    () =>
++      (channels ?? [])
++        .filter(
++          (channel) => channel.channelType === "stream" && !channel.archivedAt,
++        )
++        .map((channel) => ({ id: channel.id, name: channel.name }))
++        .sort((a, b) => a.name.localeCompare(b.name, "ko")),
++    [channels],
++  );
++}
 diff --git a/desktop/src/features/team-calendar/lib/useTeamCalendar.ts b/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
 new file mode 100644
-index 0000000..0a21cca
+index 000000000..bee6faf73
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
-@@ -0,0 +1,478 @@
+@@ -0,0 +1,485 @@
 +import * as React from "react";
 +
 +import { relayClient } from "@/shared/api/relayClient";
@@ -2281,6 +2470,7 @@ index 0000000..0a21cca
 +  type CalendarColor,
 +  type CalendarEntry,
 +  type CalendarMonth,
++  type CalendarNotify,
 +  type CalendarRepeat,
 +  MAX_ATTENDEES,
 +  MAX_NOTE_LENGTH,
@@ -2320,6 +2510,7 @@ index 0000000..0a21cca
 +  repeat?: CalendarRepeat;
 +  skip?: string[];
 +  sourceEventId?: string;
++  notify?: CalendarNotify;
 +};
 +
 +/** The input that saves `entry` again unchanged (to change one field of it). */
@@ -2336,6 +2527,7 @@ index 0000000..0a21cca
 +  repeat: entry.repeat,
 +  skip: entry.skip,
 +  sourceEventId: entry.sourceEventId,
++  notify: entry.notify,
 +});
 +
 +export type TeamCalendarStatus = "loading" | "ready" | "error";
@@ -2430,6 +2622,10 @@ index 0000000..0a21cca
 +      entry.skip = [...new Set(input.skip)].sort().slice(-MAX_SKIPPED_DAYS);
 +  }
 +  if (input.sourceEventId) entry.sourceEventId = input.sourceEventId;
++  if (input.notify?.channelId) {
++    entry.notify = { channelId: input.notify.channelId };
++    if (input.notify.before) entry.notify.before = input.notify.before;
++  }
 +  return entry;
 +}
 +
@@ -2751,10 +2947,10 @@ index 0000000..0a21cca
 +}
 diff --git a/desktop/src/features/team-calendar/lib/useTeamCalendarReminders.ts b/desktop/src/features/team-calendar/lib/useTeamCalendarReminders.ts
 new file mode 100644
-index 0000000..c1241aa
+index 000000000..10ed041c7
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/useTeamCalendarReminders.ts
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,182 @@
 +import * as React from "react";
 +import { toast } from "sonner";
 +
@@ -2772,10 +2968,13 @@ index 0000000..c1241aa
 +import {
 +  MAX_REMINDER_OFFSET_MINUTES,
 +  type ReminderOverrides,
++  channelNoticeText,
++  dueChannelNotices,
 +  dueReminders,
 +  parseReminderOverrides,
 +  reminderLabel,
 +} from "./teamReminders";
++import { postChannelNotice } from "./channelNotice";
 +import { useTeamCalendarMonth } from "./useTeamCalendar";
 +
 +const CHECK_INTERVAL_MS = 30_000;
@@ -2890,10 +3089,33 @@ index 0000000..c1241aa
 +        sinceMs,
 +        nowMs,
 +      });
++      const notices = dueChannelNotices({
++        entries: entriesRef.current,
++        pubkey,
++        sinceMs,
++        nowMs,
++      });
 +      try {
 +        window.localStorage.setItem(key, String(nowMs));
 +      } catch {
 +        // `shown` still stops repeats within this run.
++      }
++      for (const entry of notices) {
++        const channelId = entry.notify?.channelId;
++        const before = entry.notify?.before;
++        if (!channelId || !before) continue;
++        const id = `${entry.id}@${entry.date}@channel`;
++        if (shown.has(id)) continue;
++        shown.add(id);
++        // One attempt: the watermark has moved on, so a failed post is not
++        // retried into the channel later, out of time.
++        void postChannelNotice(
++          relayUrl,
++          channelId,
++          channelNoticeText(entry, `일정 알림 (${reminderLabel(before)})`),
++        ).catch(() =>
++          toast.error(`"${entry.title}" 일정 알림을 채널에 올리지 못했습니다.`),
++        );
 +      }
 +      for (const { entry, offset } of due) {
 +        const id = `${entry.id}@${entry.date}@${offset}`;
@@ -2913,7 +3135,7 @@ index 0000000..c1241aa
 +}
 diff --git a/desktop/src/features/team-calendar/lib/useTeamMembers.ts b/desktop/src/features/team-calendar/lib/useTeamMembers.ts
 new file mode 100644
-index 0000000..3039fd4
+index 000000000..3039fd4ab
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/useTeamMembers.ts
 @@ -0,0 +1,45 @@
@@ -2964,7 +3186,7 @@ index 0000000..3039fd4
 +}
 diff --git a/desktop/src/features/team-calendar/lib/useTeamPolls.ts b/desktop/src/features/team-calendar/lib/useTeamPolls.ts
 new file mode 100644
-index 0000000..1005312
+index 000000000..100531284
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/useTeamPolls.ts
 @@ -0,0 +1,291 @@
@@ -3261,10 +3483,10 @@ index 0000000..1005312
 +}
 diff --git a/desktop/src/features/team-calendar/ui/AddFromMessageDialog.tsx b/desktop/src/features/team-calendar/ui/AddFromMessageDialog.tsx
 new file mode 100644
-index 0000000..203cbbc
+index 000000000..a915b9207
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/AddFromMessageDialog.tsx
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,148 @@
 +import * as React from "react";
 +import { toast } from "sonner";
 +
@@ -3278,7 +3500,10 @@ index 0000000..203cbbc
 +  titleFromMessage,
 +} from "@/features/team-calendar/lib/parseSchedule";
 +import { todayKey } from "@/features/team-calendar/lib/teamCalendar";
++import { postChannelNotice } from "@/features/team-calendar/lib/channelNotice";
++import { channelNoticeText } from "@/features/team-calendar/lib/teamReminders";
 +import { saveEntryToDoc } from "@/features/team-calendar/lib/useTeamCalendar";
++import { useNoticeChannels } from "@/features/team-calendar/lib/useNoticeChannels";
 +import { useTeamMembers } from "@/features/team-calendar/lib/useTeamMembers";
 +import {
 +  Dialog,
@@ -3321,6 +3546,7 @@ index 0000000..203cbbc
 +    [channelMembers],
 +  );
 +  const { members } = useTeamMembers(channelPeople);
++  const channels = useNoticeChannels();
 +  const parsed = React.useMemo(
 +    () => parseSchedule(request.text),
 +    [request.text],
@@ -3352,7 +3578,15 @@ index 0000000..203cbbc
 +    if (saving || draft.title.trim().length === 0 || draftError(draft)) return;
 +    setSaving(true);
 +    try {
-+      await saveEntryToDoc({ pubkey, relayUrl, entry: inputOfDraft(draft) });
++      const input = inputOfDraft(draft);
++      await saveEntryToDoc({ pubkey, relayUrl, entry: input });
++      if (draft.notifyNow && input.notify?.channelId) {
++        void postChannelNotice(
++          relayUrl,
++          input.notify.channelId,
++          channelNoticeText(input, "새 일정"),
++        ).catch(() => toast.error("채널에 일정을 알리지 못했습니다."));
++      }
 +      toast.success("캘린더에 추가했습니다.");
 +      onClose();
 +    } catch (error) {
@@ -3382,6 +3616,7 @@ index 0000000..203cbbc
 +          </DialogDescription>
 +        </DialogHeader>
 +        <EntryForm
++          channels={channels}
 +          draft={draft}
 +          members={members}
 +          onCancel={onClose}
@@ -3402,10 +3637,10 @@ index 0000000..203cbbc
 +}
 diff --git a/desktop/src/features/team-calendar/ui/EntryForm.tsx b/desktop/src/features/team-calendar/ui/EntryForm.tsx
 new file mode 100644
-index 0000000..155f643
+index 000000000..3dea2dd90
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/EntryForm.tsx
-@@ -0,0 +1,355 @@
+@@ -0,0 +1,465 @@
 +import type * as React from "react";
 +
 +import {
@@ -3414,6 +3649,7 @@ index 0000000..155f643
 +  CALENDAR_COLORS,
 +  MAX_NOTE_LENGTH,
 +  MAX_TITLE_LENGTH,
++  NOTIFY_BEFORE_CHOICES,
 +  type RepeatEvery,
 +  REPEAT_CHOICES,
 +  addDays,
@@ -3421,6 +3657,7 @@ index 0000000..155f643
 +  entryEndDate,
 +  validateRange,
 +} from "@/features/team-calendar/lib/teamCalendar";
++import { reminderLabel } from "@/features/team-calendar/lib/teamReminders";
 +import type { CalendarEntryInput } from "@/features/team-calendar/lib/useTeamCalendar";
 +import type { TeamMember } from "@/features/team-calendar/lib/useTeamMembers";
 +import { cn } from "@/shared/lib/cn";
@@ -3445,6 +3682,12 @@ index 0000000..155f643
 +  purple: { label: "보라", bar: "bg-purple-500/25", dot: "bg-purple-500" },
 +  pink: { label: "분홍", bar: "bg-pink-500/25", dot: "bg-pink-500" },
 +  gray: { label: "회색", bar: "bg-gray-500/25", dot: "bg-gray-500" },
++  yellow: { label: "노랑", bar: "bg-yellow-500/30", dot: "bg-yellow-400" },
++  lime: { label: "연두", bar: "bg-lime-500/25", dot: "bg-lime-500" },
++  teal: { label: "청록", bar: "bg-teal-500/25", dot: "bg-teal-500" },
++  cyan: { label: "하늘", bar: "bg-cyan-500/25", dot: "bg-cyan-500" },
++  indigo: { label: "남색", bar: "bg-indigo-500/25", dot: "bg-indigo-500" },
++  brown: { label: "갈색", bar: "bg-amber-800/30", dot: "bg-amber-800" },
 +};
 +const COLOR_CHOICES: ColorChoice[] = ["", ...CALENDAR_COLORS];
 +
@@ -3470,6 +3713,11 @@ index 0000000..155f643
 +  attendees: string[];
 +  skip?: string[];
 +  sourceEventId?: string;
++  /** Channel told about the entry ("" = none) and its reminder lead (0 = none). */
++  notifyChannelId: string;
++  notifyBefore: number;
++  /** Also post to the channel right when the entry is saved. */
++  notifyNow: boolean;
 +};
 +
 +export const emptyDraft = (date: string): Draft => ({
@@ -3484,6 +3732,9 @@ index 0000000..155f643
 +  until: "",
 +  everyone: true,
 +  attendees: [],
++  notifyChannelId: "",
++  notifyBefore: 0,
++  notifyNow: false,
 +});
 +
 +/** The draft that edits `entry` (for a repeating entry: the whole series). */
@@ -3505,6 +3756,28 @@ index 0000000..155f643
 +    attendees: entry.attendees ?? [],
 +    skip: entry.skip,
 +    sourceEventId: entry.sourceEventId,
++    notifyChannelId: entry.notify?.channelId ?? "",
++    notifyBefore: entry.notify?.before ?? 0,
++    notifyNow: false,
++  };
++}
++
++/**
++ * A draft that makes a copy of `entry` starting on `date`: same length, time,
++ * color, attendees, note and channel. A copy is a one-off entry even when the
++ * original repeats, and it is a new entry (no id, no source message).
++ */
++export function copyDraftOf(entry: CalendarOccurrence, date: string): Draft {
++  const span = daysBetween(entry.date, entryEndDate(entry));
++  return {
++    ...draftOf(entry),
++    id: undefined,
++    date,
++    endDate: addDays(date, span),
++    repeat: "",
++    until: "",
++    skip: undefined,
++    sourceEventId: undefined,
 +  };
 +}
 +
@@ -3542,6 +3815,12 @@ index 0000000..155f643
 +    repeat: repeatOf(draft),
 +    skip: draft.repeat ? draft.skip : undefined,
 +    sourceEventId: draft.sourceEventId,
++    notify: draft.notifyChannelId
++      ? {
++          channelId: draft.notifyChannelId,
++          before: draft.notifyBefore || undefined,
++        }
++      : undefined,
 +  };
 +}
 +
@@ -3558,6 +3837,7 @@ index 0000000..155f643
 +export function EntryForm({
 +  draft,
 +  members,
++  channels,
 +  saving,
 +  onChange,
 +  onCancel,
@@ -3565,6 +3845,8 @@ index 0000000..155f643
 +}: {
 +  draft: Draft;
 +  members: TeamMember[];
++  /** Channels a notice can go to; the section is hidden when there are none. */
++  channels: Array<{ id: string; name: string }>;
 +  saving: boolean;
 +  onChange: (draft: Draft) => void;
 +  onCancel: () => void;
@@ -3729,6 +4011,69 @@ index 0000000..155f643
 +        }
 +        selected={draft.attendees}
 +      />
++      {channels.length > 0 ? (
++        <fieldset className="flex min-w-0 flex-col gap-1 text-xs">
++          <legend className="mb-1">채널 알림 (선택)</legend>
++          <select
++            aria-label="알릴 채널"
++            className={SELECT_CLASS}
++            data-testid="team-calendar-notify-channel"
++            onChange={(event) =>
++              onChange({ ...draft, notifyChannelId: event.target.value })
++            }
++            value={draft.notifyChannelId}
++          >
++            <option value="">알리지 않음</option>
++            {channels.map((channel) => (
++              <option key={channel.id} value={channel.id}>
++                {channel.name}
++              </option>
++            ))}
++          </select>
++          {draft.notifyChannelId ? (
++            <>
++              <label className="flex items-center gap-2">
++                <input
++                  checked={draft.notifyNow}
++                  data-testid="team-calendar-notify-now"
++                  onChange={(event) =>
++                    onChange({ ...draft, notifyNow: event.target.checked })
++                  }
++                  type="checkbox"
++                />
++                저장할 때 이 채널에 일정 알리기
++              </label>
++              <label className="flex items-center gap-2">
++                일정 전에 채널에 알림
++                <select
++                  className={SELECT_CLASS}
++                  data-testid="team-calendar-notify-before"
++                  onChange={(event) =>
++                    onChange({
++                      ...draft,
++                      notifyBefore: Number(event.target.value),
++                    })
++                  }
++                  value={draft.notifyBefore}
++                >
++                  <option value={0}>안 함</option>
++                  {NOTIFY_BEFORE_CHOICES.map((minutes) => (
++                    <option key={minutes} value={minutes}>
++                      {reminderLabel(minutes)}
++                    </option>
++                  ))}
++                </select>
++              </label>
++              {draft.notifyBefore ? (
++                <p className="text-muted-foreground">
++                  일정 전 알림은 이 일정을 마지막으로 저장한 사람의 Buzz가 켜져
++                  있을 때 그 사람 이름으로 올라갑니다.
++                </p>
++              ) : null}
++            </>
++          ) : null}
++        </fieldset>
++      ) : null}
 +      <label className="flex flex-col gap-1 text-xs">
 +        메모 (선택)
 +        <Textarea
@@ -3763,7 +4108,7 @@ index 0000000..155f643
 +}
 diff --git a/desktop/src/features/team-calendar/ui/MemberPicker.tsx b/desktop/src/features/team-calendar/ui/MemberPicker.tsx
 new file mode 100644
-index 0000000..d702c0e
+index 000000000..d702c0ea5
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/MemberPicker.tsx
 @@ -0,0 +1,59 @@
@@ -3828,7 +4173,7 @@ index 0000000..d702c0e
 +}
 diff --git a/desktop/src/features/team-calendar/ui/PollDetail.tsx b/desktop/src/features/team-calendar/ui/PollDetail.tsx
 new file mode 100644
-index 0000000..fb693e8
+index 000000000..fb693e8d9
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/PollDetail.tsx
 @@ -0,0 +1,343 @@
@@ -4177,7 +4522,7 @@ index 0000000..fb693e8
 +}
 diff --git a/desktop/src/features/team-calendar/ui/PollsPanel.tsx b/desktop/src/features/team-calendar/ui/PollsPanel.tsx
 new file mode 100644
-index 0000000..6147470
+index 000000000..6147470a5
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/PollsPanel.tsx
 @@ -0,0 +1,296 @@
@@ -4479,11 +4824,19 @@ index 0000000..6147470
 +}
 diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
 new file mode 100644
-index 0000000..dc036d1
+index 000000000..b6a127f8e
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
-@@ -0,0 +1,628 @@
-+import { ChevronLeft, ChevronRight, Pencil, Plus, Trash2 } from "lucide-react";
+@@ -0,0 +1,682 @@
++import {
++  ChevronLeft,
++  ChevronRight,
++  ClipboardPaste,
++  Copy,
++  Pencil,
++  Plus,
++  Trash2,
++} from "lucide-react";
 +import * as React from "react";
 +import { toast } from "sonner";
 +
@@ -4502,6 +4855,7 @@ index 0000000..dc036d1
 +} from "@/features/team-calendar/lib/teamCalendar";
 +import {
 +  REMINDER_CHOICES,
++  channelNoticeText,
 +  reminderLabel,
 +  reminderOffsets,
 +} from "@/features/team-calendar/lib/teamReminders";
@@ -4510,6 +4864,8 @@ index 0000000..dc036d1
 +  useTeamCalendarRange,
 +} from "@/features/team-calendar/lib/useTeamCalendar";
 +import { useReminderOverrides } from "@/features/team-calendar/lib/useTeamCalendarReminders";
++import { postChannelNotice } from "@/features/team-calendar/lib/channelNotice";
++import { useNoticeChannels } from "@/features/team-calendar/lib/useNoticeChannels";
 +import { useTeamMembers } from "@/features/team-calendar/lib/useTeamMembers";
 +import { cn } from "@/shared/lib/cn";
 +import { Button } from "@/shared/ui/button";
@@ -4526,6 +4882,7 @@ index 0000000..dc036d1
 +  type Draft,
 +  EntryForm,
 +  REPEAT_LABELS,
++  copyDraftOf,
 +  draftError,
 +  draftOf,
 +  emptyDraft,
@@ -4608,6 +4965,9 @@ index 0000000..dc036d1
 +  // Deleting takes two clicks on the same entry (no native confirm dialog).
 +  const [confirmingKey, setConfirmingKey] = React.useState<string | null>(null);
 +  const [remindersFor, setRemindersFor] = React.useState<string | null>(null);
++  // The entry "복사" picked up; "붙여넣기" opens a copy of it on the selected day.
++  const [copied, setCopied] = React.useState<CalendarOccurrence | null>(null);
++  const channels = useNoticeChannels();
 +
 +  const { entries, status, saveEntry, deleteEntry, retry } =
 +    useTeamCalendarRange(pubkey, relayUrl, month);
@@ -4669,6 +5029,14 @@ index 0000000..dc036d1
 +      "일정을 저장하지 못했습니다.",
 +    );
 +    if (!saved) return;
++    if (draft.notifyNow && input.notify?.channelId) {
++      // The entry is saved either way; a failed post only loses the notice.
++      void postChannelNotice(
++        relayUrl,
++        input.notify.channelId,
++        channelNoticeText(input, draft.id ? "일정 변경" : "새 일정"),
++      ).catch(() => toast.error("채널에 일정을 알리지 못했습니다."));
++    }
 +    setDraft(null);
 +    selectDate(input.date);
 +  };
@@ -4918,6 +5286,20 @@ index 0000000..dc036d1
 +              <h3 className="text-sm font-semibold">
 +                {dateLabel(selectedDate)}
 +              </h3>
++              {draft || !copied ? null : (
++                <Button
++                  aria-label={`${copied.title} 붙여넣기`}
++                  data-testid="team-calendar-paste"
++                  onClick={() => setDraft(copyDraftOf(copied, selectedDate))}
++                  size="sm"
++                  title={`"${copied.title}"을(를) 이 날에 붙여넣기`}
++                  type="button"
++                  variant="outline"
++                >
++                  <ClipboardPaste className="h-4 w-4" />
++                  붙여넣기
++                </Button>
++              )}
 +              {draft ? null : (
 +                <Button
 +                  data-testid="team-calendar-add"
@@ -4948,6 +5330,7 @@ index 0000000..dc036d1
 +
 +            {draft ? (
 +              <EntryForm
++                channels={channels}
 +                draft={draft}
 +                members={members}
 +                onCancel={() => setDraft(null)}
@@ -4990,6 +5373,22 @@ index 0000000..dc036d1
 +                              : ""}
 +                          </p>
 +                        </div>
++                        <Button
++                          aria-label={`${entry.title} 복사`}
++                          data-testid="team-calendar-copy"
++                          onClick={() => {
++                            setCopied(entry);
++                            toast("일정을 복사했습니다.", {
++                              description:
++                                "붙여넣을 날짜를 누른 뒤 \"붙여넣기\"를 누르세요.",
++                            });
++                          }}
++                          size="icon-xs"
++                          type="button"
++                          variant="ghost"
++                        >
++                          <Copy />
++                        </Button>
 +                        <Button
 +                          aria-label={`${entry.title} 수정`}
 +                          disabled={saving}
@@ -5113,7 +5512,7 @@ index 0000000..dc036d1
 +}
 diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
 new file mode 100644
-index 0000000..92e1eb5
+index 000000000..92e1eb5b2
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
 @@ -0,0 +1,75 @@
