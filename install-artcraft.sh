@@ -3,19 +3,20 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/EugeneBot01/buzz/team/install-artcraft.sh | bash
 #
-# Installs WordCraft and GridCraft (open-source Word / Excel, github.com/storytold)
-# so that Buzz's "열기" button opens .docx / .xlsx in them, and puts their
+# Installs WordCraft, GridCraft and DeckCraft (open-source Word / Excel /
+# PowerPoint, github.com/storytold) so that Buzz's "열기" button opens
+# .docx / .xlsx / .pptx in them, and puts their
 # command-line tools where Buzz agents look for them
 # (~/Library/Application Support/ArtCraft/bin). Apps go to ~/Applications, so
 # no administrator password is needed. Every download is checked against the
 # release's SHA256SUMS.txt before anything is installed.
 #
-# ARTCRAFT_APPS="wordcraft gridcraft deckcraft pdfcraft" installs more apps.
+# ARTCRAFT_APPS="wordcraft gridcraft deckcraft pdfcraft" also installs PdfCraft.
 
 set -euo pipefail
 
 {
-APPS="${ARTCRAFT_APPS:-wordcraft gridcraft}"
+APPS="${ARTCRAFT_APPS:-wordcraft gridcraft deckcraft}"
 BIN="$HOME/Library/Application Support/ArtCraft/bin"
 APP_DIR="$HOME/Applications"
 
@@ -77,7 +78,7 @@ done
 cat <<'DONE'
 
 완료! 이제 Buzz에서 워드·엑셀 파일 옆의 "열기"를 누르면 이 앱으로 열려요.
-에이전트에게 쓰게 하려면: 채널 위 바로가기 버튼 → 고급 → 워드 문서 / 엑셀 체크 → 저장 → 에이전트 다시 시작.
-에이전트가 만드는 파일은 홈 폴더의 BuzzArtCraft 폴더에 생겨요.
+에이전트에게 쓰게 하려면: 채널 위 바로가기 버튼 → 고급 → 워드 문서 / 엑셀 / PPT 체크 → 저장 → 에이전트 다시 시작.
+에이전트가 만든 파일은 대화방에 첨부돼서 와요. (작업 폴더: Finder에서 ⌘+Shift+H → BuzzArtCraft)
 DONE
 }
