@@ -166,6 +166,32 @@ index 75adfa9ba..7618a0ad3 100644
    {
      server: {
        name: "figma",
+diff --git a/desktop/src/features/team-links/lib/teamLinks.test.mjs b/desktop/src/features/team-links/lib/teamLinks.test.mjs
+index 666abe74c..10727cc0c 100644
+--- a/desktop/src/features/team-links/lib/teamLinks.test.mjs
++++ b/desktop/src/features/team-links/lib/teamLinks.test.mjs
+@@ -92,13 +92,18 @@ test("shortcuts round-trip, merge by last writer and filter by channel", () => {
+ });
+ 
+ test("MCP servers are stored in one environment variable", () => {
+-  const figma = MCP_PRESETS[1].server;
++  const preset = (name) => MCP_PRESETS.find((p) => p.server.name === name).server;
++  const figma = preset("notion");
+   assert.equal(remoteUrlOf(figma), "https://mcp.notion.com/mcp");
+   // The Figma preset is the desktop app's local server, not a hosted address.
+-  assert.equal(remoteUrlOf(MCP_PRESETS[0].server), null);
++  assert.equal(remoteUrlOf(preset("figma")), null);
++  // ArtCraft presets start the app's own MCP server through the shell.
++  assert.equal(preset("wordcraft").command, "/bin/sh");
++  assert.match(preset("wordcraft").args[1], /wordcraft-cli" mcp --automation-read-root/);
++  assert.match(preset("gridcraft").args[1], /gridcraft-cli" mcp$/);
+   const stale = { name: "figma", command: "npx", args: ["-y", "mcp-remote", "https://mcp.figma.com/mcp"], env: {} };
+   assert.deepEqual(withCurrentPresets([stale, { name: "mine", command: "x", args: [], env: {} }]), [
+-    MCP_PRESETS[0].server,
++    preset("figma"),
+     { name: "mine", command: "x", args: [], env: {} },
+   ]);
+   const env = envWithMcpServers({ OTHER: "1" }, [figma]);
 diff --git a/desktop/src/shared/lib/openInApp.test.mjs b/desktop/src/shared/lib/openInApp.test.mjs
 new file mode 100644
 index 000000000..7eae85665
