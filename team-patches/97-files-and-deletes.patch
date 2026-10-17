@@ -48,10 +48,10 @@ index 000000000..0cfa4f3a5
 +  }
 +}
 diff --git a/desktop/src/features/channel-files/lib/channelFiles.test.mjs b/desktop/src/features/channel-files/lib/channelFiles.test.mjs
-index 543301b99..5a7d82556 100644
+index 543301b99..2f0b6d60f 100644
 --- a/desktop/src/features/channel-files/lib/channelFiles.test.mjs
 +++ b/desktop/src/features/channel-files/lib/channelFiles.test.mjs
-@@ -82,3 +82,19 @@ test("kinds and sizes are labelled", () => {
+@@ -82,3 +82,52 @@ test("kinds and sizes are labelled", () => {
    assert.equal(formatFileSize(undefined), "");
    assert.equal(formatFileSize(-1), "");
  });
@@ -71,11 +71,56 @@ index 543301b99..5a7d82556 100644
 +  assert.deepEqual(searchFiles(files, "회의록"), []);
 +  assert.equal(searchFiles(files, "  ").length, 2);
 +});
++
++test("the list follows a message's latest edit and drops deleted messages", async () => {
++  const { collectChannelFiles } = await import("./channelFiles.ts");
++  const A = "a".repeat(64);
++  const B = "b".repeat(64);
++  const id = (c) => c.repeat(64);
++  const msg = {
++    id: id("1"), pubkey: A, created_at: 100, kind: 9, content: "", sig: "",
++    tags: [["h", "c"], ["imeta", "url https://r.example/media/old.pdf", "filename 공모전 정리.pdf"]],
++  };
++  const edit = {
++    id: id("2"), pubkey: A, created_at: 200, kind: 40003, content: "", sig: "",
++    tags: [["h", "c"], ["e", id("1")],
++      ["imeta", "url https://r.example/media/x.xlsx", "filename 공모전 정리_1007.xlsx"],
++      ["imeta", "url https://r.example/media/y.pdf", "filename 공모전 정리_1007.pdf"]],
++  };
++  const strangerEdit = { ...edit, id: id("3"), pubkey: B, created_at: 300,
++    tags: [["e", id("1")], ["imeta", "url https://r.example/media/z.exe", "filename hack.exe"]] };
++  const other = {
++    id: id("4"), pubkey: B, created_at: 150, kind: 9, content: "", sig: "",
++    tags: [["imeta", "url https://r.example/media/gone.docx", "filename gone.docx"]],
++  };
++  const deletion = { id: id("5"), pubkey: B, created_at: 400, kind: 5, content: "", sig: "", tags: [["e", id("4")]] };
++  const names = collectChannelFiles([msg, edit, strangerEdit, other, deletion])
++    .map((file) => file.filename)
++    .sort();
++  assert.deepEqual(names, ["공모전 정리_1007.pdf", "공모전 정리_1007.xlsx"]);
++  // Without the edit and deletion, the message is listed as first posted.
++  assert.deepEqual(
++    collectChannelFiles([msg, other]).map((file) => file.filename).sort(),
++    ["gone.docx", "공모전 정리.pdf"],
++  );
++});
 diff --git a/desktop/src/features/channel-files/lib/channelFiles.ts b/desktop/src/features/channel-files/lib/channelFiles.ts
-index 17e1feeb8..f38bf92d1 100644
+index 17e1feeb8..9fd85bedb 100644
 --- a/desktop/src/features/channel-files/lib/channelFiles.ts
 +++ b/desktop/src/features/channel-files/lib/channelFiles.ts
-@@ -47,6 +47,41 @@ function resolveFilename(url: string, filename: string | undefined): string {
+@@ -1,4 +1,11 @@
+ import type { RelayEvent } from "@/shared/api/types";
++import { applyEditTagOverlay } from "@/features/messages/lib/applyEditTagOverlay.mjs";
++import {
++  CHANNEL_MESSAGE_EVENT_KINDS,
++  KIND_DELETION,
++  KIND_NIP29_DELETE_EVENT,
++  KIND_STREAM_MESSAGE_EDIT,
++} from "@/shared/constants/kinds";
+ import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
+ 
+ /**
+@@ -47,10 +54,86 @@ function resolveFilename(url: string, filename: string | undefined): string {
   * The attachments carried by `events`, newest first. A file posted more than
   * once (same URL) is listed once, at its most recent post.
   */
@@ -114,11 +159,57 @@ index 17e1feeb8..f38bf92d1 100644
 +  });
 +}
 +
++const HEX_ID = /^[0-9a-f]{64}$/;
++const CHANNEL_MESSAGE_KINDS: ReadonlySet<number> = new Set(
++  CHANNEL_MESSAGE_EVENT_KINDS,
++);
++
++/**
++ * Every file posted in `events`, newest first, one row per URL.
++ *
++ * `events` may also hold edits and deletions. A message's files are the ones
++ * its latest edit lists (an edit carries the message's whole new set of
++ * attachments, as the timeline shows it), and a deleted message's files are
++ * left out. Without this the list showed a message as first posted: renamed
++ * or added files were missing and deleted ones stayed.
++ */
  export function collectChannelFiles(events: RelayEvent[]): ChannelFile[] {
++  const deleted = new Set<string>();
++  for (const event of events) {
++    if (event.kind !== KIND_DELETION && event.kind !== KIND_NIP29_DELETE_EVENT)
++      continue;
++    for (const tag of event.tags)
++      if (tag[0] === "e" && typeof tag[1] === "string" && HEX_ID.test(tag[1]))
++        deleted.add(tag[1]);
++  }
++  const byId = new Map(events.map((event) => [event.id, event]));
++  const latestEdit = new Map<string, RelayEvent>();
++  for (const event of events) {
++    if (event.kind !== KIND_STREAM_MESSAGE_EDIT || deleted.has(event.id))
++      continue;
++    let targetId: string | undefined;
++    for (const tag of event.tags)
++      if (tag[0] === "e" && typeof tag[1] === "string") targetId = tag[1];
++    const target = targetId ? byId.get(targetId) : undefined;
++    // Only the author's own edits count.
++    if (!target || !targetId || target.pubkey !== event.pubkey) continue;
++    const current = latestEdit.get(targetId);
++    if (!current || event.created_at > current.created_at)
++      latestEdit.set(targetId, event);
++  }
++
    const byUrl = new Map<string, ChannelFile>();
    for (const event of events) {
+-    for (const entry of parseImetaTags(event.tags).values()) {
++    if (!CHANNEL_MESSAGE_KINDS.has(event.kind) || deleted.has(event.id))
++      continue;
++    const tags = applyEditTagOverlay(event.tags, latestEdit.get(event.id)?.tags);
++    for (const entry of parseImetaTags(tags).values()) {
+       const current = byUrl.get(entry.url);
+       if (current && current.postedAt >= event.created_at) continue;
+       byUrl.set(entry.url, {
 diff --git a/desktop/src/features/channel-files/ui/ChannelFilesDialog.tsx b/desktop/src/features/channel-files/ui/ChannelFilesDialog.tsx
-index a9ad7fd9e..1eeb6662b 100644
+index a9ad7fd9e..0e910a605 100644
 --- a/desktop/src/features/channel-files/ui/ChannelFilesDialog.tsx
 +++ b/desktop/src/features/channel-files/ui/ChannelFilesDialog.tsx
 @@ -1,6 +1,5 @@
@@ -128,7 +219,7 @@ index a9ad7fd9e..1eeb6662b 100644
  
  import {
    type ChannelFile,
-@@ -9,10 +8,12 @@ import {
+@@ -9,12 +8,19 @@ import {
    fileKind,
    formatFileSize,
    formatPostedDate,
@@ -140,9 +231,17 @@ index a9ad7fd9e..1eeb6662b 100644
  import { relayClient } from "@/shared/api/relayClient";
 -import { invokeTauri } from "@/shared/api/tauri";
  import type { RelayEvent } from "@/shared/api/types";
- import { CHANNEL_MESSAGE_EVENT_KINDS } from "@/shared/constants/kinds";
+-import { CHANNEL_MESSAGE_EVENT_KINDS } from "@/shared/constants/kinds";
++import {
++  CHANNEL_MESSAGE_EVENT_KINDS,
++  KIND_DELETION,
++  KIND_NIP29_DELETE_EVENT,
++  KIND_STREAM_MESSAGE_EDIT,
++} from "@/shared/constants/kinds";
  import { Button } from "@/shared/ui/button";
-@@ -28,12 +29,6 @@ import {
+ import { Checkbox } from "@/shared/ui/checkbox";
+ import {
+@@ -28,12 +34,6 @@ import {
  /** Messages read per page while looking for attachments. */
  const PAGE_SIZE = 500;
  
@@ -155,7 +254,48 @@ index a9ad7fd9e..1eeb6662b 100644
  function KindIcon({ mime }: { mime: string }) {
    const kind = fileKind(mime);
    const Icon =
-@@ -115,7 +110,13 @@ export function ChannelFilesDialog({
+@@ -82,16 +82,33 @@ export function ChannelFilesDialog({
+       const generation = generationRef.current;
+       setStatus("loading");
+       try {
+-        const page = await relayClient.fetchEvents({
+-          kinds: [...CHANNEL_MESSAGE_EVENT_KINDS],
+-          "#h": [channelId],
+-          limit: PAGE_SIZE,
+-          ...(until === undefined ? {} : { until }),
+-        });
++        const [page, changes] = await Promise.all([
++          relayClient.fetchEvents({
++            kinds: [...CHANNEL_MESSAGE_EVENT_KINDS],
++            "#h": [channelId],
++            limit: PAGE_SIZE,
++            ...(until === undefined ? {} : { until }),
++          }),
++          // Team patch: edits and deletions, so the list shows each message
++          // as it is now (they can be newer than the page, so no `until`).
++          until === undefined
++            ? relayClient.fetchEvents({
++                kinds: [
++                  KIND_STREAM_MESSAGE_EDIT,
++                  KIND_DELETION,
++                  KIND_NIP29_DELETE_EVENT,
++                ],
++                "#h": [channelId],
++                limit: PAGE_SIZE * 2,
++              })
++            : Promise.resolve([] as RelayEvent[]),
++        ]);
+         if (generationRef.current !== generation) return;
+         setEvents((current) => {
+           const known = new Set(current.map((event) => event.id));
+-          const added = page.filter((event) => !known.has(event.id));
++          const added = [...page, ...changes].filter(
++            (event) => !known.has(event.id),
++          );
+           return added.length > 0 ? [...current, ...added] : current;
+         });
+         setHasMore(page.length >= PAGE_SIZE);
+@@ -115,7 +132,13 @@ export function ChannelFilesDialog({
      };
    }, [loadPage]);
  
@@ -170,7 +310,20 @@ index a9ad7fd9e..1eeb6662b 100644
    const selectedFiles = React.useMemo(
      () => files.filter((file) => selected.has(file.url)),
      [files, selected],
-@@ -144,33 +145,7 @@ export function ChannelFilesDialog({
+@@ -133,8 +156,11 @@ export function ChannelFilesDialog({
+   };
+ 
+   const loadOlder = () => {
++    // Page by messages only: an edit or deletion is not part of the page.
++    const messageKinds: ReadonlySet<number> = new Set(CHANNEL_MESSAGE_EVENT_KINDS);
+     const oldest = events.reduce(
+-      (min, event) => Math.min(min, event.created_at),
++      (min, event) =>
++        messageKinds.has(event.kind) ? Math.min(min, event.created_at) : min,
+       Number.POSITIVE_INFINITY,
+     );
+     if (Number.isFinite(oldest)) void loadPage(oldest);
+@@ -144,33 +170,7 @@ export function ChannelFilesDialog({
      if (downloading || selectedFiles.length === 0 || tooMany) return;
      setDownloading(true);
      try {
@@ -205,7 +358,7 @@ index a9ad7fd9e..1eeb6662b 100644
      } finally {
        setDownloading(false);
      }
-@@ -193,6 +168,14 @@ export function ChannelFilesDialog({
+@@ -193,6 +193,14 @@ export function ChannelFilesDialog({
            </DialogDescription>
          </DialogHeader>
  
@@ -220,7 +373,7 @@ index a9ad7fd9e..1eeb6662b 100644
          <div className="flex flex-wrap items-center gap-3">
            <label className="flex items-center gap-2 text-sm">
              <Checkbox
-@@ -210,7 +193,10 @@ export function ChannelFilesDialog({
+@@ -210,7 +218,10 @@ export function ChannelFilesDialog({
              전체 선택
            </label>
            <span aria-live="polite" className="text-xs text-muted-foreground">
@@ -232,7 +385,7 @@ index a9ad7fd9e..1eeb6662b 100644
              {selectedFiles.length > 0 && selectedSize
                ? ` · ${selectedSize}`
                : ""}
-@@ -270,7 +256,9 @@ export function ChannelFilesDialog({
+@@ -270,7 +281,9 @@ export function ChannelFilesDialog({
            })}
            {files.length === 0 && status === "ready" ? (
              <li className="px-3 py-6 text-center text-sm text-muted-foreground">
