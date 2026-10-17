@@ -19,6 +19,10 @@ Agents can now hand people the files they make, in the chat.
 - **DeckCraft preset** (`mcpCatalog.ts`): "PPT (DeckCraft)" next to WordCraft and
   GridCraft. `install-artcraft.sh` now installs DeckCraft by default.
 
+- **"열기" with DeckCraft** (`media_download.rs`): DeckCraft ignores the macOS
+  open-file event (it shows its start screen), so a .pptx is handed to it as a
+  launch argument in a new window (`open -n -a DeckCraft --args <file>`).
+
 ## Notes
 
 - DeckCraft's and GridCraft's MCP servers have no folder limits (WordCraft's do).

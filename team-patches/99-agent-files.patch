@@ -188,6 +188,39 @@ index f80f928d3..c93deacb3 100644
      use super::{
          channel_id_from_event, cmd_get_thread, cmd_send_message, event_mention_pubkeys,
          find_root_from_tags, format_events, match_profiles_by_name, merge_message_mentions,
+diff --git a/desktop/src-tauri/src/commands/media_download.rs b/desktop/src-tauri/src/commands/media_download.rs
+index 8c2a07b34..b165c67c3 100644
+--- a/desktop/src-tauri/src/commands/media_download.rs
++++ b/desktop/src-tauri/src/commands/media_download.rs
+@@ -237,11 +237,25 @@ pub async fn open_file_in_app(
+ 
+     let app = team_app_for(&ext).and_then(|name| installed_app_path(name).map(|p| (name, p)));
+     let mut command = std::process::Command::new("/usr/bin/open");
+-    if let Some((_, app_path)) = &app {
+-        command.arg("-a").arg(app_path);
++    match &app {
++        // DeckCraft ignores the system's "open this file" message and only
++        // reads a path given at launch, so start a new window with the path.
++        Some((name, app_path)) if *name == "DeckCraft" => {
++            command
++                .arg("-n")
++                .arg("-a")
++                .arg(app_path)
++                .arg("--args")
++                .arg(&path);
++        }
++        Some((_, app_path)) => {
++            command.arg("-a").arg(app_path).arg(&path);
++        }
++        None => {
++            command.arg(&path);
++        }
+     }
+     let status = command
+-        .arg(&path)
+         .status()
+         .map_err(|e| format!("failed to open the file: {e}"))?;
+     if !status.success() {
 diff --git a/desktop/src/features/team-links/lib/mcpCatalog.ts b/desktop/src/features/team-links/lib/mcpCatalog.ts
 index 7618a0ad3..5fd8077ac 100644
 --- a/desktop/src/features/team-links/lib/mcpCatalog.ts
