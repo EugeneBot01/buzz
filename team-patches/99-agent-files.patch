@@ -1,0 +1,252 @@
+diff --git a/crates/buzz-acp/src/base_prompt.md b/crates/buzz-acp/src/base_prompt.md
+index 565173e8b..a8372f6ed 100644
+--- a/crates/buzz-acp/src/base_prompt.md
++++ b/crates/buzz-acp/src/base_prompt.md
+@@ -69,6 +69,7 @@ All replies and delegations — including task assignments to other agents — g
+ 
+ - Respond promptly to @mentions. Be direct — no preamble. Name what you did, what you found, or what you need.
+ - **If your turn produced anything worth knowing, you MUST publish it.** Use `buzz messages send`. Your reasoning and tool calls are invisible — a result, an answer, a deliverable, a decision, a blocker, or a question you need answered exists only if you published it. Work or an answer that someone asked you for always counts. Ending that kind of turn without a message is a silent failure.
++- **Deliver files as attachments.** When you make a document, spreadsheet, slide deck, PDF or other file for someone, attach it to your message with `buzz messages send ... --file <path>` (repeat `--file` for several) so people can download it from the chat. Do not only name a path on your machine: people cannot open files on your computer. Images must be jpeg/png/gif/webp and video mp4; zip other media first. Up to 100 MB per file.
+ - **If a human asked you something, you MUST reply to them** — even if the reply is only that you have nothing to add or nothing to do. Never leave a person waiting on you.
+ - **Otherwise, publishing is optional and silence is usually correct.** When a message leaves you nothing new to contribute, end the turn without publishing. That is a success, not a failure.
+ - **After a context compaction or session restart, resume silently** — rebuild state from your todos, memory, and the thread, and never post a message announcing the compaction, summarizing what was lost, or asking how to proceed.
+diff --git a/crates/buzz-cli/src/client.rs b/crates/buzz-cli/src/client.rs
+index 54441f55c..0b993a5c6 100644
+--- a/crates/buzz-cli/src/client.rs
++++ b/crates/buzz-cli/src/client.rs
+@@ -75,6 +75,47 @@ const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+ /// Maximum file size for video uploads (500 MB).
+ const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
+ 
++/// Team patch: maximum size for a generic file (the relay's default cap, 100 MB).
++const MAX_GENERIC_FILE_BYTES: u64 = 100 * 1024 * 1024;
++
++/// Team patch: types the relay refuses on its generic file path (active web
++/// content and executables). Mirrors `BLOCKED_FILE_MIME_TYPES` in buzz-media.
++const BLOCKED_FILE_MIMES: &[&str] = &[
++    "application/xhtml+xml",
++    "image/svg+xml",
++    "application/javascript",
++    "text/javascript",
++    "application/x-msdownload",
++    "application/x-executable",
++    "application/vnd.microsoft.portable-executable",
++    "application/x-mach-binary",
++    "application/x-sharedlib",
++    "application/x-elf",
++    "application/x-msi",
++    "application/vnd.android.package-archive",
++    "application/x-apple-diskimage",
++];
++
++/// Team patch: whether `mime` may be uploaded, and if so whether it is a
++/// generic file (document, sheet, slides, archive, text) rather than inline
++/// media. The relay stores generic files as downloads; images and video keep
++/// the media allowlist, and other images and audio are refused there, so they
++/// are refused here with a hint.
++pub fn upload_kind(mime: &str) -> Result<bool, CliError> {
++    if ALLOWED_MIMES.contains(&mime) {
++        return Ok(false);
++    }
++    if mime.starts_with("image/") || mime.starts_with("video/") || mime.starts_with("audio/") {
++        return Err(CliError::Usage(format!(
++            "unsupported file type: {mime} (only jpeg/png/gif/webp images and mp4 video; zip other media first)"
++        )));
++    }
++    if BLOCKED_FILE_MIMES.contains(&mime) {
++        return Err(CliError::Usage(format!("unsupported file type: {mime}")));
++    }
++    Ok(true)
++}
++
+ /// Sign a NIP-98 HTTP auth event (kind:27235) and return the Authorization header value.
+ ///
+ /// The event includes:
+@@ -1220,12 +1261,12 @@ impl BuzzClient {
+             .map(|t| t.mime_type().to_string())
+             .unwrap_or_else(|| "application/octet-stream".to_string());
+ 
+-        if !ALLOWED_MIMES.contains(&mime.as_str()) {
+-            return Err(CliError::Usage(format!("unsupported file type: {mime}")));
+-        }
++        let generic = upload_kind(&mime)?;
+ 
+         // 3. Size check
+-        let max = if mime.starts_with("video/") {
++        let max = if generic {
++            MAX_GENERIC_FILE_BYTES
++        } else if mime.starts_with("video/") {
+             MAX_VIDEO_BYTES
+         } else {
+             MAX_IMAGE_BYTES
+@@ -2413,6 +2454,26 @@ mod retry_policy_tests {
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn team_upload_kind_allows_documents_and_refuses_risky_types() {
++        use super::upload_kind;
++        assert!(!upload_kind("image/png").unwrap());
++        assert!(!upload_kind("video/mp4").unwrap());
++        for m in [
++            "application/pdf",
++            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
++            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
++            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
++            "application/zip",
++            "application/octet-stream",
++        ] {
++            assert!(upload_kind(m).unwrap(), "{m}");
++        }
++        for m in ["audio/mpeg", "image/heic", "video/quicktime", "image/svg+xml", "application/x-mach-binary"] {
++            assert!(upload_kind(m).is_err(), "{m}");
++        }
++    }
++
+     use super::{
+         advance_query_cursor, create_response_with_id_if_accepted, extract_relay_response_field,
+         normalize_events, BuzzClient,
+diff --git a/crates/buzz-cli/src/commands/messages.rs b/crates/buzz-cli/src/commands/messages.rs
+index f80f928d3..c93deacb3 100644
+--- a/crates/buzz-cli/src/commands/messages.rs
++++ b/crates/buzz-cli/src/commands/messages.rs
+@@ -608,6 +608,36 @@ pub struct SendMessageParams {
+     pub mentions: Vec<String>,
+ }
+ 
++/// Team patch: the name shown on a file card for an attached file — the
++/// path's last part, with characters that would break the imeta tag removed.
++fn attachment_file_name(file_path: &str) -> String {
++    let name: String = std::path::Path::new(file_path)
++        .file_name()
++        .map(|n| n.to_string_lossy().into_owned())
++        .unwrap_or_default()
++        .chars()
++        .filter(|c| !c.is_control())
++        .collect();
++    let name = name.trim().to_string();
++    if name.is_empty() {
++        "file".to_string()
++    } else {
++        name
++    }
++}
++
++/// Team patch: escape a markdown link label (`\`, `[`, `]`).
++fn escape_link_label(label: &str) -> String {
++    let mut out = String::with_capacity(label.len());
++    for c in label.chars() {
++        if matches!(c, '\\' | '[' | ']') {
++            out.push('\\');
++        }
++        out.push(c);
++    }
++    out
++}
++
+ pub async fn cmd_send_message(
+     client: &BuzzClient,
+     mut p: SendMessageParams,
+@@ -655,7 +685,17 @@ pub async fn cmd_send_message(
+             .upload_file(file_path)
+             .await
+             .map_err(|e| CliError::Other(format!("upload failed for {file_path}: {e}")))?;
+-        media_tags.push(crate::client::build_imeta_tag(&desc));
++        let mut tag = crate::client::build_imeta_tag(&desc);
++        // Team patch: documents and other generic files are shown as a file
++        // card with their name, like files attached in the desktop app.
++        if crate::client::upload_kind(&desc.mime_type).unwrap_or(true) {
++            let name = attachment_file_name(file_path);
++            tag.push(format!("filename {name}"));
++            media_tags.push(tag);
++            media_content.push_str(&format!("\n[{}]({})", escape_link_label(&name), desc.url));
++            continue;
++        }
++        media_tags.push(tag);
+         if desc.mime_type.starts_with("video/") {
+             media_content.push_str("\n![video](");
+         } else {
+@@ -1083,6 +1123,21 @@ pub async fn dispatch(
+ 
+ #[cfg(test)]
+ mod tests {
++    use super::{attachment_file_name, escape_link_label};
++
++    #[test]
++    fn team_attachment_file_name_uses_last_path_part() {
++        assert_eq!(attachment_file_name("/tmp/x/회의록 1007.docx"), "회의록 1007.docx");
++        assert_eq!(attachment_file_name("report.xlsx"), "report.xlsx");
++        assert_eq!(attachment_file_name("/tmp/a\nb.pdf"), "ab.pdf");
++        assert_eq!(attachment_file_name("/"), "file");
++    }
++
++    #[test]
++    fn team_escape_link_label_escapes_brackets() {
++        assert_eq!(escape_link_label("a[1].docx"), "a\\[1\\].docx");
++        assert_eq!(escape_link_label("a\\b"), "a\\\\b");
++    }
+     use super::{
+         channel_id_from_event, cmd_get_thread, cmd_send_message, event_mention_pubkeys,
+         find_root_from_tags, format_events, match_profiles_by_name, merge_message_mentions,
+diff --git a/desktop/src-tauri/src/commands/media_download.rs b/desktop/src-tauri/src/commands/media_download.rs
+index 8c2a07b34..b165c67c3 100644
+--- a/desktop/src-tauri/src/commands/media_download.rs
++++ b/desktop/src-tauri/src/commands/media_download.rs
+@@ -237,11 +237,25 @@ pub async fn open_file_in_app(
+ 
+     let app = team_app_for(&ext).and_then(|name| installed_app_path(name).map(|p| (name, p)));
+     let mut command = std::process::Command::new("/usr/bin/open");
+-    if let Some((_, app_path)) = &app {
+-        command.arg("-a").arg(app_path);
++    match &app {
++        // DeckCraft ignores the system's "open this file" message and only
++        // reads a path given at launch, so start a new window with the path.
++        Some((name, app_path)) if *name == "DeckCraft" => {
++            command
++                .arg("-n")
++                .arg("-a")
++                .arg(app_path)
++                .arg("--args")
++                .arg(&path);
++        }
++        Some((_, app_path)) => {
++            command.arg("-a").arg(app_path).arg(&path);
++        }
++        None => {
++            command.arg(&path);
++        }
+     }
+     let status = command
+-        .arg(&path)
+         .status()
+         .map_err(|e| format!("failed to open the file: {e}"))?;
+     if !status.success() {
+diff --git a/desktop/src/features/team-links/lib/mcpCatalog.ts b/desktop/src/features/team-links/lib/mcpCatalog.ts
+index 7618a0ad3..5fd8077ac 100644
+--- a/desktop/src/features/team-links/lib/mcpCatalog.ts
++++ b/desktop/src/features/team-links/lib/mcpCatalog.ts
+@@ -90,6 +90,12 @@ export const MCP_PRESETS: McpPreset[] = [
+     description:
+       "엑셀 표를 만들고 계산하고 정리합니다. BuzzArtCraft 폴더에서 작업합니다.",
+   },
++  {
++    server: artcraftMcpServer("deckcraft", "deckcraft-cli", false),
++    label: "PPT (DeckCraft)",
++    description:
++      "발표 자료(PPT)를 만들고 꾸미고 PDF로 내보냅니다. BuzzArtCraft 폴더에서 작업합니다.",
++  },
+   {
+     server: {
+       name: "figma",
+diff --git a/desktop/src/features/team-links/lib/teamLinks.test.mjs b/desktop/src/features/team-links/lib/teamLinks.test.mjs
+index 10727cc0c..c3c284c2f 100644
+--- a/desktop/src/features/team-links/lib/teamLinks.test.mjs
++++ b/desktop/src/features/team-links/lib/teamLinks.test.mjs
+@@ -101,6 +101,7 @@ test("MCP servers are stored in one environment variable", () => {
+   assert.equal(preset("wordcraft").command, "/bin/sh");
+   assert.match(preset("wordcraft").args[1], /wordcraft-cli" mcp --automation-read-root/);
+   assert.match(preset("gridcraft").args[1], /gridcraft-cli" mcp$/);
++  assert.match(preset("deckcraft").args[1], /deckcraft-cli" mcp$/);
+   const stale = { name: "figma", command: "npx", args: ["-y", "mcp-remote", "https://mcp.figma.com/mcp"], env: {} };
+   assert.deepEqual(withCurrentPresets([stale, { name: "mine", command: "x", args: [], env: {} }]), [
+     preset("figma"),

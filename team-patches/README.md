@@ -30,6 +30,9 @@ with `git apply --3way`.
 | `94-settings-ui-clarity.patch` | Weekly digest, Google Calendar and shortcut dialogs laid out as numbered steps with an on/off status line; MCP tools folded under "고급" | `BUZZ-SETTINGS-UI-CLARITY-PATCH.md` |
 | `95-update-check-30min.patch` | Background update check every 30 min and on window focus (at most every 10 min) instead of every 6 h | `BUZZ-UPDATE-CHECK-PATCH.md` |
 | `96-agent-status-bar.patch` | One line above the composer showing which channel agents can answer now (presence) and which are resting because their maker's Mac is off | `BUZZ-AGENT-STATUS-BAR-PATCH.md` |
+| `97-files-and-deletes.patch` | Files dialog name search; "download all" under a message with 2+ files; deleted messages leave the thread panel too; Korean download error advice | `BUZZ-FILES-AND-DELETES-PATCH.md` |
+| `98-artcraft.patch` | ArtCraft (open-source Word/Excel/PowerPoint/PDF apps): "열기" next to file cards opens them in the matching app (else the default app; documents and pictures only); WordCraft/GridCraft MCP presets for agents. Apps and tools come from `install-artcraft.sh` | `BUZZ-ARTCRAFT-PATCH.md` |
+| `99-agent-files.patch` | Agents attach the files they make (documents, sheets, slides, PDF, zip; up to 100 MB) to their messages with `buzz messages send --file`, shown as file cards with the file name; base prompt tells them to; DeckCraft (PowerPoint) MCP preset | `BUZZ-AGENT-FILES-PATCH.md` |
 
 
 If a patch stops applying to a new upstream tag, re-implement it from section 3

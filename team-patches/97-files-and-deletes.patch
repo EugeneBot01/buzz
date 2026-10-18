@@ -1,0 +1,636 @@
+diff --git a/desktop/src/features/channel-files/lib/bulkDownload.ts b/desktop/src/features/channel-files/lib/bulkDownload.ts
+new file mode 100644
+index 000000000..0cfa4f3a5
+--- /dev/null
++++ b/desktop/src/features/channel-files/lib/bulkDownload.ts
+@@ -0,0 +1,43 @@
++import { toast } from "sonner";
++
++import type { ChannelFile } from "@/features/channel-files/lib/channelFiles";
++import { invokeTauri } from "@/shared/api/tauri";
++import { downloadErrorText } from "@/shared/lib/downloadErrorText";
++
++type BulkDownloadResult = {
++  cancelled: boolean;
++  saved: number;
++  failed: Array<{ filename: string; error: string }>;
++};
++
++/**
++ * Asks for one folder and saves every file into it (team patch), then tells
++ * the person how it went. Resolves to true when every file was saved.
++ */
++export async function downloadFilesToFolder(
++  files: ChannelFile[],
++): Promise<boolean> {
++  try {
++    const result = await invokeTauri<BulkDownloadResult>(
++      "download_files_to_folder",
++      {
++        items: files.map((file) => ({ url: file.url, filename: file.filename })),
++      },
++    );
++    if (result.cancelled) return false;
++    if (result.saved > 0) toast.success(`파일 ${result.saved}개를 저장했습니다.`);
++    const first = result.failed[0];
++    if (first) {
++      toast.error(`파일 ${result.failed.length}개를 받지 못했습니다.`, {
++        description: `${first.filename}: ${downloadErrorText(first.error)}`,
++      });
++      return false;
++    }
++    return true;
++  } catch (error) {
++    toast.error(
++      downloadErrorText(error instanceof Error ? error.message : String(error)),
++    );
++    return false;
++  }
++}
+diff --git a/desktop/src/features/channel-files/lib/channelFiles.test.mjs b/desktop/src/features/channel-files/lib/channelFiles.test.mjs
+index 543301b99..2f0b6d60f 100644
+--- a/desktop/src/features/channel-files/lib/channelFiles.test.mjs
++++ b/desktop/src/features/channel-files/lib/channelFiles.test.mjs
+@@ -82,3 +82,52 @@ test("kinds and sizes are labelled", () => {
+   assert.equal(formatFileSize(undefined), "");
+   assert.equal(formatFileSize(-1), "");
+ });
++
++test("a message's files are listed in order and found by name", async () => {
++  const { filesFromTags, searchFiles } = await import("./channelFiles.ts");
++  const tags = [
++    ["imeta", "url https://r.example/media/a.xlsx", "m application/vnd.ms-excel", "filename 공모전 정리_1007.xlsx", "size 11000"],
++    ["imeta", "url https://r.example/media/b.pdf", "m application/pdf", "filename 공모전 정리_1007.pdf"],
++  ];
++  const files = filesFromTags(tags);
++  assert.deepEqual(files.map((file) => file.filename), ["공모전 정리_1007.xlsx", "공모전 정리_1007.pdf"]);
++  assert.equal(files[0].size, 11000);
++  assert.deepEqual(filesFromTags(undefined), []);
++  assert.deepEqual(searchFiles(files, " PDF ").map((f) => f.filename), ["공모전 정리_1007.pdf"]);
++  assert.deepEqual(searchFiles(files, "정리 1007").length, 2);
++  assert.deepEqual(searchFiles(files, "회의록"), []);
++  assert.equal(searchFiles(files, "  ").length, 2);
++});
++
++test("the list follows a message's latest edit and drops deleted messages", async () => {
++  const { collectChannelFiles } = await import("./channelFiles.ts");
++  const A = "a".repeat(64);
++  const B = "b".repeat(64);
++  const id = (c) => c.repeat(64);
++  const msg = {
++    id: id("1"), pubkey: A, created_at: 100, kind: 9, content: "", sig: "",
++    tags: [["h", "c"], ["imeta", "url https://r.example/media/old.pdf", "filename 공모전 정리.pdf"]],
++  };
++  const edit = {
++    id: id("2"), pubkey: A, created_at: 200, kind: 40003, content: "", sig: "",
++    tags: [["h", "c"], ["e", id("1")],
++      ["imeta", "url https://r.example/media/x.xlsx", "filename 공모전 정리_1007.xlsx"],
++      ["imeta", "url https://r.example/media/y.pdf", "filename 공모전 정리_1007.pdf"]],
++  };
++  const strangerEdit = { ...edit, id: id("3"), pubkey: B, created_at: 300,
++    tags: [["e", id("1")], ["imeta", "url https://r.example/media/z.exe", "filename hack.exe"]] };
++  const other = {
++    id: id("4"), pubkey: B, created_at: 150, kind: 9, content: "", sig: "",
++    tags: [["imeta", "url https://r.example/media/gone.docx", "filename gone.docx"]],
++  };
++  const deletion = { id: id("5"), pubkey: B, created_at: 400, kind: 5, content: "", sig: "", tags: [["e", id("4")]] };
++  const names = collectChannelFiles([msg, edit, strangerEdit, other, deletion])
++    .map((file) => file.filename)
++    .sort();
++  assert.deepEqual(names, ["공모전 정리_1007.pdf", "공모전 정리_1007.xlsx"]);
++  // Without the edit and deletion, the message is listed as first posted.
++  assert.deepEqual(
++    collectChannelFiles([msg, other]).map((file) => file.filename).sort(),
++    ["gone.docx", "공모전 정리.pdf"],
++  );
++});
+diff --git a/desktop/src/features/channel-files/lib/channelFiles.ts b/desktop/src/features/channel-files/lib/channelFiles.ts
+index 17e1feeb8..9fd85bedb 100644
+--- a/desktop/src/features/channel-files/lib/channelFiles.ts
++++ b/desktop/src/features/channel-files/lib/channelFiles.ts
+@@ -1,4 +1,11 @@
+ import type { RelayEvent } from "@/shared/api/types";
++import { applyEditTagOverlay } from "@/features/messages/lib/applyEditTagOverlay.mjs";
++import {
++  CHANNEL_MESSAGE_EVENT_KINDS,
++  KIND_DELETION,
++  KIND_NIP29_DELETE_EVENT,
++  KIND_STREAM_MESSAGE_EDIT,
++} from "@/shared/constants/kinds";
+ import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
+ 
+ /**
+@@ -47,10 +54,86 @@ function resolveFilename(url: string, filename: string | undefined): string {
+  * The attachments carried by `events`, newest first. A file posted more than
+  * once (same URL) is listed once, at its most recent post.
+  */
++/** The files one message carries, in the order the message lists them. */
++export function filesFromTags(tags: string[][] | undefined): ChannelFile[] {
++  if (!tags) return [];
++  const seen = new Set<string>();
++  const files: ChannelFile[] = [];
++  for (const entry of parseImetaTags(tags).values()) {
++    if (seen.has(entry.url)) continue;
++    seen.add(entry.url);
++    files.push({
++      url: entry.url,
++      filename: resolveFilename(entry.url, entry.filename),
++      size:
++        typeof entry.size === "number" &&
++        Number.isFinite(entry.size) &&
++        entry.size >= 0
++          ? entry.size
++          : undefined,
++      mime: entry.m ?? "",
++      author: "",
++      postedAt: 0,
++    });
++  }
++  return files;
++}
++
++/** Files whose name contains every word of `query` (case does not matter). */
++export function searchFiles(files: ChannelFile[], query: string): ChannelFile[] {
++  const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
++  if (words.length === 0) return files;
++  return files.filter((file) => {
++    const name = file.filename.toLowerCase();
++    return words.every((word) => name.includes(word));
++  });
++}
++
++const HEX_ID = /^[0-9a-f]{64}$/;
++const CHANNEL_MESSAGE_KINDS: ReadonlySet<number> = new Set(
++  CHANNEL_MESSAGE_EVENT_KINDS,
++);
++
++/**
++ * Every file posted in `events`, newest first, one row per URL.
++ *
++ * `events` may also hold edits and deletions. A message's files are the ones
++ * its latest edit lists (an edit carries the message's whole new set of
++ * attachments, as the timeline shows it), and a deleted message's files are
++ * left out. Without this the list showed a message as first posted: renamed
++ * or added files were missing and deleted ones stayed.
++ */
+ export function collectChannelFiles(events: RelayEvent[]): ChannelFile[] {
++  const deleted = new Set<string>();
++  for (const event of events) {
++    if (event.kind !== KIND_DELETION && event.kind !== KIND_NIP29_DELETE_EVENT)
++      continue;
++    for (const tag of event.tags)
++      if (tag[0] === "e" && typeof tag[1] === "string" && HEX_ID.test(tag[1]))
++        deleted.add(tag[1]);
++  }
++  const byId = new Map(events.map((event) => [event.id, event]));
++  const latestEdit = new Map<string, RelayEvent>();
++  for (const event of events) {
++    if (event.kind !== KIND_STREAM_MESSAGE_EDIT || deleted.has(event.id))
++      continue;
++    let targetId: string | undefined;
++    for (const tag of event.tags)
++      if (tag[0] === "e" && typeof tag[1] === "string") targetId = tag[1];
++    const target = targetId ? byId.get(targetId) : undefined;
++    // Only the author's own edits count.
++    if (!target || !targetId || target.pubkey !== event.pubkey) continue;
++    const current = latestEdit.get(targetId);
++    if (!current || event.created_at > current.created_at)
++      latestEdit.set(targetId, event);
++  }
++
+   const byUrl = new Map<string, ChannelFile>();
+   for (const event of events) {
+-    for (const entry of parseImetaTags(event.tags).values()) {
++    if (!CHANNEL_MESSAGE_KINDS.has(event.kind) || deleted.has(event.id))
++      continue;
++    const tags = applyEditTagOverlay(event.tags, latestEdit.get(event.id)?.tags);
++    for (const entry of parseImetaTags(tags).values()) {
+       const current = byUrl.get(entry.url);
+       if (current && current.postedAt >= event.created_at) continue;
+       byUrl.set(entry.url, {
+diff --git a/desktop/src/features/channel-files/ui/ChannelFilesDialog.tsx b/desktop/src/features/channel-files/ui/ChannelFilesDialog.tsx
+index a9ad7fd9e..0e910a605 100644
+--- a/desktop/src/features/channel-files/ui/ChannelFilesDialog.tsx
++++ b/desktop/src/features/channel-files/ui/ChannelFilesDialog.tsx
+@@ -1,6 +1,5 @@
+ import { FileText, Film, Image as ImageIcon, Music } from "lucide-react";
+ import * as React from "react";
+-import { toast } from "sonner";
+ 
+ import {
+   type ChannelFile,
+@@ -9,12 +8,19 @@ import {
+   fileKind,
+   formatFileSize,
+   formatPostedDate,
++  searchFiles,
+   totalSize,
+ } from "@/features/channel-files/lib/channelFiles";
++import { downloadFilesToFolder } from "@/features/channel-files/lib/bulkDownload";
++import { Input } from "@/shared/ui/input";
+ import { relayClient } from "@/shared/api/relayClient";
+-import { invokeTauri } from "@/shared/api/tauri";
+ import type { RelayEvent } from "@/shared/api/types";
+-import { CHANNEL_MESSAGE_EVENT_KINDS } from "@/shared/constants/kinds";
++import {
++  CHANNEL_MESSAGE_EVENT_KINDS,
++  KIND_DELETION,
++  KIND_NIP29_DELETE_EVENT,
++  KIND_STREAM_MESSAGE_EDIT,
++} from "@/shared/constants/kinds";
+ import { Button } from "@/shared/ui/button";
+ import { Checkbox } from "@/shared/ui/checkbox";
+ import {
+@@ -28,12 +34,6 @@ import {
+ /** Messages read per page while looking for attachments. */
+ const PAGE_SIZE = 500;
+ 
+-type BulkDownloadResult = {
+-  cancelled: boolean;
+-  saved: number;
+-  failed: Array<{ filename: string; error: string }>;
+-};
+-
+ function KindIcon({ mime }: { mime: string }) {
+   const kind = fileKind(mime);
+   const Icon =
+@@ -82,16 +82,33 @@ export function ChannelFilesDialog({
+       const generation = generationRef.current;
+       setStatus("loading");
+       try {
+-        const page = await relayClient.fetchEvents({
+-          kinds: [...CHANNEL_MESSAGE_EVENT_KINDS],
+-          "#h": [channelId],
+-          limit: PAGE_SIZE,
+-          ...(until === undefined ? {} : { until }),
+-        });
++        const [page, changes] = await Promise.all([
++          relayClient.fetchEvents({
++            kinds: [...CHANNEL_MESSAGE_EVENT_KINDS],
++            "#h": [channelId],
++            limit: PAGE_SIZE,
++            ...(until === undefined ? {} : { until }),
++          }),
++          // Team patch: edits and deletions, so the list shows each message
++          // as it is now (they can be newer than the page, so no `until`).
++          until === undefined
++            ? relayClient.fetchEvents({
++                kinds: [
++                  KIND_STREAM_MESSAGE_EDIT,
++                  KIND_DELETION,
++                  KIND_NIP29_DELETE_EVENT,
++                ],
++                "#h": [channelId],
++                limit: PAGE_SIZE * 2,
++              })
++            : Promise.resolve([] as RelayEvent[]),
++        ]);
+         if (generationRef.current !== generation) return;
+         setEvents((current) => {
+           const known = new Set(current.map((event) => event.id));
+-          const added = page.filter((event) => !known.has(event.id));
++          const added = [...page, ...changes].filter(
++            (event) => !known.has(event.id),
++          );
+           return added.length > 0 ? [...current, ...added] : current;
+         });
+         setHasMore(page.length >= PAGE_SIZE);
+@@ -115,7 +132,13 @@ export function ChannelFilesDialog({
+     };
+   }, [loadPage]);
+ 
+-  const files = React.useMemo(() => collectChannelFiles(events), [events]);
++  const allFiles = React.useMemo(() => collectChannelFiles(events), [events]);
++  // Team patch: find a file by name (회의록, 기획안 …) instead of ⌘F.
++  const [query, setQuery] = React.useState("");
++  const files = React.useMemo(
++    () => searchFiles(allFiles, query),
++    [allFiles, query],
++  );
+   const selectedFiles = React.useMemo(
+     () => files.filter((file) => selected.has(file.url)),
+     [files, selected],
+@@ -133,8 +156,11 @@ export function ChannelFilesDialog({
+   };
+ 
+   const loadOlder = () => {
++    // Page by messages only: an edit or deletion is not part of the page.
++    const messageKinds: ReadonlySet<number> = new Set(CHANNEL_MESSAGE_EVENT_KINDS);
+     const oldest = events.reduce(
+-      (min, event) => Math.min(min, event.created_at),
++      (min, event) =>
++        messageKinds.has(event.kind) ? Math.min(min, event.created_at) : min,
+       Number.POSITIVE_INFINITY,
+     );
+     if (Number.isFinite(oldest)) void loadPage(oldest);
+@@ -144,33 +170,7 @@ export function ChannelFilesDialog({
+     if (downloading || selectedFiles.length === 0 || tooMany) return;
+     setDownloading(true);
+     try {
+-      const result = await invokeTauri<BulkDownloadResult>(
+-        "download_files_to_folder",
+-        {
+-          items: selectedFiles.map((file) => ({
+-            url: file.url,
+-            filename: file.filename,
+-          })),
+-        },
+-      );
+-      if (result.cancelled) return;
+-      if (result.saved > 0) {
+-        toast.success(`파일 ${result.saved}개를 저장했습니다.`);
+-      }
+-      if (result.failed.length > 0) {
+-        const first = result.failed[0];
+-        toast.error(
+-          `파일 ${result.failed.length}개를 받지 못했습니다. ${first ? `${first.filename}: ${first.error}` : ""}`,
+-        );
+-      } else {
+-        setSelected(new Set());
+-      }
+-    } catch (error) {
+-      toast.error(
+-        error instanceof Error && error.message
+-          ? error.message
+-          : "파일을 받지 못했습니다.",
+-      );
++      if (await downloadFilesToFolder(selectedFiles)) setSelected(new Set());
+     } finally {
+       setDownloading(false);
+     }
+@@ -193,6 +193,14 @@ export function ChannelFilesDialog({
+           </DialogDescription>
+         </DialogHeader>
+ 
++        <Input
++          aria-label="파일 이름으로 찾기"
++          autoFocus
++          data-testid="channel-files-search"
++          onChange={(event) => setQuery(event.target.value)}
++          placeholder="파일 이름으로 찾기 (예: 회의록 1007)"
++          value={query}
++        />
+         <div className="flex flex-wrap items-center gap-3">
+           <label className="flex items-center gap-2 text-sm">
+             <Checkbox
+@@ -210,7 +218,10 @@ export function ChannelFilesDialog({
+             전체 선택
+           </label>
+           <span aria-live="polite" className="text-xs text-muted-foreground">
+-            {files.length}개 중 {selectedFiles.length}개 선택
++            {query.trim()
++              ? `${allFiles.length}개 중 ${files.length}개 찾음 · `
++              : `${files.length}개 중 `}
++            {selectedFiles.length}개 선택
+             {selectedFiles.length > 0 && selectedSize
+               ? ` · ${selectedSize}`
+               : ""}
+@@ -270,7 +281,9 @@ export function ChannelFilesDialog({
+           })}
+           {files.length === 0 && status === "ready" ? (
+             <li className="px-3 py-6 text-center text-sm text-muted-foreground">
+-              이 채널에는 아직 올라온 파일이 없습니다.
++              {query.trim() && allFiles.length > 0
++                ? "찾는 이름의 파일이 없습니다. 아래 \"이전 메시지에서 더 찾기\"로 더 오래된 파일까지 불러와 보세요."
++                : "이 채널에는 아직 올라온 파일이 없습니다."}
+             </li>
+           ) : null}
+         </ul>
+diff --git a/desktop/src/features/channel-files/ui/MessageFilesDownloadButton.tsx b/desktop/src/features/channel-files/ui/MessageFilesDownloadButton.tsx
+new file mode 100644
+index 000000000..bbcc64ca3
+--- /dev/null
++++ b/desktop/src/features/channel-files/ui/MessageFilesDownloadButton.tsx
+@@ -0,0 +1,39 @@
++import { Download } from "lucide-react";
++import * as React from "react";
++
++import { downloadFilesToFolder } from "@/features/channel-files/lib/bulkDownload";
++import {
++  MAX_BULK_DOWNLOAD_FILES,
++  filesFromTags,
++} from "@/features/channel-files/lib/channelFiles";
++import { Button } from "@/shared/ui/button";
++
++/**
++ * "Download all" under a message that carries two or more files (team patch):
++ * one folder picker, every file saved into it.
++ */
++export function MessageFilesDownloadButton({ tags }: { tags?: string[][] }) {
++  const files = React.useMemo(() => filesFromTags(tags), [tags]);
++  const [busy, setBusy] = React.useState(false);
++  if (files.length < 2 || files.length > MAX_BULK_DOWNLOAD_FILES) return null;
++
++  return (
++    <Button
++      aria-label={`첨부 파일 ${files.length}개 모두 받기`}
++      className="mt-1 h-7 gap-1.5 px-2 text-xs"
++      data-no-translate=""
++      data-testid="message-files-download-all"
++      disabled={busy}
++      onClick={() => {
++        setBusy(true);
++        void downloadFilesToFolder(files).finally(() => setBusy(false));
++      }}
++      size="sm"
++      type="button"
++      variant="outline"
++    >
++      <Download className="h-3.5 w-3.5" />
++      {busy ? "받는 중…" : `파일 ${files.length}개 모두 받기`}
++    </Button>
++  );
++}
+diff --git a/desktop/src/features/home/ui/HomeView.tsx b/desktop/src/features/home/ui/HomeView.tsx
+index dae653b78..88fc16fcb 100644
+--- a/desktop/src/features/home/ui/HomeView.tsx
++++ b/desktop/src/features/home/ui/HomeView.tsx
+@@ -1,3 +1,5 @@
++import { useQueryClient } from "@tanstack/react-query";
++import { forgetDeletedMessage } from "@/features/messages/lib/forgetDeletedMessage";
+ import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
+ import { useCommunities } from "@/features/communities/useCommunities";
+ import * as React from "react";
+@@ -231,6 +233,7 @@ export function HomeView({
+   const [isSendingReply, setIsSendingReply] = React.useState(false);
+   // Team patch (block/buzz#7518): refuse a reply when the backend is bound to
+   // another community's relay than the one this inbox belongs to.
++  const queryClient = useQueryClient();
+   const { activeCommunity: sendScopeCommunity } = useCommunities();
+   const sendRelayScope = sendScopeCommunity?.relayUrl
+     ? normalizeRelayUrl(sendScopeCommunity.relayUrl)
+@@ -489,6 +492,8 @@ export function HomeView({
+       setIsDeletingMessage(true);
+       try {
+         await deleteMessage(channelId, eventId);
++        // Team patch: also drop it from the channel and thread caches.
++        forgetDeletedMessage(queryClient, channelId, eventId);
+         await threadContext.refreshStructuralEvents();
+         onRefresh();
+       } finally {
+@@ -497,6 +502,7 @@ export function HomeView({
+     },
+     [
+       onRefresh,
++      queryClient,
+       selectedItem?.item.channelId,
+       threadContext.refreshStructuralEvents,
+     ],
+diff --git a/desktop/src/features/messages/hooks.ts b/desktop/src/features/messages/hooks.ts
+index 3fdd83670..2aa7db96c 100644
+--- a/desktop/src/features/messages/hooks.ts
++++ b/desktop/src/features/messages/hooks.ts
+@@ -8,6 +8,7 @@ import {
+ import { toast } from "sonner";
+ 
+ import { useCommunities } from "@/features/communities/useCommunities";
++import { forgetDeletedMessage } from "@/features/messages/lib/forgetDeletedMessage";
+ import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
+ 
+ import {
+@@ -852,10 +853,8 @@ export function useDeleteMessageMutation(channel: Channel | null) {
+     },
+     onSuccess: (_data, { eventId }) => {
+       if (!channel) return;
+-      queryClient.setQueryData<RelayEvent[]>(
+-        channelMessagesKey(channel.id),
+-        (current = []) => current.filter((message) => message.id !== eventId),
+-      );
++      // Team patch: the thread panel's caches too, not only the timeline.
++      forgetDeletedMessage(queryClient, channel.id, eventId);
+     },
+     onError: (error) => {
+       toast.error(`Failed to delete message: ${error.message}`);
+diff --git a/desktop/src/features/messages/lib/forgetDeletedMessage.ts b/desktop/src/features/messages/lib/forgetDeletedMessage.ts
+new file mode 100644
+index 000000000..4a110d207
+--- /dev/null
++++ b/desktop/src/features/messages/lib/forgetDeletedMessage.ts
+@@ -0,0 +1,29 @@
++import type { QueryClient } from "@tanstack/react-query";
++
++import type { RelayEvent } from "@/shared/api/types";
++import { channelMessagesKey } from "./messageQueryKeys";
++
++/**
++ * Drops a deleted message from every cache that shows it (team patch).
++ *
++ * Deleting used to update only the channel timeline, so the message stayed in
++ * an open thread panel (and in a thread opened later from cache) until the
++ * app refetched it. The thread caches are filtered at once and then refetched
++ * so replies to the deleted message and its counters are corrected too.
++ */
++export function forgetDeletedMessage(
++  queryClient: QueryClient,
++  channelId: string,
++  eventId: string,
++): void {
++  const drop = (current: RelayEvent[] | undefined) =>
++    current?.filter((message) => message.id !== eventId);
++  queryClient.setQueryData<RelayEvent[]>(channelMessagesKey(channelId), drop);
++  queryClient.setQueriesData<RelayEvent[]>(
++    { queryKey: ["thread-replies", channelId] },
++    drop,
++  );
++  void queryClient.invalidateQueries({
++    queryKey: ["thread-replies", channelId],
++  });
++}
+diff --git a/desktop/src/features/messages/ui/MessageRow.tsx b/desktop/src/features/messages/ui/MessageRow.tsx
+index 519ae05ab..dd770cac7 100644
+--- a/desktop/src/features/messages/ui/MessageRow.tsx
++++ b/desktop/src/features/messages/ui/MessageRow.tsx
+@@ -18,6 +18,7 @@ import { MessageAuthorWithIndicators } from "@/features/messages/ui/MessageAutho
+ import { useReactionHandler } from "@/features/messages/ui/useReactionHandler";
+ import type { UserProfileLookup } from "@/features/profile/lib/identity";
+ import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
++import { MessageFilesDownloadButton } from "@/features/channel-files/ui/MessageFilesDownloadButton";
+ import { useRemindLater } from "@/features/reminders/ui/RemindMeLaterProvider";
+ import {
+   getThreadReplyAvatarCenterRem,
+@@ -435,6 +436,7 @@ export const MessageRow = React.memo(
+           }
+ 
+           return (
++            <>
+             <VideoReviewCommentMarkdown
+               channelNames={channelNames}
+               className={cn(
+@@ -466,6 +468,9 @@ export const MessageRow = React.memo(
+               videoReviewCommentRootId={videoReviewCommentRootId}
+               videoReviewContext={videoReviewContext}
+             />
++            {/* Team patch: one button for every file the message carries. */}
++            <MessageFilesDownloadButton tags={message.tags} />
++            </>
+           );
+         }
+       }
+diff --git a/desktop/src/shared/lib/downloadErrorText.test.mjs b/desktop/src/shared/lib/downloadErrorText.test.mjs
+new file mode 100644
+index 000000000..e6cdcbd81
+--- /dev/null
++++ b/desktop/src/shared/lib/downloadErrorText.test.mjs
+@@ -0,0 +1,12 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import { downloadErrorText } from "./downloadErrorText.ts";
++
++test("download errors become Korean advice", () => {
++  assert.match(downloadErrorText("download URL must match the relay origin"), /커뮤니티/);
++  assert.match(downloadErrorText("file too large (600 MiB, max 512 MiB)"), /512MB/);
++  assert.match(downloadErrorText("relay returned 403 Forbidden"), /날짜와 시간/);
++  assert.match(downloadErrorText("404 Not Found"), /지워졌을/);
++  assert.equal(downloadErrorText("weird"), "파일을 받지 못했습니다: weird");
++});
+diff --git a/desktop/src/shared/lib/downloadErrorText.ts b/desktop/src/shared/lib/downloadErrorText.ts
+new file mode 100644
+index 000000000..7d42155cd
+--- /dev/null
++++ b/desktop/src/shared/lib/downloadErrorText.ts
+@@ -0,0 +1,20 @@
++/**
++ * A Korean sentence for a failed file download (team patch). The native
++ * download command answers in terse English ("download URL must match the
++ * relay origin"), which told people nothing about what to do.
++ */
++export function downloadErrorText(raw: string): string {
++  const text = raw.trim();
++  if (/must match the relay origin|must be a \/media\/ path/i.test(text))
++    return "이 파일은 지금 연결된 커뮤니티 서버에 있지 않아 받을 수 없습니다. Buzz를 완전히 종료(⌘Q)한 뒤 다시 켜고, 파일이 올라온 커뮤니티에서 다시 받아 주세요.";
++  if (/file too large/i.test(text))
++    return "파일이 너무 커서 받을 수 없습니다. (최대 512MB)";
++  if (/\b(401|403)\b|unauthori[sz]ed|forbidden|expired/i.test(text))
++    return "서버가 파일 받기를 거절했습니다. 맥의 날짜와 시간이 맞는지 확인한 뒤 다시 받아 주세요.";
++  if (/\b404\b|not found/i.test(text))
++    return "서버에 이 파일이 없습니다. 지워졌을 수 있습니다.";
++  if (/cancel/i.test(text)) return "파일 받기를 취소했습니다.";
++  if (/timed? ?out|timeout/i.test(text))
++    return "파일을 받는 데 시간이 너무 오래 걸렸습니다. 인터넷 연결을 확인하고 다시 받아 주세요.";
++  return `파일을 받지 못했습니다: ${text || "알 수 없는 오류"}`;
++}
+diff --git a/desktop/src/shared/ui/markdown/FileCard.tsx b/desktop/src/shared/ui/markdown/FileCard.tsx
+index 889847193..83264f7ae 100644
+--- a/desktop/src/shared/ui/markdown/FileCard.tsx
++++ b/desktop/src/shared/ui/markdown/FileCard.tsx
+@@ -3,6 +3,7 @@ import { Download, FileText } from "lucide-react";
+ import { toast } from "sonner";
+ 
+ import { invokeTauri } from "@/shared/api/tauri";
++import { downloadErrorText } from "@/shared/lib/downloadErrorText";
+ import { useSmoothCorners } from "@/shared/ui/smoothCorners";
+ 
+ /** Human-readable byte size: "820 B", "12.4 KB", "3.1 MB". */
+@@ -49,8 +50,9 @@ export function FileCard({
+       onClick={() => {
+         invokeTauri("download_file", { url: href, filename }).catch(
+           (err: unknown) => {
+-            const msg = err instanceof Error ? err.message : "Download failed";
+-            toast.error(msg);
++            const msg = err instanceof Error ? err.message : String(err);
++            // Team patch: say what went wrong and what to do, in Korean.
++            toast.error(downloadErrorText(msg));
+           },
+         );
+       }}

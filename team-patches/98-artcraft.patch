@@ -1,0 +1,343 @@
+diff --git a/desktop/src-tauri/src/commands/media_download.rs b/desktop/src-tauri/src/commands/media_download.rs
+index f45140f0a..8c2a07b34 100644
+--- a/desktop/src-tauri/src/commands/media_download.rs
++++ b/desktop/src-tauri/src/commands/media_download.rs
+@@ -161,6 +161,97 @@ pub async fn download_file(
+     save_bytes_with_dialog(&app, &filename, "All Files", &extensions, &bytes).await
+ }
+ 
++/// Team patch: the ArtCraft app that opens an attachment, by file extension.
++fn team_app_for(ext: &str) -> Option<&'static str> {
++    match ext {
++        "docx" | "doc" | "odt" | "rtf" => Some("WordCraft"),
++        "xlsx" | "xls" | "xlsm" | "ods" | "csv" | "tsv" => Some("GridCraft"),
++        "pptx" | "ppt" | "odp" => Some("DeckCraft"),
++        "pdf" => Some("PdfCraft"),
++        _ => None,
++    }
++}
++
++/// Team patch: document and picture types "열기" may hand to another app.
++/// Anything else (a script, an app bundle, an installer) is refused, because
++/// the system would run it instead of showing it.
++const TEAM_OPENABLE_EXTENSIONS: &[&str] = &[
++    "docx", "doc", "odt", "rtf", "xlsx", "xls", "xlsm", "ods", "csv", "tsv", "pptx", "ppt",
++    "odp", "pdf", "txt", "md", "png", "jpg", "jpeg", "gif", "webp", "hwp", "hwpx",
++];
++
++/// The installed app bundle for `name`, in /Applications or ~/Applications.
++fn installed_app_path(name: &str) -> Option<std::path::PathBuf> {
++    let mut candidates = vec![std::path::PathBuf::from(format!("/Applications/{name}.app"))];
++    if let Some(home) = std::env::var_os("HOME") {
++        candidates.push(
++            std::path::PathBuf::from(home)
++                .join("Applications")
++                .join(format!("{name}.app")),
++        );
++    }
++    candidates.into_iter().find(|path| path.is_dir())
++}
++
++/// Team patch: download an attachment to a fresh temporary folder and open it
++/// in its ArtCraft app (WordCraft, GridCraft, DeckCraft, PdfCraft) when that
++/// app is installed, else in the Mac's default app for the type. Returns the
++/// name of the app it used, or "default".
++///
++/// Same address, size and type checks as `download_file`, and only the
++/// document and picture types in `TEAM_OPENABLE_EXTENSIONS` are opened.
++#[tauri::command]
++pub async fn open_file_in_app(
++    url: String,
++    filename: String,
++    state: State<'_, AppState>,
++) -> Result<String, String> {
++    let relay_base = relay_api_base_url_with_override(&state);
++    validate_download_url(&url, &relay_base)?;
++    let filename = sanitize_filename(&filename);
++
++    let bytes = fetch_blob_bytes_with_cap(&url, &state, MAX_FILE_DOWNLOAD_BYTES, None).await?;
++    detect_and_validate_mime(&bytes)?;
++    let (bytes, filename) =
++        match super::media_team_zip::unpack_team_zip(&bytes, &filename, MAX_FILE_DOWNLOAD_BYTES) {
++            Some((unpacked, original)) => (unpacked, sanitize_filename(&original)),
++            None => (bytes, filename),
++        };
++
++    let ext = std::path::Path::new(&filename)
++        .extension()
++        .and_then(|e| e.to_str())
++        .map(|e| e.to_ascii_lowercase())
++        .unwrap_or_default();
++    if !TEAM_OPENABLE_EXTENSIONS.contains(&ext.as_str()) {
++        return Err(format!("cannot open this file type here: .{ext}"));
++    }
++
++    // A fresh folder per open, so two files with the same name never collide.
++    let dir = std::env::temp_dir()
++        .join("buzz-opened")
++        .join(uuid::Uuid::new_v4().to_string());
++    std::fs::create_dir_all(&dir).map_err(|e| format!("failed to prepare the file: {e}"))?;
++    let path = dir.join(&filename);
++    std::fs::write(&path, &bytes).map_err(|e| format!("failed to prepare the file: {e}"))?;
++
++    let app = team_app_for(&ext).and_then(|name| installed_app_path(name).map(|p| (name, p)));
++    let mut command = std::process::Command::new("/usr/bin/open");
++    if let Some((_, app_path)) = &app {
++        command.arg("-a").arg(app_path);
++    }
++    let status = command
++        .arg(&path)
++        .status()
++        .map_err(|e| format!("failed to open the file: {e}"))?;
++    if !status.success() {
++        return Err("failed to open the file".to_string());
++    }
++    Ok(app
++        .map(|(name, _)| name.to_string())
++        .unwrap_or_else(|| "default".to_string()))
++}
++
+ /// Copy an image from a relay media URL directly to the system clipboard.
+ ///
+ /// Fetches the image, decodes it to RGBA8, and writes it to the clipboard via
+diff --git a/desktop/src-tauri/src/lib.rs b/desktop/src-tauri/src/lib.rs
+index b16b34dfd..143e43cea 100644
+--- a/desktop/src-tauri/src/lib.rs
++++ b/desktop/src-tauri/src/lib.rs
+@@ -690,6 +690,7 @@ pub fn run() {
+             save_png_data_url,
+             download_file,
+             download_files_to_folder,
++            open_file_in_app,
+             fetch_media_bytes,
+             cancel_media_fetch,
+             release_media_fetch,
+diff --git a/desktop/src/features/team-links/lib/mcpCatalog.ts b/desktop/src/features/team-links/lib/mcpCatalog.ts
+index 75adfa9ba..7618a0ad3 100644
+--- a/desktop/src/features/team-links/lib/mcpCatalog.ts
++++ b/desktop/src/features/team-links/lib/mcpCatalog.ts
+@@ -47,7 +47,49 @@ export type McpPreset = {
+  * has approved (it refuses `mcp-remote`), so Figma goes through the server the
+  * Figma desktop app runs on this computer once it is switched on there.
+  */
++/** Folder the ArtCraft tools read and write in (created on first use). */
++export const ARTCRAFT_WORK_DIR = "$HOME/BuzzArtCraft";
++const ARTCRAFT_BIN = "$HOME/Library/Application Support/ArtCraft/bin";
++
++/**
++ * An ArtCraft app's own MCP server (`<app>-cli mcp`), started through the
++ * shell so `$HOME` resolves on whichever Mac runs the agent. Installed by
++ * `install-artcraft.sh`. `confine` passes WordCraft's flags that keep the
++ * agent's reads and writes inside `ARTCRAFT_WORK_DIR`.
++ */
++export function artcraftMcpServer(
++  name: string,
++  cli: string,
++  confine: boolean,
++): McpServerSpec {
++  const dir = `"${ARTCRAFT_WORK_DIR}"`;
++  const roots = confine
++    ? ` --automation-read-root ${dir} --automation-write-root ${dir}`
++    : "";
++  return {
++    name,
++    command: "/bin/sh",
++    args: [
++      "-c",
++      `mkdir -p ${dir} && cd ${dir} && exec "${ARTCRAFT_BIN}/${cli}" mcp${roots}`,
++    ],
++    env: {},
++  };
++}
++
+ export const MCP_PRESETS: McpPreset[] = [
++  {
++    server: artcraftMcpServer("wordcraft", "wordcraft-cli", true),
++    label: "워드 문서 (WordCraft)",
++    description:
++      "워드 문서를 만들고 고치고 PDF로 내보냅니다. 홈 폴더의 BuzzArtCraft 폴더 안의 파일만 다룹니다.",
++  },
++  {
++    server: artcraftMcpServer("gridcraft", "gridcraft-cli", false),
++    label: "엑셀 (GridCraft)",
++    description:
++      "엑셀 표를 만들고 계산하고 정리합니다. BuzzArtCraft 폴더에서 작업합니다.",
++  },
+   {
+     server: {
+       name: "figma",
+diff --git a/desktop/src/features/team-links/lib/teamLinks.test.mjs b/desktop/src/features/team-links/lib/teamLinks.test.mjs
+index 666abe74c..10727cc0c 100644
+--- a/desktop/src/features/team-links/lib/teamLinks.test.mjs
++++ b/desktop/src/features/team-links/lib/teamLinks.test.mjs
+@@ -92,13 +92,18 @@ test("shortcuts round-trip, merge by last writer and filter by channel", () => {
+ });
+ 
+ test("MCP servers are stored in one environment variable", () => {
+-  const figma = MCP_PRESETS[1].server;
++  const preset = (name) => MCP_PRESETS.find((p) => p.server.name === name).server;
++  const figma = preset("notion");
+   assert.equal(remoteUrlOf(figma), "https://mcp.notion.com/mcp");
+   // The Figma preset is the desktop app's local server, not a hosted address.
+-  assert.equal(remoteUrlOf(MCP_PRESETS[0].server), null);
++  assert.equal(remoteUrlOf(preset("figma")), null);
++  // ArtCraft presets start the app's own MCP server through the shell.
++  assert.equal(preset("wordcraft").command, "/bin/sh");
++  assert.match(preset("wordcraft").args[1], /wordcraft-cli" mcp --automation-read-root/);
++  assert.match(preset("gridcraft").args[1], /gridcraft-cli" mcp$/);
+   const stale = { name: "figma", command: "npx", args: ["-y", "mcp-remote", "https://mcp.figma.com/mcp"], env: {} };
+   assert.deepEqual(withCurrentPresets([stale, { name: "mine", command: "x", args: [], env: {} }]), [
+-    MCP_PRESETS[0].server,
++    preset("figma"),
+     { name: "mine", command: "x", args: [], env: {} },
+   ]);
+   const env = envWithMcpServers({ OTHER: "1" }, [figma]);
+diff --git a/desktop/src/shared/lib/openInApp.test.mjs b/desktop/src/shared/lib/openInApp.test.mjs
+new file mode 100644
+index 000000000..7eae85665
+--- /dev/null
++++ b/desktop/src/shared/lib/openInApp.test.mjs
+@@ -0,0 +1,17 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import { canOpenInApp, fileExtension, teamAppFor } from "./openInApp.ts";
++
++test("documents open in their ArtCraft app; scripts are never offered", () => {
++  assert.equal(teamAppFor("공모전 정리_1007.xlsx"), "GridCraft");
++  assert.equal(teamAppFor("회의록.DOCX"), "WordCraft");
++  assert.equal(teamAppFor("발표.pptx"), "DeckCraft");
++  assert.equal(teamAppFor("계약서.pdf"), "PdfCraft");
++  assert.equal(teamAppFor("메모.txt"), null);
++  assert.ok(canOpenInApp("메모.txt"));
++  assert.ok(canOpenInApp("기획안.hwp"));
++  for (const name of ["run.command", "setup.sh", "Buzz.app", "x.dmg", "a.pkg", "noext"])
++    assert.equal(canOpenInApp(name), false, name);
++  assert.equal(fileExtension("a.tar.gz"), "gz");
++});
+diff --git a/desktop/src/shared/lib/openInApp.ts b/desktop/src/shared/lib/openInApp.ts
+new file mode 100644
+index 000000000..db9b0f4fe
+--- /dev/null
++++ b/desktop/src/shared/lib/openInApp.ts
+@@ -0,0 +1,50 @@
++/**
++ * Team patch: which attachments "열기" offers, and the ArtCraft app that
++ * opens each (WordCraft, GridCraft, DeckCraft, PdfCraft). The native command
++ * keeps the same list and refuses anything else, so a script or installer is
++ * never handed to the system to run.
++ */
++const TEAM_APPS: Record<string, string> = {
++  docx: "WordCraft",
++  doc: "WordCraft",
++  odt: "WordCraft",
++  rtf: "WordCraft",
++  xlsx: "GridCraft",
++  xls: "GridCraft",
++  xlsm: "GridCraft",
++  ods: "GridCraft",
++  csv: "GridCraft",
++  tsv: "GridCraft",
++  pptx: "DeckCraft",
++  ppt: "DeckCraft",
++  odp: "DeckCraft",
++  pdf: "PdfCraft",
++};
++
++const OTHER_OPENABLE = new Set([
++  "txt",
++  "md",
++  "png",
++  "jpg",
++  "jpeg",
++  "gif",
++  "webp",
++  "hwp",
++  "hwpx",
++]);
++
++export function fileExtension(filename: string): string {
++  const match = /\.([A-Za-z0-9]+)$/.exec(filename.trim());
++  return match ? (match[1] as string).toLowerCase() : "";
++}
++
++/** True when "열기" is offered for this file name. */
++export function canOpenInApp(filename: string): boolean {
++  const ext = fileExtension(filename);
++  return ext in TEAM_APPS || OTHER_OPENABLE.has(ext);
++}
++
++/** The ArtCraft app meant for this file, or null for the Mac's default. */
++export function teamAppFor(filename: string): string | null {
++  return TEAM_APPS[fileExtension(filename)] ?? null;
++}
+diff --git a/desktop/src/shared/ui/markdown/FileCard.tsx b/desktop/src/shared/ui/markdown/FileCard.tsx
+index 83264f7ae..fca497dd0 100644
+--- a/desktop/src/shared/ui/markdown/FileCard.tsx
++++ b/desktop/src/shared/ui/markdown/FileCard.tsx
+@@ -1,9 +1,10 @@
+ import * as React from "react";
+-import { Download, FileText } from "lucide-react";
++import { Download, ExternalLink, FileText } from "lucide-react";
+ import { toast } from "sonner";
+ 
+ import { invokeTauri } from "@/shared/api/tauri";
+ import { downloadErrorText } from "@/shared/lib/downloadErrorText";
++import { canOpenInApp, teamAppFor } from "@/shared/lib/openInApp";
+ import { useSmoothCorners } from "@/shared/ui/smoothCorners";
+ 
+ /** Human-readable byte size: "820 B", "12.4 KB", "3.1 MB". */
+@@ -42,8 +43,23 @@ export function FileCard({
+   const cardRef = React.useRef<HTMLButtonElement | null>(null);
+   const sizeLabel = size != null ? formatFileSize(size) : "";
+   useSmoothCorners(cardRef);
++  // Team patch: "열기" opens the file in its ArtCraft app (or the default app).
++  const [opening, setOpening] = React.useState(false);
++  const openable = canOpenInApp(filename);
++  const appName = teamAppFor(filename);
+ 
+-  return (
++  const open = () => {
++    if (opening) return;
++    setOpening(true);
++    invokeTauri<string>("open_file_in_app", { url: href, filename })
++      .catch((err: unknown) => {
++        const msg = err instanceof Error ? err.message : String(err);
++        toast.error(downloadErrorText(msg));
++      })
++      .finally(() => setOpening(false));
++  };
++
++  const card = (
+     <button
+       ref={cardRef}
+       type="button"
+@@ -76,4 +92,28 @@ export function FileCard({
+       <Download className="h-4 w-4 shrink-0 text-muted-foreground" />
+     </button>
+   );
++
++  if (!openable) return card;
++  return (
++    <span className="inline-flex max-w-full items-center gap-1.5 align-middle">
++      {card}
++      <button
++        aria-label={`${filename} ${appName ? `${appName}(으)로` : ""} 열기`}
++        className="inline-flex h-8 shrink-0 items-center gap-1 rounded-full border border-border/70 px-2.5 text-xs text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground disabled:opacity-60"
++        data-no-translate=""
++        data-testid="file-card-open"
++        disabled={opening}
++        onClick={open}
++        title={
++          appName
++            ? `${appName}이(가) 깔려 있으면 ${appName}로, 아니면 맥의 기본 앱으로 엽니다.`
++            : "맥의 기본 앱으로 엽니다."
++        }
++        type="button"
++      >
++        <ExternalLink className="h-3.5 w-3.5" />
++        {opening ? "여는 중…" : "열기"}
++      </button>
++    </span>
++  );
+ }
