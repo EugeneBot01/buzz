@@ -1,0 +1,944 @@
+diff --git a/desktop/src/app/AppShell.tsx b/desktop/src/app/AppShell.tsx
+index 1fe855738..1359cdf67 100644
+--- a/desktop/src/app/AppShell.tsx
++++ b/desktop/src/app/AppShell.tsx
+@@ -106,6 +106,8 @@ import { AppShellTrayMenu } from "@/app/useAppShellTrayMenu";
+ import { AppProfilePanelProvider } from "@/app/AppProfilePanelProvider";
+ import { AppWorkflowEditorOverlayProvider } from "@/app/AppWorkflowEditorOverlayProvider";
+ import { LazySettingsScreen } from "@/app/LazySettingsScreen";
++import { useTeamWelcome } from "@/features/team-welcome/lib/useTeamWelcome";
++import { WelcomeGuide } from "@/features/team-welcome/ui/WelcomeGuide";
+ const EMPTY_CHANNELS: Channel[] = [];
+ export function AppShell() {
+   useWebviewZoomShortcuts();
+@@ -247,6 +249,11 @@ export function AppShell() {
+   const feedItemState = useFeedItemState(identityQuery.data?.pubkey);
+   const channelsQuery = useChannelsQuery();
+   const channels = channelsQuery.data ?? [];
++  useTeamWelcome(
++    identityQuery.data?.pubkey,
++    communitiesHook.activeCommunity?.relayUrl,
++    channelsQuery.data,
++  );
+   useReminderNotifications(
+     identityQuery.data?.pubkey,
+     notificationSettings.settings,
+@@ -997,6 +1004,7 @@ export function AppShell() {
+                     onOpenChange={setIsSendFeedbackOpen}
+                     open={isSendFeedbackOpen}
+                   />
++                  {!isHuddleRoom ? <WelcomeGuide /> : null}
+                   {!isHuddleRoom ? <ProtectedGlobalOverlay /> : null}
+                 </AppWorkflowEditorOverlayProvider>
+               </AppProfilePanelProvider>
+diff --git a/desktop/src/features/settings/ui/SettingsPanels.tsx b/desktop/src/features/settings/ui/SettingsPanels.tsx
+index 183232de7..b9947c9f1 100644
+--- a/desktop/src/features/settings/ui/SettingsPanels.tsx
++++ b/desktop/src/features/settings/ui/SettingsPanels.tsx
+@@ -12,6 +12,7 @@ import {
+   LayoutTemplate,
+   MessagesSquare,
+   MonitorCog,
++  Sparkles,
+   Moon,
+   ServerCog,
+   Smartphone,
+@@ -71,6 +72,7 @@ import { NotificationSettingsCard } from "./NotificationSettingsCard";
+ import { AgentsSettingsPanel } from "./AgentsSettingsPanel";
+ import { HostedCommunitiesSettingsCard } from "./HostedCommunitiesSettingsCard";
+ import { AdminConsoleSettingsCard } from "@/features/admin-console/AdminConsoleSettingsCard";
++import { TeamWelcomeSettingsCard } from "@/features/team-welcome/ui/TeamWelcomeSettingsCard";
+ import {
+   SettingsOptionGroup,
+   SettingsOptionGroupList,
+@@ -95,6 +97,7 @@ export type SettingsSection =
+   | "hosted-communities"
+   | "community-members"
+   | "relay-admin"
++  | "team-welcome"
+   | "custom-emoji"
+   | "local-archive"
+   | "mobile"
+@@ -115,6 +118,7 @@ const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
+   "hosted-communities",
+   "community-members",
+   "relay-admin",
++  "team-welcome",
+   "custom-emoji",
+   "local-archive",
+   "mobile",
+@@ -214,6 +218,11 @@ export const settingsSections: SettingsSectionDescriptor[] = [
+     label: "Admin",
+     icon: ServerCog,
+   },
++  {
++    value: "team-welcome",
++    label: "팀 안내",
++    icon: Sparkles,
++  },
+   {
+     value: "custom-emoji",
+     label: "Custom emoji",
+@@ -852,6 +861,8 @@ export function renderSettingsSection(
+       );
+     case "relay-admin":
+       return <AdminConsoleSettingsCard />;
++    case "team-welcome":
++      return <TeamWelcomeSettingsCard />;
+     case "custom-emoji":
+       return <CustomEmojiSettingsCard />;
+     case "local-archive":
+diff --git a/desktop/src/features/settings/ui/SettingsView.tsx b/desktop/src/features/settings/ui/SettingsView.tsx
+index e2fc80587..e34308421 100644
+--- a/desktop/src/features/settings/ui/SettingsView.tsx
++++ b/desktop/src/features/settings/ui/SettingsView.tsx
+@@ -67,7 +67,12 @@ export const settingsNavGroups: Array<{
+   },
+   {
+     label: "Communities",
+-    sections: ["hosted-communities", "community-members", "relay-admin"],
++    sections: [
++      "hosted-communities",
++      "community-members",
++      "relay-admin",
++      "team-welcome",
++    ],
+   },
+   {
+     label: "App",
+diff --git a/desktop/src/features/team-welcome/lib/defaults.test.mjs b/desktop/src/features/team-welcome/lib/defaults.test.mjs
+new file mode 100644
+index 000000000..2c67fd23c
+--- /dev/null
++++ b/desktop/src/features/team-welcome/lib/defaults.test.mjs
+@@ -0,0 +1,155 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++
++import {
++  MAX_DEFAULT_CHANNELS,
++  NEWCOMER_WINDOW_MS,
++  decodeOnboarding,
++  encodeOnboarding,
++  firstRunAttempted,
++  isNewcomer,
++  latestOnboarding,
++  onboardingDTag,
++  pendingDefaults,
++  readProgress,
++  writeProgress,
++} from "./defaults.ts";
++
++const ADMIN = "a".repeat(64);
++const MEMBER = "b".repeat(64);
++
++const doc = (channels) => decodeOnboarding(encodeOnboarding(channels, 1));
++
++test("the document key matches the Buzz Team 0.7 build", () => {
++  assert.equal(
++    onboardingDTag("wss://Relay.Example.com/"),
++    "team-onboarding:wss://relay.example.com",
++  );
++});
++
++test("encode and decode keep valid channels, drop bad and repeated ones", () => {
++  const decoded = decodeOnboarding(
++    JSON.stringify({
++      version: 1,
++      updatedAt: 5,
++      channels: [
++        { id: "c1", name: "공지" },
++        { id: "c1", name: "dup" },
++        { id: "", name: "empty" },
++        { id: 3 },
++        null,
++        { id: "c2" },
++      ],
++    }),
++  );
++  assert.deepEqual(decoded, {
++    version: 1,
++    updatedAt: 5,
++    channels: [
++      { id: "c1", name: "공지" },
++      { id: "c2", name: "c2" },
++    ],
++  });
++  assert.equal(decodeOnboarding("not json"), null);
++  assert.equal(
++    decodeOnboarding(JSON.stringify({ version: 2, channels: [] })),
++    null,
++  );
++});
++
++test("at most MAX_DEFAULT_CHANNELS are kept", () => {
++  const many = Array.from({ length: MAX_DEFAULT_CHANNELS + 5 }, (_, i) => ({
++    id: `c${i}`,
++    name: `c${i}`,
++  }));
++  assert.equal(doc(many).channels.length, MAX_DEFAULT_CHANNELS);
++});
++
++test("only the newest document by an owner or admin counts", () => {
++  const events = [
++    {
++      pubkey: ADMIN,
++      created_at: 10,
++      content: encodeOnboarding([{ id: "old", name: "old" }]),
++    },
++    {
++      pubkey: ADMIN,
++      created_at: 20,
++      content: encodeOnboarding([{ id: "new", name: "new" }]),
++    },
++    {
++      pubkey: MEMBER,
++      created_at: 30,
++      content: encodeOnboarding([{ id: "spam", name: "spam" }]),
++    },
++  ];
++  assert.deepEqual(
++    latestOnboarding(events, new Set([ADMIN])).channels.map(({ id }) => id),
++    ["new"],
++  );
++  assert.equal(latestOnboarding(events, new Set()), null);
++});
++
++test("pending defaults skip joined and already attempted channels", () => {
++  const defaults = doc([
++    { id: "a", name: "a" },
++    { id: "b", name: "b" },
++    { id: "c", name: "c" },
++  ]);
++  assert.deepEqual(
++    pendingDefaults(defaults, new Set(["a"]), new Set(["b"])).map(
++      ({ id }) => id,
++    ),
++    ["c"],
++  );
++  assert.deepEqual(pendingDefaults(null, new Set(), new Set()), []);
++});
++
++test("a newcomer starts with nothing handled", () => {
++  const defaults = doc([{ id: "a", name: "a" }]);
++  assert.deepEqual(firstRunAttempted(true, ["x", "y"], defaults), []);
++});
++
++test("an existing member's first run marks every unjoined public channel and every default handled", () => {
++  const defaults = doc([
++    { id: "a", name: "a" },
++    { id: "x", name: "x" },
++  ]);
++  assert.deepEqual([...firstRunAttempted(false, ["x", "y"], defaults)].sort(), [
++    "a",
++    "x",
++    "y",
++  ]);
++  // No defaults saved yet: a later first save still cannot reach old channels.
++  assert.deepEqual([...firstRunAttempted(false, ["x", "y"], null)].sort(), [
++    "x",
++    "y",
++  ]);
++});
++
++test("newcomer: in no channel yet, or first added within the window", () => {
++  const now = Date.UTC(2026, 10, 4);
++  assert.equal(isNewcomer(null, now), true);
++  assert.equal(isNewcomer(now - 60_000, now), true);
++  assert.equal(isNewcomer(now - NEWCOMER_WINDOW_MS - 1, now), false);
++});
++
++test("progress round-trips per member and relay, and is null when never run", () => {
++  const store = new Map();
++  const storage = {
++    getItem: (key) => store.get(key) ?? null,
++    setItem: (key, value) => store.set(key, value),
++  };
++  assert.equal(readProgress(ADMIN, "wss://r.example", storage), null);
++  writeProgress(
++    ADMIN,
++    "wss://r.example",
++    { welcomed: true, attempted: ["a"] },
++    storage,
++  );
++  assert.deepEqual(readProgress(ADMIN, "wss://R.example/", storage), {
++    welcomed: true,
++    attempted: ["a"],
++  });
++  assert.equal(readProgress(MEMBER, "wss://r.example", storage), null);
++});
+diff --git a/desktop/src/features/team-welcome/lib/defaults.ts b/desktop/src/features/team-welcome/lib/defaults.ts
+new file mode 100644
+index 000000000..8a68c5520
+--- /dev/null
++++ b/desktop/src/features/team-welcome/lib/defaults.ts
+@@ -0,0 +1,180 @@
++import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
++
++/**
++ * Team welcome (team patch): the channels a community's owners and admins
++ * choose for every newcomer, and a short guide shown once per device.
++ *
++ * Stored as one plaintext kind-30078 document per admin, in the same shape as
++ * the Buzz Team 0.7 build (`team-onboarding`), so both builds read each
++ * other's choice. Readers keep the newest document written by a current owner
++ * or admin, so an ordinary member's document never changes anyone's defaults.
++ */
++export const ONBOARDING_TAG = "team-onboarding";
++export const MAX_DEFAULT_CHANNELS = 30;
++
++export function onboardingDTag(relayUrl: string): string {
++  return `${ONBOARDING_TAG}:${normalizeRelayUrl(relayUrl)}`;
++}
++
++export type DefaultChannel = Readonly<{ id: string; name: string }>;
++export type OnboardingDoc = Readonly<{
++  version: 1;
++  channels: readonly DefaultChannel[];
++  updatedAt: number;
++}>;
++
++export function encodeOnboarding(
++  channels: readonly DefaultChannel[],
++  now = Date.now(),
++): string {
++  const doc: OnboardingDoc = {
++    version: 1,
++    channels: channels.slice(0, MAX_DEFAULT_CHANNELS),
++    updatedAt: now,
++  };
++  return JSON.stringify(doc);
++}
++
++export function decodeOnboarding(content: string): OnboardingDoc | null {
++  let raw: unknown;
++  try {
++    raw = JSON.parse(content);
++  } catch {
++    return null;
++  }
++  if (!raw || typeof raw !== "object") return null;
++  const { version, channels, updatedAt } = raw as Record<string, unknown>;
++  if (version !== 1 || !Array.isArray(channels)) return null;
++  const seen = new Set<string>();
++  const valid: DefaultChannel[] = [];
++  for (const entry of channels) {
++    if (!entry || typeof entry !== "object") continue;
++    const { id, name } = entry as Record<string, unknown>;
++    if (typeof id !== "string" || !id || id.length > 128 || seen.has(id))
++      continue;
++    seen.add(id);
++    valid.push({
++      id,
++      name: typeof name === "string" ? name.slice(0, 120) : id,
++    });
++    if (valid.length === MAX_DEFAULT_CHANNELS) break;
++  }
++  return {
++    version: 1,
++    channels: valid,
++    updatedAt: typeof updatedAt === "number" ? updatedAt : 0,
++  };
++}
++
++/** The newest readable document written by a current owner or admin. */
++export function latestOnboarding(
++  events: readonly { pubkey: string; content: string; created_at: number }[],
++  managers: ReadonlySet<string>,
++): OnboardingDoc | null {
++  let best: { at: number; doc: OnboardingDoc } | undefined;
++  for (const event of events) {
++    if (!managers.has(event.pubkey)) continue;
++    const doc = decodeOnboarding(event.content);
++    if (doc && (!best || event.created_at > best.at))
++      best = { at: event.created_at, doc };
++  }
++  return best?.doc ?? null;
++}
++
++/**
++ * Default channels this member is not in and has never been put into from
++ * this device. A channel the member left after joining stays left.
++ */
++export function pendingDefaults(
++  doc: OnboardingDoc | null,
++  joined: ReadonlySet<string>,
++  attempted: ReadonlySet<string>,
++): DefaultChannel[] {
++  return (doc?.channels ?? []).filter(
++    ({ id }) => !joined.has(id) && !attempted.has(id),
++  );
++}
++
++// ---- progress on this device, per member and community ----
++
++export type WelcomeProgress = Readonly<{
++  welcomed: boolean;
++  attempted: readonly string[];
++}>;
++
++const progressKey = (pubkey: string, relayUrl: string) =>
++  `buzz-team-welcome:${pubkey}:${normalizeRelayUrl(relayUrl)}`;
++
++/** `null` when this device has never run the welcome for this member. */
++export function readProgress(
++  pubkey: string,
++  relayUrl: string,
++  storage: Pick<Storage, "getItem"> = localStorage,
++): WelcomeProgress | null {
++  try {
++    const raw = JSON.parse(
++      storage.getItem(progressKey(pubkey, relayUrl)) ?? "",
++    );
++    if (!raw || typeof raw !== "object") return null;
++    const { welcomed, attempted } = raw as Record<string, unknown>;
++    return {
++      welcomed: welcomed === true,
++      attempted: Array.isArray(attempted)
++        ? attempted.filter((id): id is string => typeof id === "string")
++        : [],
++    };
++  } catch {
++    return null;
++  }
++}
++
++export function writeProgress(
++  pubkey: string,
++  relayUrl: string,
++  progress: WelcomeProgress,
++  storage: Pick<Storage, "setItem"> = localStorage,
++): void {
++  try {
++    storage.setItem(progressKey(pubkey, relayUrl), JSON.stringify(progress));
++  } catch {
++    // Without storage the welcome simply runs again next launch.
++  }
++}
++
++/** How long after first joining a team channel someone counts as new. */
++export const NEWCOMER_WINDOW_MS = 7 * 24 * 60 * 60 * 1_000;
++
++/**
++ * Whether this member is new to the community: in no team channel yet, or
++ * first added to one within the window. A channel keeps the first join time
++ * when someone is added back, so an old member who left and was re-added by
++ * the server-side invite still counts as old.
++ */
++export function isNewcomer(
++  earliestJoinMs: number | null,
++  now = Date.now(),
++): boolean {
++  return earliestJoinMs === null || now - earliestJoinMs < NEWCOMER_WINDOW_MS;
++}
++
++/**
++ * What the first run on a device records as already handled. A newcomer
++ * starts with nothing handled, so every default channel is joined. An
++ * existing member updating the app has every public channel they are not in
++ * marked handled, so no channel they once left (or never wanted) is forced on
++ * them, whatever an admin picks later; only channels made after this run can
++ * still reach them as defaults.
++ */
++export function firstRunAttempted(
++  newcomer: boolean,
++  notJoinedOpenChannelIds: readonly string[],
++  doc: OnboardingDoc | null,
++): readonly string[] {
++  if (newcomer) return [];
++  return [
++    ...new Set([
++      ...notJoinedOpenChannelIds,
++      ...(doc?.channels ?? []).map(({ id }) => id),
++    ]),
++  ];
++}
+diff --git a/desktop/src/features/team-welcome/lib/useTeamWelcome.ts b/desktop/src/features/team-welcome/lib/useTeamWelcome.ts
+new file mode 100644
+index 000000000..0b3ae1a34
+--- /dev/null
++++ b/desktop/src/features/team-welcome/lib/useTeamWelcome.ts
+@@ -0,0 +1,190 @@
++import { useQueryClient } from "@tanstack/react-query";
++import * as React from "react";
++
++import { channelsQueryKey } from "@/features/channels/hooks";
++import { relayClient } from "@/shared/api/relayClient";
++import { listRelayMembers } from "@/shared/api/relayMembers";
++import { getChannelMembers, joinChannel } from "@/shared/api/tauri";
++import type { Channel } from "@/shared/api/types";
++import { KIND_CHANNEL_SECTIONS } from "@/shared/constants/kinds";
++import {
++  type OnboardingDoc,
++  firstRunAttempted,
++  isNewcomer,
++  latestOnboarding,
++  onboardingDTag,
++  pendingDefaults,
++  readProgress,
++  writeProgress,
++} from "./defaults";
++
++// ---- whether the guide is open, shared by the app shell and Settings ----
++
++type GuideState = { open: boolean; joined: readonly string[] };
++let guide: GuideState = { open: false, joined: [] };
++const listeners = new Set<() => void>();
++const emit = () => {
++  for (const listener of listeners) listener();
++};
++const subscribe = (listener: () => void) => {
++  listeners.add(listener);
++  return () => {
++    listeners.delete(listener);
++  };
++};
++
++export function openWelcomeGuide(joined: readonly string[] = []) {
++  guide = { open: true, joined };
++  emit();
++}
++
++export function closeWelcomeGuide() {
++  guide = { ...guide, open: false };
++  emit();
++}
++
++export function useWelcomeGuideState() {
++  return React.useSyncExternalStore(subscribe, () => guide);
++}
++
++// ---- relay reads ----
++
++/** The community's default channels, as chosen by its owners and admins. */
++export async function readDefaultChannels(
++  relayUrl: string,
++): Promise<OnboardingDoc | null> {
++  const [members, events] = await Promise.all([
++    listRelayMembers(),
++    relayClient.fetchEvents({
++      kinds: [KIND_CHANNEL_SECTIONS],
++      "#d": [onboardingDTag(relayUrl)],
++      limit: 50,
++    }),
++  ]);
++  const managers = new Set(
++    members
++      .filter(({ role }) => role === "owner" || role === "admin")
++      .map(({ pubkey }) => pubkey),
++  );
++  return latestOnboarding(events, managers);
++}
++
++const isTeamChannel = (channel: Channel) =>
++  channel.channelType !== "dm" && !channel.archivedAt;
++
++/** How many of the member's channels are asked for their first join time. */
++const JOIN_TIME_SAMPLE = 5;
++
++/**
++ * When this member was first added to a team channel, from up to a few of
++ * their channels; `null` when they are in none.
++ */
++async function earliestJoin(
++  pubkey: string,
++  team: readonly Channel[],
++): Promise<number | null> {
++  const mine = team
++    .filter((channel) => channel.isMember)
++    .slice(0, JOIN_TIME_SAMPLE);
++  const times = await Promise.all(
++    mine.map(async (channel) => {
++      const member = (await getChannelMembers(channel.id)).find(
++        (entry) => entry.pubkey === pubkey,
++      );
++      const at = member ? Date.parse(member.joinedAt) : Number.NaN;
++      return Number.isFinite(at) ? at : null;
++    }),
++  );
++  if (mine.length === 0) return null;
++  const known = times.filter((at): at is number => at !== null);
++  if (known.length === 0) throw new Error("join time unknown");
++  return Math.min(...known);
++}
++
++/**
++ * Once per member, community and launch: joins the community's default
++ * channels this member has not been put into from this device, and shows the
++ * guide on the first run.
++ */
++export function useTeamWelcome(
++  pubkey: string | undefined,
++  relayUrl: string | undefined,
++  channels: readonly Channel[] | undefined,
++) {
++  const queryClient = useQueryClient();
++  const ranRef = React.useRef("");
++  const channelsRef = React.useRef(channels);
++  channelsRef.current = channels;
++  // Runs again once the list (a snapshot, or nothing yet) has team channels.
++  const loaded = channels?.some(isTeamChannel) === true;
++
++  React.useEffect(() => {
++    const channels = channelsRef.current;
++    if (!pubkey || !relayUrl || !loaded || !channels) return;
++    const scope = `${pubkey}|${relayUrl}`;
++    if (ranRef.current === scope) return;
++    ranRef.current = scope;
++    let cancelled = false;
++
++    void (async () => {
++      const progress = readProgress(pubkey, relayUrl);
++      const team = channels.filter(isTeamChannel);
++      let doc: OnboardingDoc | null = null;
++      let newcomer = false;
++      try {
++        doc = await readDefaultChannels(relayUrl);
++        if (!progress) newcomer = isNewcomer(await earliestJoin(pubkey, team));
++      } catch {
++        // Try again next launch; guessing here could pull an existing member
++        // back into channels they left.
++        return;
++      }
++      if (cancelled) return;
++
++      const joined = new Set(
++        team.filter((channel) => channel.isMember).map(({ id }) => id),
++      );
++      const attempted = new Set(
++        progress?.attempted ??
++          firstRunAttempted(
++            newcomer,
++            team
++              .filter((c) => !c.isMember && c.visibility === "open")
++              .map(({ id }) => id),
++            doc,
++          ),
++      );
++      const byId = new Map(team.map((channel) => [channel.id, channel]));
++      const names: string[] = [];
++      for (const channel of pendingDefaults(doc, joined, attempted)) {
++        if (cancelled) return;
++        // Not in the list yet (a snapshot from before it was made): next launch.
++        const current = byId.get(channel.id);
++        if (!current) continue;
++        attempted.add(channel.id);
++        // Only channels a member can join by themself; a private one is skipped.
++        if (current.visibility !== "open") continue;
++        try {
++          await joinChannel(channel.id);
++          names.push(current.name);
++        } catch {
++          // A channel that was removed or made private is skipped for good.
++        }
++      }
++      writeProgress(pubkey, relayUrl, {
++        welcomed: true,
++        attempted: [...attempted],
++      });
++      if (names.length > 0)
++        void queryClient.invalidateQueries({ queryKey: channelsQueryKey });
++      // Everyone sees the guide once per device; later from Settings.
++      if (!progress) openWelcomeGuide(names);
++    })();
++
++    return () => {
++      cancelled = true;
++      // A switch away before finishing lets the next visit run it again.
++      if (ranRef.current === scope) ranRef.current = "";
++    };
++  }, [pubkey, relayUrl, loaded, queryClient]);
++}
+diff --git a/desktop/src/features/team-welcome/ui/TeamWelcomeSettingsCard.tsx b/desktop/src/features/team-welcome/ui/TeamWelcomeSettingsCard.tsx
+new file mode 100644
+index 000000000..9f04d1e1a
+--- /dev/null
++++ b/desktop/src/features/team-welcome/ui/TeamWelcomeSettingsCard.tsx
+@@ -0,0 +1,180 @@
++import * as React from "react";
++
++import { useChannelsQuery } from "@/features/channels/hooks";
++import { useMyRelayMembershipLookupQuery } from "@/features/community-members/hooks";
++import { useCommunities } from "@/features/communities/useCommunities";
++import { SettingsSectionHeader } from "@/features/settings/ui/SettingsSectionHeader";
++import {
++  ONBOARDING_TAG,
++  encodeOnboarding,
++  onboardingDTag,
++} from "@/features/team-welcome/lib/defaults";
++import {
++  openWelcomeGuide,
++  readDefaultChannels,
++} from "@/features/team-welcome/lib/useTeamWelcome";
++import { relayClient } from "@/shared/api/relayClient";
++import { canManageCommunityMembers } from "@/shared/api/relayMembers";
++import { signRelayEvent } from "@/shared/api/tauri";
++import { KIND_CHANNEL_SECTIONS } from "@/shared/constants/kinds";
++import { Button } from "@/shared/ui/button";
++import { Checkbox } from "@/shared/ui/checkbox";
++
++/** Settings → 팀 안내: show the guide again, and (admins) pick default channels. */
++export function TeamWelcomeSettingsCard() {
++  const relayUrl = useCommunities().activeCommunity?.relayUrl;
++  const membership = useMyRelayMembershipLookupQuery();
++  const manager = canManageCommunityMembers(membership.data);
++
++  return (
++    <section className="min-w-0" data-no-translate="">
++      <SettingsSectionHeader
++        action={
++          <Button
++            onClick={() => openWelcomeGuide()}
++            type="button"
++            variant="outline"
++          >
++            안내 다시 보기
++          </Button>
++        }
++        description="업데이트 후 처음 켤 때 한 번 보이는 5단계 안내예요."
++        title="팀 안내"
++      />
++      {manager && relayUrl ? (
++        <DefaultChannels key={relayUrl} relayUrl={relayUrl} />
++      ) : null}
++    </section>
++  );
++}
++
++function DefaultChannels({ relayUrl }: { relayUrl: string }) {
++  const channelsQuery = useChannelsQuery();
++  const channels = React.useMemo(
++    () =>
++      (channelsQuery.data ?? [])
++        .filter(
++          (channel) =>
++            channel.channelType !== "dm" &&
++            channel.visibility === "open" &&
++            !channel.archivedAt,
++        )
++        .sort((a, b) => a.name.localeCompare(b.name, "ko")),
++    [channelsQuery.data],
++  );
++  const [chosen, setChosen] = React.useState<ReadonlySet<string>>();
++  const [status, setStatus] = React.useState("");
++  const [busy, setBusy] = React.useState(false);
++  const lastSavedAt = React.useRef(0);
++
++  React.useEffect(() => {
++    let cancelled = false;
++    readDefaultChannels(relayUrl).then(
++      (doc) => {
++        if (!cancelled) setChosen(new Set(doc?.channels.map(({ id }) => id)));
++      },
++      () => {
++        if (!cancelled) {
++          setChosen(new Set());
++          setStatus("저장된 기본 채널을 불러오지 못했어요.");
++        }
++      },
++    );
++    return () => {
++      cancelled = true;
++    };
++  }, [relayUrl]);
++
++  const save = async () => {
++    if (!chosen) return;
++    const picked = channels
++      .filter(({ id }) => chosen.has(id))
++      .map(({ id, name }) => ({ id, name }));
++    setBusy(true);
++    setStatus("저장 중…");
++    // Two saves in one second would otherwise be refused as a duplicate.
++    const createdAt = Math.max(
++      Math.floor(Date.now() / 1_000),
++      lastSavedAt.current + 1,
++    );
++    try {
++      const event = await signRelayEvent({
++        kind: KIND_CHANNEL_SECTIONS,
++        content: encodeOnboarding(picked),
++        createdAt,
++        tags: [
++          ["d", onboardingDTag(relayUrl)],
++          ["t", ONBOARDING_TAG],
++        ],
++      });
++      await relayClient.publishEvent(
++        event,
++        "기본 채널을 저장하는 데 시간이 너무 오래 걸립니다.",
++        "기본 채널을 저장하지 못했습니다.",
++      );
++      lastSavedAt.current = createdAt;
++      setStatus(
++        "저장했어요. 새로 들어오는 팀원은 이 채널들에 자동으로 들어가요.",
++      );
++    } catch (error) {
++      setStatus(
++        `저장하지 못했어요: ${error instanceof Error ? error.message : String(error)}`,
++      );
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  return (
++    <fieldset className="flex flex-col gap-3 border-t border-border pt-6">
++      <legend className="text-sm font-semibold">
++        기본 채널 (관리자만 보여요)
++      </legend>
++      <p className="text-sm text-muted-foreground">
++        체크한 공개 채널에 새 팀원(처음 들어온 지 7일 안)이 앱을 처음 켤 때
++        자동으로 들어가요. 이미 있던 팀원은 업데이트 뒤에 새로 만든 채널을
++        체크했을 때만 한 번 들어가고, 스스로 나간 채널에 다시 넣지는 않아요.
++      </p>
++      {!chosen ? (
++        <p className="text-sm text-muted-foreground">불러오는 중…</p>
++      ) : channels.length === 0 ? (
++        <p className="text-sm text-muted-foreground">공개 채널이 없어요.</p>
++      ) : (
++        <ul className="flex max-h-72 flex-col gap-2 overflow-y-auto">
++          {channels.map((channel) => (
++            <li className="flex items-center gap-2" key={channel.id}>
++              <Checkbox
++                checked={chosen.has(channel.id)}
++                id={`team-default-channel-${channel.id}`}
++                onCheckedChange={(checked) => {
++                  const next = new Set(chosen);
++                  if (checked === true) next.add(channel.id);
++                  else next.delete(channel.id);
++                  setChosen(next);
++                }}
++              />
++              <label
++                className="text-sm"
++                htmlFor={`team-default-channel-${channel.id}`}
++              >
++                # {channel.name}
++              </label>
++            </li>
++          ))}
++        </ul>
++      )}
++      <div className="flex items-center gap-3">
++        <Button
++          disabled={!chosen || busy}
++          onClick={() => void save()}
++          type="button"
++        >
++          저장
++        </Button>
++        {status ? (
++          <span className="text-xs text-muted-foreground">{status}</span>
++        ) : null}
++      </div>
++    </fieldset>
++  );
++}
+diff --git a/desktop/src/features/team-welcome/ui/WelcomeGuide.tsx b/desktop/src/features/team-welcome/ui/WelcomeGuide.tsx
+new file mode 100644
+index 000000000..d6844840f
+--- /dev/null
++++ b/desktop/src/features/team-welcome/ui/WelcomeGuide.tsx
+@@ -0,0 +1,101 @@
++import * as React from "react";
++
++import {
++  closeWelcomeGuide,
++  useWelcomeGuideState,
++} from "@/features/team-welcome/lib/useTeamWelcome";
++import { Button } from "@/shared/ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from "@/shared/ui/dialog";
++
++/** What a newcomer needs first, in the words of this team build's screens. */
++const STEPS: readonly { title: string; body: (joined: string) => string }[] = [
++  {
++    title: "팀 Buzz에 오신 걸 환영해요",
++    body: () =>
++      "팀원과 AI 에이전트가 함께 일하는 대화 앱이에요. 다섯 가지만 알면 바로 쓸 수 있어요.",
++  },
++  {
++    title: "채널 = 주제별 대화방",
++    body: (joined) =>
++      (joined ? `기본 채널(${joined})에 자동으로 넣어 드렸어요. ` : "") +
++      "다른 공개 채널은 왼쪽 '채널' 옆 +(채널 둘러보기)에서 찾아 들어가요. 자물쇠 채널은 그 방 멤버가 초대해야 보여요.",
++  },
++  {
++    title: "알림은 채널마다 고를 수 있어요",
++    body: () =>
++      "채널 이름을 오른쪽 클릭 → 알림에서 고르세요. 기본값은 설정 → 알림에 있어요. @everyone 을 쓰면 채널의 사람 모두에게 알림이 가요.",
++  },
++  {
++    title: "왼쪽 위 '캘린더'",
++    body: () =>
++      "팀 모두가 함께 보고 고치는 달력이에요. 촬영·회의 일정을 여기에 올리면 팀원 모두에게 보여요.",
++  },
++  {
++    title: "채널 위쪽 버튼들",
++    body: () =>
++      "플러그 모양 '연결'에 회의용 구글 미트·피그마 링크를 붙여 두면 누구나 한 번에 열어요. 옆의 파일 버튼으로 채널에 올라온 파일을 모아 보고 한꺼번에 받을 수 있어요. 이 안내는 설정 → 팀 안내에서 다시 볼 수 있어요.",
++  },
++];
++
++export function WelcomeGuide() {
++  const state = useWelcomeGuideState();
++  const [step, setStep] = React.useState(0);
++  React.useEffect(() => {
++    if (state.open) setStep(0);
++  }, [state.open]);
++  if (!state.open) return null;
++
++  const page = STEPS[step];
++  if (!page) return null;
++  const last = step === STEPS.length - 1;
++
++  return (
++    <Dialog
++      onOpenChange={(open) => {
++        if (!open) closeWelcomeGuide();
++      }}
++      open
++    >
++      <DialogContent className="max-w-[440px]" data-no-translate="">
++        <DialogHeader>
++          <p className="text-xs text-muted-foreground">
++            {step + 1} / {STEPS.length}
++          </p>
++          <DialogTitle>{page.title}</DialogTitle>
++          <DialogDescription className="leading-relaxed">
++            {page.body(state.joined.join(", "))}
++          </DialogDescription>
++        </DialogHeader>
++        <DialogFooter className="flex items-center justify-between gap-2 sm:justify-between">
++          <Button onClick={closeWelcomeGuide} type="button" variant="ghost">
++            건너뛰기
++          </Button>
++          <div className="flex gap-2">
++            {step > 0 ? (
++              <Button
++                onClick={() => setStep(step - 1)}
++                type="button"
++                variant="outline"
++              >
++                이전
++              </Button>
++            ) : null}
++            <Button
++              onClick={() => (last ? closeWelcomeGuide() : setStep(step + 1))}
++              type="button"
++            >
++              {last ? "시작하기" : "다음"}
++            </Button>
++          </div>
++        </DialogFooter>
++      </DialogContent>
++    </Dialog>
++  );
++}
