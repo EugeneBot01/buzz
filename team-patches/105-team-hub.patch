@@ -1,0 +1,3632 @@
+diff --git a/desktop/playwright.config.ts b/desktop/playwright.config.ts
+index bb26f5588..e7dffcdb1 100644
+--- a/desktop/playwright.config.ts
++++ b/desktop/playwright.config.ts
+@@ -20,6 +20,7 @@ export default defineConfig({
+       name: "smoke",
+       testMatch: [
+         "**/smoke.spec.ts",
++        "**/team12.spec.ts",
+         "**/mock-subscription-readiness.spec.ts",
+         "**/owned-agent-discovery.spec.ts",
+         "**/thread-head-stale-edit.spec.ts",
+diff --git a/desktop/playwright.team12.config.ts b/desktop/playwright.team12.config.ts
+new file mode 100644
+index 000000000..87bfb7896
+--- /dev/null
++++ b/desktop/playwright.team12.config.ts
+@@ -0,0 +1,22 @@
++import { defineConfig } from "@playwright/test";
++import base from "./playwright.config";
++
++/** Isolated port and DOM assertions; no screenshots or external relay writes. */
++export default defineConfig({
++  ...base,
++  retries: 0,
++  projects: [{ name: "smoke", testMatch: "**/team12.spec.ts" }],
++  use: {
++    ...base.use,
++    baseURL: "http://127.0.0.1:4182",
++    screenshot: "off",
++    trace: "off",
++    video: "off",
++  },
++  webServer: {
++    command: "python3 -m http.server 4182 -d dist",
++    cwd: ".",
++    reuseExistingServer: false,
++    url: "http://127.0.0.1:4182",
++  },
++});
+diff --git a/desktop/src/app/AppShell.helpers.ts b/desktop/src/app/AppShell.helpers.ts
+index 9fc14736c..009c32418 100644
+--- a/desktop/src/app/AppShell.helpers.ts
++++ b/desktop/src/app/AppShell.helpers.ts
+@@ -9,7 +9,8 @@ export type AppView =
+   | "agents"
+   | "workflows"
+   | "pulse"
+-  | "projects";
++  | "projects"
++  | "schedule";
+ 
+ const WINDOW_DRAG_HANDLE_HEIGHT = 44;
+ const TAURI_DRAG_REGION_ATTR = "data-tauri-drag-region";
+@@ -233,6 +234,9 @@ export function deriveShellRoute(pathname: string): {
+     };
+   }
+ 
++  if (pathname === "/schedule")
++    return { selectedChannelId: null, selectedView: "schedule" };
++
+   if (pathname === "/agents") {
+     return {
+       selectedChannelId: null,
+diff --git a/desktop/src/app/navigation/useAppNavigation.ts b/desktop/src/app/navigation/useAppNavigation.ts
+index ade8c9332..ea8f16bf2 100644
+--- a/desktop/src/app/navigation/useAppNavigation.ts
++++ b/desktop/src/app/navigation/useAppNavigation.ts
+@@ -82,6 +82,11 @@ export function useAppNavigation() {
+     [commitNavigation],
+   );
+ 
++  const goSchedule = React.useCallback(
++    () => commitNavigation({ to: "/schedule" }),
++    [commitNavigation],
++  );
++
+   const goAgents = React.useCallback(
+     (behavior?: NavigationBehavior) =>
+       commitNavigation(
+@@ -459,6 +464,7 @@ export function useAppNavigation() {
+     closeSettings,
+     closeWorkflowDetail,
+     goAgents,
++    goSchedule,
+     goChannel,
+     goDuplicateWorkflow,
+     goEditWorkflow,
+diff --git a/desktop/src/app/routeTree.gen.ts b/desktop/src/app/routeTree.gen.ts
+index 2bc2c8ddb..1ad439fbb 100644
+--- a/desktop/src/app/routeTree.gen.ts
++++ b/desktop/src/app/routeTree.gen.ts
+@@ -7,6 +7,7 @@
+ import { Route as rootRouteImport } from "./routes/root";
+ import { Route as workflowsRouteImport } from "./routes/workflows";
+ import { Route as settingsRouteImport } from "./routes/settings";
++import { Route as scheduleRouteImport } from "./routes/schedule";
+ import { Route as remindersRouteImport } from "./routes/reminders";
+ import { Route as pulseRouteImport } from "./routes/pulse";
+ import { Route as projectsRouteImport } from "./routes/projects";
+@@ -28,6 +29,11 @@ const settingsRoute = settingsRouteImport.update({
+   path: "/settings",
+   getParentRoute: () => rootRouteImport,
+ } as any);
++const scheduleRoute = scheduleRouteImport.update({
++  id: "/schedule",
++  path: "/schedule",
++  getParentRoute: () => rootRouteImport,
++} as any);
+ const remindersRoute = remindersRouteImport.update({
+   id: "/reminders",
+   path: "/reminders",
+@@ -86,6 +92,7 @@ export interface FileRoutesByFullPath {
+   "/projects": typeof projectsRoute;
+   "/pulse": typeof pulseRoute;
+   "/reminders": typeof remindersRoute;
++  "/schedule": typeof scheduleRoute;
+   "/settings": typeof settingsRoute;
+   "/workflows": typeof workflowsRoute;
+   "/channels/$channelId": typeof channelsDotchannelIdRoute;
+@@ -100,6 +107,7 @@ export interface FileRoutesByTo {
+   "/projects": typeof projectsRoute;
+   "/pulse": typeof pulseRoute;
+   "/reminders": typeof remindersRoute;
++  "/schedule": typeof scheduleRoute;
+   "/settings": typeof settingsRoute;
+   "/workflows": typeof workflowsRoute;
+   "/channels/$channelId": typeof channelsDotchannelIdRoute;
+@@ -115,6 +123,7 @@ export interface FileRoutesById {
+   "/projects": typeof projectsRoute;
+   "/pulse": typeof pulseRoute;
+   "/reminders": typeof remindersRoute;
++  "/schedule": typeof scheduleRoute;
+   "/settings": typeof settingsRoute;
+   "/workflows": typeof workflowsRoute;
+   "/channels/$channelId": typeof channelsDotchannelIdRoute;
+@@ -131,6 +140,7 @@ export interface FileRouteTypes {
+     | "/projects"
+     | "/pulse"
+     | "/reminders"
++    | "/schedule"
+     | "/settings"
+     | "/workflows"
+     | "/channels/$channelId"
+@@ -145,6 +155,7 @@ export interface FileRouteTypes {
+     | "/projects"
+     | "/pulse"
+     | "/reminders"
++    | "/schedule"
+     | "/settings"
+     | "/workflows"
+     | "/channels/$channelId"
+@@ -159,6 +170,7 @@ export interface FileRouteTypes {
+     | "/projects"
+     | "/pulse"
+     | "/reminders"
++    | "/schedule"
+     | "/settings"
+     | "/workflows"
+     | "/channels/$channelId"
+@@ -174,6 +186,7 @@ export interface RootRouteChildren {
+   projectsRoute: typeof projectsRoute;
+   pulseRoute: typeof pulseRoute;
+   remindersRoute: typeof remindersRoute;
++  scheduleRoute: typeof scheduleRoute;
+   settingsRoute: typeof settingsRoute;
+   workflowsRoute: typeof workflowsRoute;
+   channelsDotchannelIdRoute: typeof channelsDotchannelIdRoute;
+@@ -199,6 +212,13 @@ declare module "@tanstack/react-router" {
+       preLoaderRoute: typeof settingsRouteImport;
+       parentRoute: typeof rootRouteImport;
+     };
++    "/schedule": {
++      id: "/schedule";
++      path: "/schedule";
++      fullPath: "/schedule";
++      preLoaderRoute: typeof scheduleRouteImport;
++      parentRoute: typeof rootRouteImport;
++    };
+     "/reminders": {
+       id: "/reminders";
+       path: "/reminders";
+@@ -278,6 +298,7 @@ const rootRouteChildren: RootRouteChildren = {
+   projectsRoute: projectsRoute,
+   pulseRoute: pulseRoute,
+   remindersRoute: remindersRoute,
++  scheduleRoute: scheduleRoute,
+   settingsRoute: settingsRoute,
+   workflowsRoute: workflowsRoute,
+   channelsDotchannelIdRoute: channelsDotchannelIdRoute,
+diff --git a/desktop/src/app/routes.ts b/desktop/src/app/routes.ts
+index f5c6938e1..ee2f2c067 100644
+--- a/desktop/src/app/routes.ts
++++ b/desktop/src/app/routes.ts
+@@ -2,6 +2,7 @@ import { index, rootRoute, route } from "@tanstack/virtual-file-routes";
+ 
+ export const routes = rootRoute("root.tsx", [
+   index("index.tsx"),
++  route("/schedule", "schedule.tsx"),
+   route("/agents", "agents.tsx"),
+   route("/pulse", "pulse.tsx"),
+   route("/reminders", "reminders.tsx"),
+diff --git a/desktop/src/app/routes/schedule.tsx b/desktop/src/app/routes/schedule.tsx
+new file mode 100644
+index 000000000..6f0710215
+--- /dev/null
++++ b/desktop/src/app/routes/schedule.tsx
+@@ -0,0 +1,6 @@
++import { createFileRoute } from "@tanstack/react-router";
++import { TeamScheduleScreen } from "@/features/team-schedule/ui/TeamScheduleScreen";
++
++export const Route = createFileRoute("/schedule")({
++  component: TeamScheduleScreen,
++});
+diff --git a/desktop/src/features/settings/ui/SettingsView.tsx b/desktop/src/features/settings/ui/SettingsView.tsx
+index e34308421..a1826f63d 100644
+--- a/desktop/src/features/settings/ui/SettingsView.tsx
++++ b/desktop/src/features/settings/ui/SettingsView.tsx
+@@ -51,33 +51,33 @@ type SettingsViewProps = SettingsPanelProps & {
+ export const settingsNavGroups: Array<{
+   label: string;
+   sections: SettingsSection[];
++  hint?: string;
+ }> = [
++  { label: "대화", sections: ["voice", "custom-emoji", "channel-templates"] },
+   {
+-    label: "Personal",
+-    sections: [
+-      "profile",
+-      "appearance",
+-      "notifications",
+-      "voice",
+-      "shortcuts",
+-      "custom-emoji",
+-      "local-archive",
+-      "channel-templates",
+-    ],
++    label: "일정",
++    sections: [],
++    hint: "캘린더의 주간 공지·구글 캘린더에서 설정하세요.",
+   },
++  { label: "파일", sections: ["local-archive"] },
++  { label: "바로가기", sections: ["shortcuts"] },
+   {
+-    label: "Communities",
++    label: "설정",
+     sections: [
++      "notifications",
++      "appearance",
++      "team-welcome",
++      "profile",
++      "agents",
++      "compute",
+       "hosted-communities",
+       "community-members",
+       "relay-admin",
+-      "team-welcome",
++      "experimental",
++      "mobile",
++      "updates",
+     ],
+   },
+-  {
+-    label: "App",
+-    sections: ["agents", "compute", "experimental", "mobile", "updates"],
+-  },
+ ];
+ 
+ function SettingsSectionButton({
+@@ -216,7 +216,7 @@ export function SettingsView({
+               (entry): entry is SettingsSectionDescriptor => entry != null,
+             ),
+         }))
+-        .filter((group) => group.sections.length > 0),
++        .filter((group) => group.sections.length > 0 || group.hint),
+     [visibleSectionByValue],
+   );
+ 
+@@ -299,6 +299,11 @@ export function SettingsView({
+             <SidebarGroup key={group.label}>
+               <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
+               <SidebarGroupContent>
++                {group.hint ? (
++                  <p className="px-2 py-1 text-xs text-muted-foreground">
++                    {group.hint}
++                  </p>
++                ) : null}
+                 <SidebarMenu aria-label={`${group.label} settings sections`}>
+                   {group.sections.map((entry) => (
+                     <SettingsSectionButton
+diff --git a/desktop/src/features/settings/ui/settingsNavGroups.test.mjs b/desktop/src/features/settings/ui/settingsNavGroups.test.mjs
+index f7c5c2eca..80c9da64d 100644
+--- a/desktop/src/features/settings/ui/settingsNavGroups.test.mjs
++++ b/desktop/src/features/settings/ui/settingsNavGroups.test.mjs
+@@ -1,30 +1,22 @@
+ import assert from "node:assert/strict";
+ import test from "node:test";
+ 
++import { settingsSections } from "./SettingsPanels.tsx";
++import { TEAM_FEATURE_CATEGORIES } from "@/features/team-hub/lib/featureGroups";
+ import { settingsNavGroups } from "./SettingsView.tsx";
+ 
+-test("relay-admin is wired into the Communities nav group", () => {
+-  const communitiesGroup = settingsNavGroups.find(
+-    (g) => g.label === "Communities",
+-  );
+-  assert.ok(
+-    communitiesGroup,
+-    "Communities group must exist in settingsNavGroups",
+-  );
++test("relay-admin is wired into the 설정 nav group", () => {
++  const communitiesGroup = settingsNavGroups.find((g) => g.label === "설정");
++  assert.ok(communitiesGroup, "설정 group must exist in settingsNavGroups");
+   assert.ok(
+     communitiesGroup.sections.includes("relay-admin"),
+-    `expected "relay-admin" in Communities group sections, got: ${JSON.stringify(communitiesGroup.sections)}`,
++    `expected "relay-admin" in 설정 group sections, got: ${JSON.stringify(communitiesGroup.sections)}`,
+   );
+ });
+ 
+-test("relay-admin follows community-members in the Communities nav group", () => {
+-  const communitiesGroup = settingsNavGroups.find(
+-    (g) => g.label === "Communities",
+-  );
+-  assert.ok(
+-    communitiesGroup,
+-    "Communities group must exist in settingsNavGroups",
+-  );
++test("relay-admin follows community-members in the 설정 nav group", () => {
++  const communitiesGroup = settingsNavGroups.find((g) => g.label === "설정");
++  assert.ok(communitiesGroup, "설정 group must exist in settingsNavGroups");
+   const membersIndex = communitiesGroup.sections.indexOf("community-members");
+   const relayAdminIndex = communitiesGroup.sections.indexOf("relay-admin");
+   assert.ok(membersIndex !== -1, "community-members must be present");
+@@ -42,3 +34,16 @@ test("the removed admin-console id is not wired into any nav group", () => {
+     );
+   }
+ });
++
++test("team category order keeps every existing settings section exactly once", () => {
++  assert.deepEqual(
++    settingsNavGroups.map(({ label }) => label),
++    TEAM_FEATURE_CATEGORIES,
++  );
++  const values = settingsNavGroups.flatMap(({ sections }) => sections);
++  assert.equal(values.length, new Set(values).size);
++  assert.deepEqual(
++    [...values].sort(),
++    settingsSections.map(({ value }) => value).sort(),
++  );
++});
+diff --git a/desktop/src/features/settings/ui/settingsNavModeration.jsdom-test.mjs b/desktop/src/features/settings/ui/settingsNavModeration.jsdom-test.mjs
+index 2761354d2..49640d029 100644
+--- a/desktop/src/features/settings/ui/settingsNavModeration.jsdom-test.mjs
++++ b/desktop/src/features/settings/ui/settingsNavModeration.jsdom-test.mjs
+@@ -278,11 +278,11 @@ test("no-probe-before-save: admin_probe not called while rendering nav with no s
+   }
+ });
+ 
+-test("settings-nav-groups-contains-relay-admin: relay-admin is wired into Communities nav group", () => {
+-  const communities = settingsNavGroups.find((g) => g.label === "Communities");
+-  assert.ok(communities, "Communities group must exist");
++test("settings-nav-groups-contains-relay-admin: relay-admin is wired into 설정 nav group", () => {
++  const communities = settingsNavGroups.find((g) => g.label === "설정");
++  assert.ok(communities, "설정 group must exist");
+   assert.ok(
+     communities.sections.includes("relay-admin"),
+-    `relay-admin must be in Communities; got: ${JSON.stringify(communities.sections)}`,
++    `relay-admin must be in 설정; got: ${JSON.stringify(communities.sections)}`,
+   );
+ });
+diff --git a/desktop/src/features/sidebar/ui/AppSidebar.tsx b/desktop/src/features/sidebar/ui/AppSidebar.tsx
+index a434db37f..17a29a73a 100644
+--- a/desktop/src/features/sidebar/ui/AppSidebar.tsx
++++ b/desktop/src/features/sidebar/ui/AppSidebar.tsx
+@@ -1,3 +1,5 @@
++import { TeamFeatureHubSidebarEntry } from "@/features/team-hub/ui/TeamFeatureHubSidebarEntry";
++import type { TeamCalendarNavigation } from "@/features/team-calendar/lib/calendarNavigation";
+ // biome-ignore format: keep compact to stay within file size limit
+ import * as React from "react";
+ import { FeatureGate } from "@/shared/features";
+@@ -154,6 +156,7 @@ export function AppSidebar({
+   onStarChannel,
+   onUnstarChannel,
+ }: AppSidebarProps) {
++  const teamCalendarRef = React.useRef<TeamCalendarNavigation | null>(null);
+   const activeWorkingByChannelId = useActiveWorkingChannelsById();
+   const { status: updateStatus } = useUpdaterContext();
+   const canShowSidebarUpdateCard = shouldShowSidebarUpdateCard(updateStatus);
+@@ -617,8 +620,25 @@ export function AppSidebar({
+               data-testid="sidebar-scroll-content"
+             >
+               <AppSidebarPrimaryMenu
++                leadingItems={
++                  <TeamFeatureHubSidebarEntry
++                    key={`${activeCommunity?.id}|${currentPubkey}|${selectedView === "channel" ? selectedChannelId : ""}`}
++                    channel={
++                      selectedView === "channel"
++                        ? channels.find(
++                            (channel) => channel.id === selectedChannelId,
++                          )
++                        : undefined
++                    }
++                    pubkey={currentPubkey}
++                    relayUrl={activeCommunity?.relayUrl}
++                    calendar={teamCalendarRef}
++                    onSettings={onSelectSettings}
++                  />
++                }
+                 extraItems={
+                   <TeamCalendarSidebarEntry
++                    ref={teamCalendarRef}
+                     pubkey={currentPubkey}
+                     relayUrl={activeCommunity?.relayUrl}
+                   />
+diff --git a/desktop/src/features/sidebar/ui/AppSidebar.types.ts b/desktop/src/features/sidebar/ui/AppSidebar.types.ts
+index 029bafe63..a75a637b9 100644
+--- a/desktop/src/features/sidebar/ui/AppSidebar.types.ts
++++ b/desktop/src/features/sidebar/ui/AppSidebar.types.ts
+@@ -45,7 +45,8 @@ export type AppSidebarProps = {
+     | "agents"
+     | "workflows"
+     | "pulse"
+-    | "projects";
++    | "projects"
++    | "schedule";
+   unreadChannelCounts: ReadonlyMap<string, number>;
+   unreadChannelIds: ReadonlySet<string>;
+   highPriorityUnreadChannelIds: ReadonlySet<string>;
+diff --git a/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx b/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
+index 460570469..93d7ac422 100644
+--- a/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
++++ b/desktop/src/features/sidebar/ui/AppSidebarPinnedHeader.tsx
+@@ -22,7 +22,8 @@ type SidebarSelectedView =
+   | "agents"
+   | "workflows"
+   | "pulse"
+-  | "projects";
++  | "projects"
++  | "schedule";
+ 
+ type AppSidebarPinnedHeaderProps = {
+   channelLabels: Record<string, string>;
+@@ -43,6 +44,7 @@ type AppSidebarPinnedHeaderProps = {
+ type AppSidebarPrimaryMenuProps = {
+   /** Extra menu items appended after the built-in ones (team patches). */
+   extraItems?: React.ReactNode;
++  leadingItems?: React.ReactNode;
+   homeBadgeCount: number;
+   onSelectAgents: () => void;
+   onSelectHome: () => void;
+@@ -94,6 +96,7 @@ export function AppSidebarPinnedHeader({
+ 
+ export function AppSidebarPrimaryMenu({
+   extraItems,
++  leadingItems,
+   homeBadgeCount,
+   onSelectAgents,
+   onSelectHome,
+@@ -111,6 +114,7 @@ export function AppSidebarPrimaryMenu({
+         data-testid="sidebar-primary-menu"
+       >
+         <SidebarMenu className="sidebar-primary-menu pb-2">
++          {leadingItems}
+           <SidebarMenuItem>
+             <SidebarMenuButton
+               className="data-[active=true]:font-normal"
+diff --git a/desktop/src/features/team-calendar/lib/calendarNavigation.ts b/desktop/src/features/team-calendar/lib/calendarNavigation.ts
+new file mode 100644
+index 000000000..3501ca16e
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/calendarNavigation.ts
+@@ -0,0 +1,8 @@
++/** Existing calendar panels, also used by the team's feature hub. */
++export type CalendarPanel = "calendar" | "polls" | "digest" | "google";
++
++/** Imperative navigation to the mounted sidebar's existing calendar dialogs. */
++export type TeamCalendarNavigation = {
++  openCalendar: (panel?: CalendarPanel) => void;
++  openSchedule: () => void;
++};
+diff --git a/desktop/src/features/team-calendar/lib/useTeamCalendar.ts b/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
+index 15c0ad9bc..4f235e9f7 100644
+--- a/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
++++ b/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
+@@ -280,10 +280,12 @@ export function useTeamCalendarMonth(
+       }));
+     };
+ 
+-    const load = () =>
++    let loadGeneration = 0;
++    const load = () => {
++      const generation = ++loadGeneration;
+       void fetchMonth(relayUrl, month, pubkey).then(
+         (result) => {
+-          if (live.cancelled) return;
++          if (live.cancelled || generation !== loadGeneration) return;
+           // Keep the newest own event seen so the next publish replaces it.
+           if (result.ownCreatedAt >= live.ownCreatedAt) {
+             live.ownCreatedAt = result.ownCreatedAt;
+@@ -292,14 +294,15 @@ export function useTeamCalendarMonth(
+           apply(mergeMonths(live.entries, result.merged), "ready");
+         },
+         () => {
+-          if (live.cancelled) return;
++          if (live.cancelled || generation !== loadGeneration) return;
+           setState((previous) =>
+-            previous.scope === scope && previous.status === "loading"
++            previous.scope === scope
+               ? { ...previous, status: "error" }
+               : previous,
+           );
+         },
+       );
++    };
+ 
+     const ingest = (event: RelayEvent) => {
+       if (live.cancelled) return;
+diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+index 167c57188..20cd60728 100644
+--- a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
++++ b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+@@ -1,3 +1,4 @@
++import type { CalendarPanel } from "../lib/calendarNavigation";
+ import {
+   CalendarDays,
+   ClipboardPaste,
+@@ -97,6 +98,8 @@ type TeamCalendarDialogProps = {
+   pubkey: string;
+   relayUrl: string;
+   embedded?: boolean;
++  initialPanel?: CalendarPanel;
++  ref?: React.Ref<{ refresh: () => void }>;
+ };
+ 
+ /**
+@@ -111,9 +114,13 @@ export function TeamCalendarDialog({
+   pubkey,
+   relayUrl,
+   embedded = false,
++  ref,
++  initialPanel = "calendar",
+ }: TeamCalendarDialogProps) {
+   const today = todayKey();
+-  const [tab, setTab] = React.useState<Tab>("board");
++  const [tab, setTab] = React.useState<Tab>(
++    initialPanel === "calendar" ? "board" : initialPanel,
++  );
+   const [view, setViewState] = React.useState<View>(readView);
+   const [panel, setPanel] = React.useState<Panel>(null);
+   const [selectedDate, setSelectedDate] = React.useState(today);
+@@ -159,6 +166,13 @@ export function TeamCalendarDialog({
+     [plan, month],
+   );
+   const calendar = useTeamCalendarMonths(pubkey, relayUrl, wantedMonths);
++  React.useImperativeHandle(ref, () => ({
++    refresh: () => {
++      calendar.refresh();
++      sprint.refresh();
++      availability.refresh();
++    },
++  }));
+   const entries = React.useMemo(
+     () =>
+       mineOnly
+@@ -348,7 +362,9 @@ export function TeamCalendarDialog({
+ 
+   const content = (
+     <>
+-      {embedded ? <h3 className="text-sm font-semibold">팀 캘린더</h3> : (
++      {embedded ? (
++        <h3 className="text-sm font-semibold">팀 캘린더</h3>
++      ) : (
+         <DialogHeader>
+           <DialogTitle>팀 캘린더</DialogTitle>
+           <DialogDescription>
+@@ -359,349 +375,354 @@ export function TeamCalendarDialog({
+         </DialogHeader>
+       )}
+ 
+-        <div className="flex flex-wrap items-center gap-2">
+-          <div
+-            aria-label="보기 방식"
+-            className="flex rounded-lg bg-muted p-0.5"
+-            role="tablist"
+-          >
+-            {(
+-              [
+-                ["sprint", "스프린트", KanbanSquare],
+-                ["calendar", "달력", CalendarDays],
+-              ] as const
+-            ).map(([value, label, Icon]) => {
+-              const active = tab === "board" && view === value;
+-              return (
+-                <button
+-                  aria-selected={active}
+-                  className={cn(
+-                    "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
+-                    active &&
+-                      "bg-background font-semibold text-foreground shadow-sm",
+-                  )}
+-                  data-testid={`team-calendar-view-${value}`}
+-                  key={value}
+-                  onClick={() => {
+-                    setTab("board");
+-                    setView(value);
+-                    setPanel((current) =>
+-                      current === "plan" ? null : current,
+-                    );
+-                  }}
+-                  role="tab"
+-                  type="button"
+-                >
+-                  <Icon className="h-4 w-4" />
+-                  {label}
+-                </button>
+-              );
+-            })}
+-          </div>
+-          <div className="flex flex-wrap items-center gap-1" role="tablist">
+-            {(
+-              [
+-                ["people", "팀원 일정"],
+-                ["polls", "모임 날짜 투표"],
+-                ["digest", "주간 공지"],
+-                ["google", "구글 캘린더"],
+-              ] as const
+-            ).map(([value, label]) => (
+-              <Button
+-                aria-selected={tab === value}
+-                data-testid={`team-calendar-tab-${value}`}
++      <div className="flex flex-wrap items-center gap-2">
++        <div
++          aria-label="보기 방식"
++          className="flex rounded-lg bg-muted p-0.5"
++          role="tablist"
++        >
++          {(
++            [
++              ["sprint", "스프린트", KanbanSquare],
++              ["calendar", "달력", CalendarDays],
++            ] as const
++          ).map(([value, label, Icon]) => {
++            const active = tab === "board" && view === value;
++            return (
++              <button
++                aria-selected={active}
++                className={cn(
++                  "flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
++                  active &&
++                    "bg-background font-semibold text-foreground shadow-sm",
++                )}
++                data-testid={`team-calendar-view-${value}`}
+                 key={value}
+                 onClick={() => {
+-                  setTab(value);
+-                  setPanel(null);
++                  setTab("board");
++                  setView(value);
++                  setPanel((current) => (current === "plan" ? null : current));
+                 }}
+                 role="tab"
+-                size="sm"
+                 type="button"
+-                variant={tab === value ? "secondary" : "ghost"}
+               >
++                <Icon className="h-4 w-4" />
+                 {label}
+-              </Button>
+-            ))}
+-          </div>
+-          <div className="ml-auto flex items-center gap-1">
++              </button>
++            );
++          })}
++        </div>
++        <div className="flex flex-wrap items-center gap-1" role="tablist">
++          {(
++            [
++              ["people", "팀원 일정"],
++              ["polls", "모임 날짜 투표"],
++              ["digest", "주간 공지"],
++              ["google", "구글 캘린더"],
++            ] as const
++          ).map(([value, label]) => (
+             <Button
+-              data-testid="team-calendar-import"
+-              onClick={() => setPanel(panel === "import" ? null : "import")}
++              aria-selected={tab === value}
++              data-testid={`team-calendar-tab-${value}`}
++              key={value}
++              onClick={() => {
++                setTab(value);
++                setPanel(null);
++              }}
++              role="tab"
+               size="sm"
+               type="button"
+-              variant={panel === "import" ? "secondary" : "outline"}
++              variant={tab === value ? "secondary" : "ghost"}
+             >
+-              <Upload className="h-4 w-4" />
+-              가져오기
++              {label}
+             </Button>
++          ))}
++        </div>
++        <div className="ml-auto flex items-center gap-1">
++          <Button
++            data-testid="team-calendar-import"
++            onClick={() => setPanel(panel === "import" ? null : "import")}
++            size="sm"
++            type="button"
++            variant={panel === "import" ? "secondary" : "outline"}
++          >
++            <Upload className="h-4 w-4" />
++            가져오기
++          </Button>
++          <Button
++            data-testid="team-calendar-export"
++            onClick={() => setPanel(panel === "export" ? null : "export")}
++            size="sm"
++            type="button"
++            variant={panel === "export" ? "secondary" : "default"}
++          >
++            <Download className="h-4 w-4" />
++            배포
++          </Button>
++        </div>
++      </div>
++
++      {panel ? (
++        <section
++          aria-label={panelTitle}
++          className="rounded-xl border border-border/70 p-4"
++        >
++          <div className="mb-3 flex items-center justify-between">
++            <h3 className="text-sm font-semibold">{panelTitle}</h3>
+             <Button
+-              data-testid="team-calendar-export"
+-              onClick={() => setPanel(panel === "export" ? null : "export")}
+-              size="sm"
++              aria-label="닫기"
++              onClick={() => setPanel(null)}
++              size="icon-xs"
+               type="button"
+-              variant={panel === "export" ? "secondary" : "default"}
++              variant="ghost"
+             >
+-              <Download className="h-4 w-4" />
+-              배포
++              <X />
+             </Button>
+           </div>
+-        </div>
+-
+-        {panel ? (
+-          <section
+-            aria-label={panelTitle}
+-            className="rounded-xl border border-border/70 p-4"
+-          >
+-            <div className="mb-3 flex items-center justify-between">
+-              <h3 className="text-sm font-semibold">{panelTitle}</h3>
+-              <Button
+-                aria-label="닫기"
+-                onClick={() => setPanel(null)}
+-                size="icon-xs"
+-                type="button"
+-                variant="ghost"
+-              >
+-                <X />
+-              </Button>
+-            </div>
+-            {panel === "export" ? (
+-              <ExportPanel
+-                initialView={view}
+-                month={month}
+-                onClose={() => setPanel(null)}
+-                people={people}
+-                plan={plan}
+-                pubkey={pubkey}
+-                relayUrl={relayUrl}
+-                today={today}
+-              />
+-            ) : panel === "import" ? (
+-              <ImportPanel
+-                hasPlan={sprint.plan !== null}
+-                onClose={() => setPanel(null)}
+-                onSavePeople={availability.savePeople}
+-                onImported={() => {
+-                  // Wait a moment so months opened for a new plan read too.
+-                  window.setTimeout(() => {
+-                    calendar.refresh();
+-                    sprint.refresh();
+-                    availability.refresh();
+-                  }, 300);
+-                }}
+-                onSavePlan={sprint.savePlan}
+-                pubkey={pubkey}
+-                relayUrl={relayUrl}
+-              />
+-            ) : (
+-              <SprintPlanForm
+-                initial={plan}
+-                onCancel={() => setPanel(null)}
+-                onSubmit={(next) =>
+-                  void run(
+-                    () => sprint.savePlan(next),
+-                    "설정을 저장하지 못했습니다.",
+-                  ).then((ok) => {
+-                    if (ok) setPanel(null);
+-                  })
+-                }
+-                saving={saving}
+-              />
+-            )}
+-          </section>
+-        ) : null}
++          {panel === "export" ? (
++            <ExportPanel
++              initialView={view}
++              month={month}
++              onClose={() => setPanel(null)}
++              people={people}
++              plan={plan}
++              pubkey={pubkey}
++              relayUrl={relayUrl}
++              today={today}
++            />
++          ) : panel === "import" ? (
++            <ImportPanel
++              hasPlan={sprint.plan !== null}
++              onClose={() => setPanel(null)}
++              onSavePeople={availability.savePeople}
++              onImported={() => {
++                // Wait a moment so months opened for a new plan read too.
++                window.setTimeout(() => {
++                  calendar.refresh();
++                  sprint.refresh();
++                  availability.refresh();
++                }, 300);
++              }}
++              onSavePlan={sprint.savePlan}
++              pubkey={pubkey}
++              relayUrl={relayUrl}
++            />
++          ) : (
++            <SprintPlanForm
++              initial={plan}
++              onCancel={() => setPanel(null)}
++              onSubmit={(next) =>
++                void run(
++                  () => sprint.savePlan(next),
++                  "설정을 저장하지 못했습니다.",
++                ).then((ok) => {
++                  if (ok) setPanel(null);
++                })
++              }
++              saving={saving}
++            />
++          )}
++        </section>
++      ) : null}
+ 
+-        {tab === "google" ? (
+-          <GoogleSyncSection pubkey={pubkey} relayUrl={relayUrl} />
+-        ) : tab === "digest" ? (
+-          <DigestPanel pubkey={pubkey} relayUrl={relayUrl} />
+-        ) : tab === "polls" ? (
+-          <PollsPanel
+-            members={members}
+-            nameOf={nameOf}
+-            onPick={pickFromPoll}
+-            pubkey={pubkey}
+-            relayUrl={relayUrl}
+-          />
+-        ) : tab === "people" ? (
+-          <AvailabilityPanel
+-            members={members}
+-            nameOf={nameOf}
+-            onDelete={availability.deletePerson}
+-            onSave={(person) => availability.savePeople([person])}
+-            people={people}
+-            pubkey={pubkey}
+-            status={availability.status}
+-            today={today}
+-          />
+-        ) : view === "sprint" ? (
+-          <div className="flex flex-col gap-4 lg:flex-row">
+-            <div className="min-w-0 flex-1">
+-              <SprintBoard
+-                editingId={draft?.id}
+-                entries={entries}
+-                isDefaultPlan={
+-                  sprint.plan === null && sprint.status !== "loading"
+-                }
+-                onAdd={addInSprint}
+-                onEdit={editEntry}
+-                onEditPlan={() => setPanel("plan")}
+-                onSelectWeek={(week) => selectDate(week.start)}
+-                plan={plan}
+-                selectedDate={selectedDate}
+-                status={calendar.status}
+-                today={today}
+-              />
+-            </div>
+-            {draft || unsaved ? (
+-              <aside
+-                aria-label="일정 편집"
+-                className="flex w-full shrink-0 flex-col gap-3 lg:w-80"
+-              >
+-                {draft ? (
+-                  <h3
+-                    className="text-sm font-semibold"
+-                    data-testid="sprint-editor-title"
+-                  >
+-                    {draft.id ? "일정 수정" : "일정 추가"}
+-                    {draft.dept
+-                      ? ` · ${deptLabel(draft.dept) ?? draft.dept}`
+-                      : ""}
+-                    {selectedWeek >= 0 ? ` · ${weekId(selectedWeek)}` : ""}
+-                  </h3>
+-                ) : null}
+-                {unsavedBanner}
+-                {entryForm}
+-                {draft?.id && editing?.id === draft.id ? (
+-                  <div className="flex flex-wrap justify-end gap-1 border-t border-border/60 pt-2">
+-                    {confirmDelete ? (
+-                      <>
+-                        {editing.repeat ? (
+-                          <Button
+-                            disabled={saving}
+-                            onClick={() => {
+-                              skipOccurrence(editing);
+-                              setDraft(null);
+-                            }}
+-                            size="xs"
+-                            type="button"
+-                            variant="outline"
+-                          >
+-                            이 날만 삭제
+-                          </Button>
+-                        ) : null}
++      {tab === "google" ? (
++        <GoogleSyncSection pubkey={pubkey} relayUrl={relayUrl} />
++      ) : tab === "digest" ? (
++        <DigestPanel pubkey={pubkey} relayUrl={relayUrl} />
++      ) : tab === "polls" ? (
++        <PollsPanel
++          members={members}
++          nameOf={nameOf}
++          onPick={pickFromPoll}
++          pubkey={pubkey}
++          relayUrl={relayUrl}
++        />
++      ) : tab === "people" ? (
++        <AvailabilityPanel
++          members={members}
++          nameOf={nameOf}
++          onDelete={availability.deletePerson}
++          onSave={(person) => availability.savePeople([person])}
++          people={people}
++          pubkey={pubkey}
++          status={availability.status}
++          today={today}
++        />
++      ) : view === "sprint" ? (
++        <div className="flex flex-col gap-4 lg:flex-row">
++          <div className="min-w-0 flex-1">
++            <SprintBoard
++              editingId={draft?.id}
++              entries={entries}
++              isDefaultPlan={
++                sprint.plan === null && sprint.status !== "loading"
++              }
++              onAdd={addInSprint}
++              onEdit={editEntry}
++              onEditPlan={() => setPanel("plan")}
++              onSelectWeek={(week) => selectDate(week.start)}
++              plan={plan}
++              selectedDate={selectedDate}
++              status={calendar.status}
++              today={today}
++            />
++          </div>
++          {draft || unsaved ? (
++            <aside
++              aria-label="일정 편집"
++              className="flex w-full shrink-0 flex-col gap-3 lg:w-80"
++            >
++              {draft ? (
++                <h3
++                  className="text-sm font-semibold"
++                  data-testid="sprint-editor-title"
++                >
++                  {draft.id ? "일정 수정" : "일정 추가"}
++                  {draft.dept
++                    ? ` · ${deptLabel(draft.dept) ?? draft.dept}`
++                    : ""}
++                  {selectedWeek >= 0 ? ` · ${weekId(selectedWeek)}` : ""}
++                </h3>
++              ) : null}
++              {unsavedBanner}
++              {entryForm}
++              {draft?.id && editing?.id === draft.id ? (
++                <div className="flex flex-wrap justify-end gap-1 border-t border-border/60 pt-2">
++                  {confirmDelete ? (
++                    <>
++                      {editing.repeat ? (
+                         <Button
+-                          data-testid="sprint-delete-confirm"
+                           disabled={saving}
+-                          onClick={() => removeEntry(editing)}
++                          onClick={() => {
++                            skipOccurrence(editing);
++                            setDraft(null);
++                          }}
+                           size="xs"
+                           type="button"
+-                          variant="destructive"
++                          variant="outline"
+                         >
+-                          {editing.repeat ? "반복 전체 삭제" : "삭제 확인"}
++                          이 날만 삭제
+                         </Button>
+-                      </>
+-                    ) : (
++                      ) : null}
+                       <Button
+-                        data-testid="sprint-delete"
++                        data-testid="sprint-delete-confirm"
+                         disabled={saving}
+-                        onClick={() => setConfirmDelete(true)}
++                        onClick={() => removeEntry(editing)}
+                         size="xs"
+                         type="button"
+-                        variant="ghost"
++                        variant="destructive"
+                       >
+-                        이 일정 삭제
++                        {editing.repeat ? "반복 전체 삭제" : "삭제 확인"}
+                       </Button>
+-                    )}
+-                  </div>
++                    </>
++                  ) : (
++                    <Button
++                      data-testid="sprint-delete"
++                      disabled={saving}
++                      onClick={() => setConfirmDelete(true)}
++                      size="xs"
++                      type="button"
++                      variant="ghost"
++                    >
++                      이 일정 삭제
++                    </Button>
++                  )}
++                </div>
++              ) : null}
++            </aside>
++          ) : null}
++        </div>
++      ) : (
++        <div className="flex flex-col gap-4 md:flex-row">
++          <CalendarGrid
++            colorOfDept={colorOfDept}
++            entries={monthEntries}
++            mineOnly={mineOnly}
++            month={month}
++            onMineOnly={setMineOnly}
++            onMonth={goToMonth}
++            onSelectDate={selectDate}
++            onShowPeople={setShowPeople}
++            people={people}
++            selectedDate={selectedDate}
++            showPeople={showPeople}
++            status={calendar.statusOf(monthsAround(month))}
++            today={today}
++          />
++          <section
++            aria-label={`${dateLabel(selectedDate)} 일정`}
++            className="flex w-full shrink-0 flex-col gap-3 md:w-80"
++          >
++            <div className="flex items-center justify-between gap-2">
++              <h3 className="text-sm font-semibold">
++                {dateLabel(selectedDate)}
++                {selectedWeek >= 0 ? (
++                  <span className="ml-1 font-mono text-2xs font-normal text-muted-foreground">
++                    {weekId(selectedWeek)}
++                  </span>
+                 ) : null}
+-              </aside>
+-            ) : null}
+-          </div>
+-        ) : (
+-          <div className="flex flex-col gap-4 md:flex-row">
+-            <CalendarGrid
+-              colorOfDept={colorOfDept}
+-              entries={monthEntries}
+-              mineOnly={mineOnly}
+-              month={month}
+-              onMineOnly={setMineOnly}
+-              onMonth={goToMonth}
+-              onSelectDate={selectDate}
+-              onShowPeople={setShowPeople}
+-              people={people}
+-              selectedDate={selectedDate}
+-              showPeople={showPeople}
+-              status={calendar.statusOf(monthsAround(month))}
+-              today={today}
+-            />
+-            <section
+-              aria-label={`${dateLabel(selectedDate)} 일정`}
+-              className="flex w-full shrink-0 flex-col gap-3 md:w-80"
+-            >
+-              <div className="flex items-center justify-between gap-2">
+-                <h3 className="text-sm font-semibold">
+-                  {dateLabel(selectedDate)}
+-                  {selectedWeek >= 0 ? (
+-                    <span className="ml-1 font-mono text-2xs font-normal text-muted-foreground">
+-                      {weekId(selectedWeek)}
+-                    </span>
+-                  ) : null}
+-                </h3>
+-                {draft || !copied ? null : (
+-                  <Button
+-                    aria-label={`${copied.title} 붙여넣기`}
+-                    data-testid="team-calendar-paste"
+-                    onClick={() => setDraft(copyDraftOf(copied, selectedDate))}
+-                    size="sm"
+-                    title={`"${copied.title}"을(를) 이 날에 붙여넣기`}
+-                    type="button"
+-                    variant="outline"
+-                  >
+-                    <ClipboardPaste className="h-4 w-4" />
+-                    붙여넣기
+-                  </Button>
+-                )}
+-                {draft ? null : (
+-                  <Button
+-                    data-testid="team-calendar-add"
+-                    onClick={() => setDraft(emptyDraft(selectedDate))}
+-                    size="sm"
+-                    type="button"
+-                  >
+-                    <Plus className="h-4 w-4" />
+-                    일정 추가
+-                  </Button>
+-                )}
+-              </div>
+-              {unsavedBanner}
+-              {draft ? (
+-                entryForm
+-              ) : (
+-                <DayPanel
+-                  availability={dayAvailability}
+-                  colorOfDept={colorOfDept}
+-                  deptLabel={deptLabel}
+-                  entries={selectedEntries}
+-                  nameOf={nameOf}
+-                  onCopy={copyEntry}
+-                  onEdit={editEntry}
+-                  onReminders={setEntryOffsets}
+-                  onRemove={removeEntry}
+-                  onSkip={skipOccurrence}
+-                  overrides={overrides}
+-                  pubkey={pubkey}
+-                  saving={saving}
+-                />
++              </h3>
++              {draft || !copied ? null : (
++                <Button
++                  aria-label={`${copied.title} 붙여넣기`}
++                  data-testid="team-calendar-paste"
++                  onClick={() => setDraft(copyDraftOf(copied, selectedDate))}
++                  size="sm"
++                  title={`"${copied.title}"을(를) 이 날에 붙여넣기`}
++                  type="button"
++                  variant="outline"
++                >
++                  <ClipboardPaste className="h-4 w-4" />
++                  붙여넣기
++                </Button>
+               )}
+-            </section>
+-          </div>
+-        )}
++              {draft ? null : (
++                <Button
++                  data-testid="team-calendar-add"
++                  onClick={() => setDraft(emptyDraft(selectedDate))}
++                  size="sm"
++                  type="button"
++                >
++                  <Plus className="h-4 w-4" />
++                  일정 추가
++                </Button>
++              )}
++            </div>
++            {unsavedBanner}
++            {draft ? (
++              entryForm
++            ) : (
++              <DayPanel
++                availability={dayAvailability}
++                colorOfDept={colorOfDept}
++                deptLabel={deptLabel}
++                entries={selectedEntries}
++                nameOf={nameOf}
++                onCopy={copyEntry}
++                onEdit={editEntry}
++                onReminders={setEntryOffsets}
++                onRemove={removeEntry}
++                onSkip={skipOccurrence}
++                overrides={overrides}
++                pubkey={pubkey}
++                saving={saving}
++              />
++            )}
++          </section>
++        </div>
++      )}
+     </>
+   );
+-  if (embedded) return (
+-    <div data-no-translate="" data-testid="team-calendar-embedded" className="min-w-0 w-full space-y-4">{content}</div>
+-  );
++  if (embedded)
++    return (
++      <div
++        data-no-translate=""
++        data-testid="team-calendar-embedded"
++        className="min-w-0 w-full space-y-4"
++      >
++        {content}
++      </div>
++    );
+   return (
+     <Dialog onOpenChange={onOpenChange} open={open}>
+       <DialogContent
+diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
+index 7c1a0948a..5105f9418 100644
+--- a/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
++++ b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
+@@ -1,4 +1,8 @@
+-import { TeamScheduleDialog } from "@/features/team-schedule/ui/TeamScheduleDialog";
++import type {
++  CalendarPanel,
++  TeamCalendarNavigation,
++} from "../lib/calendarNavigation";
++import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+ import { CalendarDays } from "lucide-react";
+ import * as React from "react";
+ 
+@@ -23,26 +27,45 @@ import { TeamCalendarDialog } from "./TeamCalendarDialog";
+ export function TeamCalendarSidebarEntry({
+   pubkey,
+   relayUrl,
++  ref,
+ }: {
+   pubkey?: string;
+   relayUrl?: string;
++  ref?: React.Ref<TeamCalendarNavigation>;
+ }) {
+   if (!pubkey || !relayUrl) return null;
+-  return <TeamCalendarEntry pubkey={pubkey} relayUrl={relayUrl} />;
++  return <TeamCalendarEntry pubkey={pubkey} relayUrl={relayUrl} ref={ref} />;
+ }
+ 
+ function TeamCalendarEntry({
+   pubkey,
+   relayUrl,
++  ref,
+ }: {
+   pubkey: string;
+   relayUrl: string;
++  ref?: React.Ref<TeamCalendarNavigation>;
+ }) {
+-  const [scheduleOpen, setScheduleOpen] = React.useState(false);
++  const [initialPanel, setInitialPanel] =
++    React.useState<CalendarPanel>("calendar");
++  const { goSchedule } = useAppNavigation();
+   const [open, setOpen] = React.useState(false);
+   const [request, setRequest] = React.useState<AddFromMessageRequest | null>(
+     null,
+   );
++  React.useImperativeHandle(
++    ref,
++    () => ({
++      openCalendar(panel = "calendar") {
++        setInitialPanel(panel);
++        setOpen(true);
++      },
++      openSchedule() {
++        void goSchedule();
++      },
++    }),
++    [goSchedule],
++  );
+   useTeamCalendarReminders(pubkey, relayUrl);
+   useWeeklyDigest(pubkey, relayUrl);
+   useGoogleCalendarSync(pubkey, relayUrl);
+@@ -52,7 +75,10 @@ function TeamCalendarEntry({
+     <SidebarMenuItem data-no-translate="">
+       <SidebarMenuButton
+         data-testid="open-team-calendar"
+-        onClick={() => setOpen(true)}
++        onClick={() => {
++          setInitialPanel("calendar");
++          setOpen(true);
++        }}
+         tooltip="팀 캘린더"
+         type="button"
+       >
+@@ -61,23 +87,16 @@ function TeamCalendarEntry({
+       </SidebarMenuButton>
+       <SidebarMenuButton
+         data-testid="open-team-schedule"
+-        onClick={() => setScheduleOpen(true)}
++        onClick={() => void goSchedule()}
+         tooltip="일정"
+         type="button"
+       >
+         <CalendarDays className="h-4 w-4" />
+         <SidebarMenuLabel>일정</SidebarMenuLabel>
+       </SidebarMenuButton>
+-      {scheduleOpen ? (
+-        <TeamScheduleDialog
+-          key={`${pubkey}|${relayUrl}`}
+-          onOpenChange={setScheduleOpen}
+-          pubkey={pubkey}
+-          relayUrl={relayUrl}
+-        />
+-      ) : null}
+       {open ? (
+         <TeamCalendarDialog
++          initialPanel={initialPanel}
+           onOpenChange={setOpen}
+           open={open}
+           pubkey={pubkey}
+diff --git a/desktop/src/features/team-hub/lib/featureGroups.ts b/desktop/src/features/team-hub/lib/featureGroups.ts
+new file mode 100644
+index 000000000..687b19c42
+--- /dev/null
++++ b/desktop/src/features/team-hub/lib/featureGroups.ts
+@@ -0,0 +1,141 @@
++export const TEAM_FEATURE_CATEGORIES = [
++  "대화",
++  "일정",
++  "파일",
++  "바로가기",
++  "설정",
++] as const;
++export type FeatureAction =
++  | "schedule"
++  | "calendar"
++  | "digest"
++  | "google"
++  | "notifications"
++  | "appearance"
++  | "team-welcome";
++export type HubItem = {
++  name: string;
++  description: string;
++  action?: FeatureAction;
++  location?: string;
++};
++export const teamFeatureGroups: ReadonlyArray<{
++  name: (typeof TEAM_FEATURE_CATEGORIES)[number];
++  items: readonly HubItem[];
++}> = [
++  {
++    name: "대화",
++    items: [
++      {
++        name: "채널·DM",
++        description: "팀 대화와 개인 대화",
++        location: "왼쪽 채널 목록·사람 검색에서",
++      },
++      {
++        name: "@everyone / @all",
++        description: "채널 전체에게 알리기",
++        location: "메시지 입력란에 적기",
++      },
++      {
++        name: "허들",
++        description: "통화·사람 초대·한국어 자막",
++        location: "채널 위쪽 통화 버튼에서",
++      },
++      {
++        name: "에이전트 상태줄",
++        description: "지금 하는 일 확인하기",
++        location: "채널 입력란 주변에서",
++      },
++    ],
++  },
++  {
++    name: "일정",
++    items: [
++      {
++        name: "일정 창",
++        description: "일정 페이지를 탭으로 보기",
++        action: "schedule",
++      },
++      {
++        name: "팀 캘린더",
++        description: "팀 일정 함께 보고 고치기",
++        action: "calendar",
++      },
++      {
++        name: "주간 요약·당일 알림",
++        description: "일정을 채널에 알려 주기",
++        action: "digest",
++      },
++      {
++        name: "구글 캘린더 보내기",
++        description: "내 캘린더에도 일정 담기",
++        action: "google",
++      },
++    ],
++  },
++  {
++    name: "파일",
++    items: [
++      {
++        name: "채널 파일·일괄 저장",
++        description: "파일 찾아 한 번에 받기",
++        location: "채널 위쪽 파일 모아보기에서",
++      },
++      {
++        name: "파일 열기 (ArtCraft)",
++        description: "문서·표·발표 자료 열기",
++        location: "첨부 파일의 열기 버튼에서",
++      },
++      {
++        name: "에이전트가 만든 파일",
++        description: "완성된 파일 확인하기",
++        location: "에이전트 대화의 파일 카드에서",
++      },
++      {
++        name: "압축 오디오 재생",
++        description: "압축된 음성 바로 듣기",
++        location: "대화 속 오디오의 재생 버튼에서",
++      },
++    ],
++  },
++  {
++    name: "바로가기",
++    items: [
++      {
++        name: "미트 버튼",
++        description: "화상 회의 바로 들어가기",
++        location: "채널 위쪽 미트 버튼에서",
++      },
++      {
++        name: "피그마·링크 바로가기",
++        description: "자주 쓰는 페이지 모으기",
++        location: "채널 위쪽 바로가기에서",
++      },
++    ],
++  },
++  {
++    name: "설정",
++    items: [
++      {
++        name: "알림",
++        description: "알림 소리와 표시 고르기",
++        action: "notifications",
++      },
++      {
++        name: "한국어",
++        description: "화면 언어를 한국어로",
++        action: "appearance",
++      },
++      {
++        name: "팀 안내·기본 채널",
++        description: "처음 쓰는 팀원 안내하기",
++        action: "team-welcome",
++      },
++      {
++        name: "에이전트 MCP (고급)",
++        description: "에이전트에 도구 연결하기",
++        location: "채널 위쪽 바로가기의 에이전트 도구에서",
++      },
++    ],
++  },
++];
+diff --git a/desktop/src/features/team-hub/ui/TeamFeatureHubDialog.tsx b/desktop/src/features/team-hub/ui/TeamFeatureHubDialog.tsx
+new file mode 100644
+index 000000000..ba5f2205a
+--- /dev/null
++++ b/desktop/src/features/team-hub/ui/TeamFeatureHubDialog.tsx
+@@ -0,0 +1,100 @@
++import {
++  Bell,
++  BookOpen,
++  CalendarDays,
++  Files,
++  Megaphone,
++  Video,
++} from "lucide-react";
++import { Button } from "@/shared/ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogHeader,
++  DialogTitle,
++} from "@/shared/ui/dialog";
++
++export const teamFeatureTiles = [
++  {
++    action: "schedule",
++    name: "일정",
++    description: "팀 일정을 크게 보기",
++    icon: CalendarDays,
++  },
++  {
++    action: "meet",
++    name: "회의 시작",
++    description: "미트로 바로 만나기",
++    icon: Video,
++  },
++  {
++    action: "files",
++    name: "채널 파일",
++    description: "지금 대화의 파일 모으기",
++    icon: Files,
++  },
++  {
++    action: "digest",
++    name: "주간 공지",
++    description: "이번 주 일정 알리기",
++    icon: Megaphone,
++  },
++  {
++    action: "notifications",
++    name: "알림 설정",
++    description: "소리와 표시 고르기",
++    icon: Bell,
++  },
++  {
++    action: "help",
++    name: "사용법",
++    description: "팀 기능 쉽게 익히기",
++    icon: BookOpen,
++  },
++] as const;
++export type TileAction = (typeof teamFeatureTiles)[number]["action"];
++
++/** Six large targets for the team's everyday actions. */
++export function TeamFeatureHubDialog({
++  onOpenChange,
++  onAction,
++}: {
++  onOpenChange: (open: boolean) => void;
++  onAction: (action: TileAction) => void;
++}) {
++  return (
++    <Dialog onOpenChange={onOpenChange} open>
++      <DialogContent
++        className="max-w-2xl"
++        data-no-translate=""
++        data-testid="team-feature-hub"
++      >
++        <DialogHeader>
++          <DialogTitle>팀 기능</DialogTitle>
++          <DialogDescription className="sr-only">
++            사용할 기능을 고르세요.
++          </DialogDescription>
++        </DialogHeader>
++        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
++          {teamFeatureTiles.map(({ action, name, description, icon: Icon }) => (
++            <Button
++              key={action}
++              type="button"
++              variant="outline"
++              aria-label={name}
++              className="h-auto min-h-28 flex-col gap-2 whitespace-normal px-2 py-4 [&_svg]:size-7"
++              onClick={() => onAction(action)}
++            >
++              <Icon aria-hidden="true" />
++              <span className="font-semibold">{name}</span>
++              <span className="text-xs font-normal text-muted-foreground">
++                {description}
++              </span>
++            </Button>
++          ))}
++        </div>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/desktop/src/features/team-hub/ui/TeamFeatureHubSidebarEntry.tsx b/desktop/src/features/team-hub/ui/TeamFeatureHubSidebarEntry.tsx
+new file mode 100644
+index 000000000..fb23139fd
+--- /dev/null
++++ b/desktop/src/features/team-hub/ui/TeamFeatureHubSidebarEntry.tsx
+@@ -0,0 +1,135 @@
++import { openWelcomeGuide } from "@/features/team-welcome/lib/useTeamWelcome";
++import { openUrl } from "@tauri-apps/plugin-opener";
++import { toast } from "sonner";
++import { ChannelFilesDialog } from "@/features/channel-files/ui/ChannelFilesDialog";
++import type { Channel } from "@/shared/api/types";
++import {
++  NEW_MEET_URL,
++  linksForChannel,
++  splitMeetShortcut,
++} from "@/features/team-links/lib/teamLinks";
++import { useTeamLinks } from "@/features/team-links/lib/useTeamLinks";
++import { TeamHelpDialog } from "./TeamHelpDialog";
++import { LayoutGrid } from "lucide-react";
++import * as React from "react";
++import type { SettingsSection } from "@/features/settings/ui/SettingsPanels";
++import type { TeamCalendarNavigation } from "@/features/team-calendar/lib/calendarNavigation";
++import { useDeferredModalOpen } from "@/shared/ui/deferredModalOpen";
++import { SidebarMenuButton, SidebarMenuItem } from "@/shared/ui/sidebar";
++import { SidebarMenuLabel } from "@/shared/ui/sidebar-menu-label";
++import { TeamFeatureHubDialog } from "./TeamFeatureHubDialog";
++
++/** Keep existing entry points and add one feature map above the primary menu. */
++export function TeamFeatureHubSidebarEntry({
++  calendar,
++  onSettings,
++  channel,
++  pubkey,
++  relayUrl,
++}: {
++  channel?: Channel;
++  pubkey?: string;
++  relayUrl?: string;
++  calendar: React.RefObject<TeamCalendarNavigation | null>;
++  onSettings: (section: SettingsSection) => void;
++}) {
++  const [help, setHelp] = React.useState(false);
++  const [files, setFiles] = React.useState(false);
++  const [meeting, setMeeting] = React.useState(false);
++  const [open, setOpen] = React.useState(false);
++  const { openAfterExit } = useDeferredModalOpen();
++  return (
++    <SidebarMenuItem data-no-translate="">
++      <SidebarMenuButton
++        data-testid="open-team-features"
++        onClick={() => setOpen(true)}
++        tooltip="팀 기능"
++        type="button"
++      >
++        <LayoutGrid className="h-4 w-4" />
++        <SidebarMenuLabel>팀 기능</SidebarMenuLabel>
++      </SidebarMenuButton>
++      {meeting && channel && pubkey && relayUrl ? (
++        <OpenChannelMeet
++          channelId={channel.id}
++          pubkey={pubkey}
++          relayUrl={relayUrl}
++          onDone={() => setMeeting(false)}
++        />
++      ) : null}
++      {help ? (
++        <TeamHelpDialog
++          onOpenChange={setHelp}
++          onWelcome={() => openAfterExit(() => openWelcomeGuide())}
++        />
++      ) : null}
++      {files && channel ? (
++        <ChannelFilesDialog
++          key={channel.id}
++          channelId={channel.id}
++          channelName={channel.name}
++          open
++          onOpenChange={setFiles}
++        />
++      ) : null}
++      {open ? (
++        <TeamFeatureHubDialog
++          onOpenChange={setOpen}
++          onAction={(action) => {
++            setOpen(false);
++            openAfterExit(() => {
++              if (action === "schedule") calendar.current?.openSchedule();
++              else if (action === "digest")
++                calendar.current?.openCalendar("digest");
++              else if (action === "help") setHelp(true);
++              else if (action === "files") {
++                if (channel) setFiles(true);
++                else toast("채널을 먼저 고르세요");
++              } else if (action === "meet") {
++                if (channel && pubkey && relayUrl) setMeeting(true);
++                else
++                  void openUrl(NEW_MEET_URL).catch(() =>
++                    toast.error("링크를 열지 못했습니다."),
++                  );
++              } else onSettings("notifications");
++            });
++          }}
++        />
++      ) : null}
++    </SidebarMenuItem>
++  );
++}
++
++/** Read the same shortcuts as the channel header before choosing a room. */
++export function OpenChannelMeet({
++  channelId,
++  pubkey,
++  relayUrl,
++  onDone,
++}: {
++  channelId: string;
++  pubkey: string;
++  relayUrl: string;
++  onDone: () => void;
++}) {
++  const { links, status } = useTeamLinks(pubkey, relayUrl);
++  const opened = React.useRef(false);
++  React.useEffect(() => {
++    if (status === "loading" || opened.current) return;
++    opened.current = true;
++    if (status === "error")
++      toast.error("회의 주소를 불러오지 못했습니다. 다시 눌러 주세요.");
++    else {
++      const { meet } = splitMeetShortcut(linksForChannel(links, channelId));
++      void openUrl(meet?.url ?? NEW_MEET_URL).catch(() =>
++        toast.error("링크를 열지 못했습니다."),
++      );
++    }
++    onDone();
++  }, [links, status, channelId, onDone]);
++  return (
++    <span className="sr-only" role="status">
++      회의 주소를 불러오는 중…
++    </span>
++  );
++}
+diff --git a/desktop/src/features/team-hub/ui/TeamHelpDialog.tsx b/desktop/src/features/team-hub/ui/TeamHelpDialog.tsx
+new file mode 100644
+index 000000000..96e9625ed
+--- /dev/null
++++ b/desktop/src/features/team-hub/ui/TeamHelpDialog.tsx
+@@ -0,0 +1,86 @@
++import {
++  Bell,
++  Bot,
++  FileAudio,
++  Files,
++  Globe,
++  Link2,
++  MessageCircle,
++  Video,
++} from "lucide-react";
++import { Button } from "@/shared/ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogHeader,
++  DialogTitle,
++} from "@/shared/ui/dialog";
++import { teamFeatureGroups } from "../lib/featureGroups";
++
++const icons: Record<string, typeof Link2> = {
++  채널·DM: MessageCircle,
++  "@everyone / @all": Bell,
++  허들: Video,
++  "에이전트 상태줄": Bot,
++  "채널 파일·일괄 저장": Files,
++  "파일 열기 (ArtCraft)": Files,
++  "에이전트가 만든 파일": Files,
++  "압축 오디오 재생": FileAudio,
++  "미트 버튼": Video,
++  "피그마·링크 바로가기": Link2,
++  "에이전트 MCP (고급)": Bot,
++  한국어: Globe,
++};
++const items = teamFeatureGroups
++  .flatMap((group) => group.items)
++  .filter((item) => item.location || item.name === "한국어");
++
++/** Compact location guide, separate from the six action tiles. */
++export function TeamHelpDialog({
++  onOpenChange,
++  onWelcome,
++}: {
++  onOpenChange: (open: boolean) => void;
++  onWelcome: () => void;
++}) {
++  return (
++    <Dialog open onOpenChange={onOpenChange}>
++      <DialogContent
++        className="max-w-lg max-h-[85vh] overflow-y-auto"
++        data-no-translate=""
++      >
++        <DialogHeader>
++          <DialogTitle>사용법</DialogTitle>
++          <DialogDescription className="sr-only">
++            팀 기능을 찾는 곳
++          </DialogDescription>
++        </DialogHeader>
++        <Button
++          type="button"
++          variant="outline"
++          onClick={() => {
++            onOpenChange(false);
++            onWelcome();
++          }}
++        >
++          처음 안내 다시 보기
++        </Button>
++        <ul className="space-y-3">
++          {items.map((item) => {
++            const Icon = icons[item.name] ?? Link2;
++            return (
++              <li className="flex items-start gap-2 text-xs" key={item.name}>
++                <Icon aria-hidden="true" className="size-4 shrink-0" />
++                <span>
++                  <strong className="font-semibold">{item.name}</strong> ·{" "}
++                  {item.location ?? "설정의 화면·언어에서"}
++                </span>
++              </li>
++            );
++          })}
++        </ul>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/desktop/src/features/team-hub/ui/teamHub.jsdom-test.mjs b/desktop/src/features/team-hub/ui/teamHub.jsdom-test.mjs
+new file mode 100644
+index 000000000..fa34c7a61
+--- /dev/null
++++ b/desktop/src/features/team-hub/ui/teamHub.jsdom-test.mjs
+@@ -0,0 +1,187 @@
++import assert from "node:assert/strict";
++import { afterEach, mock, test } from "node:test";
++import React from "react";
++import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
++import { SidebarProvider } from "@/shared/ui/sidebar";
++import { Toaster } from "sonner";
++import { TeamFeatureHubSidebarEntry } from "./TeamFeatureHubSidebarEntry.tsx";
++import {
++  prepareScheduleDom,
++  pubkey,
++  relayUrl,
++} from "@/features/team-schedule/ui/scheduleTestSupport.mjs";
++import {
++  encodeTeamLinks,
++  teamLinksDTag,
++  NEW_MEET_URL,
++} from "@/features/team-links/lib/teamLinks.ts";
++import {
++  useWelcomeGuideState,
++  closeWelcomeGuide,
++} from "@/features/team-welcome/lib/useTeamWelcome.ts";
++
++let env;
++afterEach(() => {
++  cleanup();
++  env?.client.clear();
++  mock.restoreAll();
++  localStorage.clear();
++  closeWelcomeGuide();
++  delete globalThis.isTauri;
++});
++const channel = {
++  id: "fixture-channel",
++  name: "촬영",
++  channelType: "stream",
++  visibility: "open",
++};
++function WelcomeState() {
++  const state = useWelcomeGuideState();
++  return React.createElement(
++    "span",
++    { "data-testid": "guide-state" },
++    String(state.open),
++  );
++}
++function mount(selected = channel, meet = null) {
++  env = prepareScheduleDom(async (filter) =>
++    filter["#d"]?.[0] === teamLinksDTag(relayUrl) && meet
++      ? [
++          {
++            id: "b".repeat(64),
++            pubkey,
++            kind: 30078,
++            created_at: 1,
++            tags: [["d", teamLinksDTag(relayUrl)]],
++            content: encodeTeamLinks({ room: meet }),
++          },
++        ]
++      : [],
++  );
++  const actions = [];
++  const calendar = {
++    current: {
++      openSchedule: () => actions.push("schedule"),
++      openCalendar: (panel) => actions.push(panel),
++    },
++  };
++  const view = render(
++    React.createElement(
++      SidebarProvider,
++      null,
++      React.createElement(
++        "ul",
++        null,
++        React.createElement(TeamFeatureHubSidebarEntry, {
++          calendar,
++          onSettings: (section) => actions.push(section),
++          channel: selected,
++          pubkey,
++          relayUrl,
++        }),
++      ),
++      React.createElement(WelcomeState),
++      React.createElement(Toaster),
++    ),
++    { wrapper: env.Providers },
++  );
++  return { ...view, actions };
++}
++async function tile(view, name) {
++  fireEvent.click(view.getByRole("button", { name: "팀 기능", exact: true }));
++  const hub = await view.findByTestId("team-feature-hub");
++  const buttons = Array.from(hub.querySelectorAll("button[aria-label]"));
++  assert.deepEqual(
++    buttons.map((b) => b.getAttribute("aria-label")),
++    ["일정", "회의 시작", "채널 파일", "주간 공지", "알림 설정", "사용법"],
++  );
++  fireEvent.click(view.getByRole("button", { name, exact: true }));
++}
++
++test("schedule, digest and notification tiles call their existing destinations", async () => {
++  const view = mount();
++  await tile(view, "일정");
++  await waitFor(() => assert.deepEqual(view.actions, ["schedule"]));
++  await tile(view, "주간 공지");
++  await waitFor(() => assert.deepEqual(view.actions, ["schedule", "digest"]));
++  await tile(view, "알림 설정");
++  await waitFor(() =>
++    assert.deepEqual(view.actions, ["schedule", "digest", "notifications"]),
++  );
++});
++
++test("files tile mounts the existing channel file dialog scoped to the selected channel", async () => {
++  const view = mount();
++  await tile(view, "채널 파일");
++  await waitFor(() =>
++    assert.ok(view.getByRole("dialog").textContent.includes("촬영")),
++  );
++  await waitFor(() =>
++    assert.ok(env.queries.some((filter) => filter["#h"]?.[0] === channel.id)),
++  );
++});
++
++test("without a channel files gives a short hint and meeting opens a new room", async () => {
++  const view = mount(null);
++  await tile(view, "채널 파일");
++  await waitFor(() => assert.ok(view.getByText("채널을 먼저 고르세요")));
++  assert.equal(view.queryByRole("dialog"), null);
++  await tile(view, "회의 시작");
++  await waitFor(() =>
++    assert.equal(
++      env.calls.find((c) => c.cmd === "plugin:opener|open_url")?.args.url,
++      NEW_MEET_URL,
++    ),
++  );
++});
++
++test("meeting uses the current channel room through the same shortcut selector as the header", async () => {
++  const room = {
++    id: "room",
++    kind: "meet",
++    title: "회의실",
++    url: "https://meet.google.com/abc-defg-hij",
++    channelId: channel.id,
++    updatedAt: 1,
++    updatedBy: pubkey,
++  };
++  const view = mount(channel, room);
++  await tile(view, "회의 시작");
++  await waitFor(() =>
++    assert.ok(env.calls.some((c) => c.cmd === "plugin:opener|open_url")),
++  );
++  assert.equal(
++    env.calls.find((c) => c.cmd === "plugin:opener|open_url").args.url,
++    room.url,
++  );
++});
++
++test("a channel with no meet shortcut opens a new room", async () => {
++  const view = mount();
++  await tile(view, "회의 시작");
++  await waitFor(() =>
++    assert.equal(
++      env.calls.find((c) => c.cmd === "plugin:opener|open_url")?.args.url,
++      NEW_MEET_URL,
++    ),
++  );
++});
++
++test("help lists locations and replays the welcome guide after the dialog exits", async () => {
++  const view = mount();
++  await tile(view, "사용법");
++  const help = await view.findByRole("dialog", { name: "사용법" });
++  for (const text of [
++    "채널·DM",
++    "ArtCraft",
++    "압축 오디오",
++    "한국어",
++    "에이전트 MCP",
++  ])
++    assert.ok(help.textContent.includes(text));
++  fireEvent.click(view.getByRole("button", { name: "처음 안내 다시 보기" }));
++  await waitFor(() =>
++    assert.equal(view.getByTestId("guide-state").textContent, "true"),
++  );
++  assert.equal(view.queryByRole("dialog"), null);
++});
+diff --git a/desktop/src/features/team-schedule/README.md b/desktop/src/features/team-schedule/README.md
+index 174597219..e1acb0d69 100644
+--- a/desktop/src/features/team-schedule/README.md
++++ b/desktop/src/features/team-schedule/README.md
+@@ -1,14 +1,14 @@
+ # 일정 탭 (팀 패치 103)
+ 
+-사이드바의 일정에서 첫 항목은 기존 팀 캘린더를 그대로 표시한다. 링크 탭은 설치 후 방장·관리자가 화면에서 추가한다. 기존 캘린더 입구와 백그라운드 알림은 유지한다.
++사이드바와 팀 기능의 일정은 `/schedule` 본문 전체 화면을 연다. 다른 채널을 고르면 일반 채널 화면으로 돌아간다. 첫 항목은 기존 팀 캘린더를 그대로 표시한다. 링크 탭은 설치 후 방장·관리자가 화면에서 추가한다. 기존 캘린더 입구와 백그라운드 알림은 유지한다.
+ 
+ - kind 30078, `d=team-schedule-tabs:<normalizeRelayUrl(relay)>`, `v=1`, `tabs` 배열. 탭마다 id/title/url/order/updatedAt/updatedBy와 삭제 시 `deleted:true`를 저장한다. 현재 NIP-43 owner/admin의 최신 사본만 읽고 탭 단위로 합친다. 삭제 기록 포함 최대 100탭, 사본 60,000바이트, 관리자 최대 200명. 한 번의 순서 변경은 한 이벤트로 저장한다.
+ - 열 때와 30초마다 새로 읽는다. 저장 직전에도 역할과 최신 사본을 다시 읽는다. 실패를 빈 목록이나 저장 성공으로 취급하지 않으며 다시 불러오기·재저장을 제공한다.
+ - 기기 전용 주소는 릴레이·계정·탭 id로 구분한 localStorage에만 보관한다. 공유 입력란과 별도 폼이며 공유 인코더는 공유 필드만 명시적으로 직렬화한다. 비우고 저장하면 공유 주소로 돌아간다.
+-- 링크는 일정 창 오른쪽의 Tauri 2 자식 `Webview`에서 연다. iframe을 쓰지 않는다. 요청에 따라 `tauri/unstable` 기능을 사용한다(이전 패치의 안정판 API 제한을 대체). 기본 영구 저장소에 `incognito:false`로 생성하고 임시 경로나 별도 저장소를 지정하지 않는다.
+-- 위치는 슬롯의 `getBoundingClientRect()`에 `devicePixelRatio / scaleFactor`를 적용한 논리 픽셀이다. 앱 확대는 루트 rem을 바꾸고 네이티브 확대는 1로 고정하므로 배율을 이중 적용하지 않는다. `ResizeObserver`, DOM 창 크기·스크롤, Tauri 크기·배율 이벤트와 모달 변화를 따라간다. 일정 창이 열리는 애니메이션 중에는 숨긴다.
+-- 같은 일정 창 안에서는 탭별 자식 웹뷰를 숨겨서 재사용한다. 캘린더 선택, 공유 주소 편집, 기기 주소 폼, 위에 열린 모달·팝오버, 문서 숨김 때 모든 자식을 숨긴다. 일정 창 닫기·팀/계정 변경은 자식을 닫고 지연 생성도 폐기한다. 자식 웹뷰는 독립 OS 창이 아니므로 앱 종료 후 남지 않는다.
+-- 작은 도구 줄에 탭 이름·새로고침·새 창으로 열기·이 기기 주소를 둔다. 새로고침은 해당 자식을 원래 주소로 다시 생성하며 쿠키 저장소는 유지한다. 기기 주소는 접힌 폼으로 옮겼으며 열려 있는 동안 페이지를 숨긴다.
++- 링크는 일정 본문 영역의 Tauri 2 자식 `Webview`에서 연다. iframe을 쓰지 않는다. 요청에 따라 `tauri/unstable` 기능을 사용한다(이전 패치의 안정판 API 제한을 대체). 기본 영구 저장소에 `incognito:false`로 생성하고 임시 경로나 별도 저장소를 지정하지 않는다.
++- 위치는 슬롯의 `getBoundingClientRect()`에 `devicePixelRatio / scaleFactor`를 적용한 논리 픽셀이다. 앱 확대는 루트 rem을 바꾸고 네이티브 확대는 1로 고정하므로 배율을 이중 적용하지 않는다. `ResizeObserver`, DOM 창 크기·스크롤, Tauri 크기·배율 이벤트와 모달 변화를 따라간다. 다른 모달·메뉴가 열리면 숨긴다.
++- 같은 일정 화면 안에서는 탭별 자식 웹뷰를 숨겨서 재사용한다. 캘린더 선택, 공유 주소 편집, 기기 주소 폼, 위에 열린 모달·팝오버, 문서 숨김 때 모든 자식을 숨긴다. 일정 화면 이탈·팀/계정 변경은 자식을 닫고 지연 생성도 폐기한다. 자식 웹뷰는 독립 OS 창이 아니므로 앱 종료 후 남지 않는다.
++- 위쪽 한 줄에 큰 알약 탭과 새로고침·⋯ 메뉴를 둔다. 새 창·이 기기 주소는 메뉴에서 연다. 방장·관리자만 탭 추가·이름/주소·순서·삭제를 바꾼다. 순서 폼의 변경은 저장을 눌러 한 이벤트로 반영한다. 팀 캘린더는 기존 모달과 내용 컴포넌트를 공유하며 새로고침은 읽기만 수행한다. 새로고침은 해당 자식을 원래 주소로 다시 생성하며 쿠키 저장소는 유지한다. 기기 주소는 접힌 폼으로 옮겼으며 열려 있는 동안 페이지를 숨긴다.
+ - 생성·위치·크기·표시 실패는 “이 화면에서는 열 수 없어 새 창으로 엽니다” 안내와 새 창 버튼을 표시한다. 별도 창은 기존 `openScheduleWindow` 경로를 재사용한다. 실패 시 자동으로 창을 열지 않아 중복 창이나 포커스 이동을 막는다.
+ - capability는 창 전체 대신 신뢰된 `main`·`huddle-*` **웹뷰 식별자**에만 연결한다. 일정 자식과 외부 별도 창은 권한을 받지 않는다. 원격 URL에 대한 capability도 추가하지 않는다. 자식 생성·위치·크기·표시·숨김·닫기 권한은 main에만 추가한다.
+ 
+diff --git a/desktop/src/features/team-schedule/lib/scheduleGeometry.ts b/desktop/src/features/team-schedule/lib/scheduleGeometry.ts
+index 834657fe8..11263e067 100644
+--- a/desktop/src/features/team-schedule/lib/scheduleGeometry.ts
++++ b/desktop/src/features/team-schedule/lib/scheduleGeometry.ts
+@@ -27,7 +27,7 @@ export function scheduleBounds(
+ 
+ /** Native children sit above the DOM, so hide them while any portal covers the schedule. */
+ export function scheduleCovered(host: HTMLElement): boolean {
+-  const dialog = host.closest('[role="dialog"]');
++  const dialog = host.closest('[data-schedule-surface], [role="dialog"]');
+   if (
+     !dialog ||
+     dialog.getAttribute("data-state") === "closed" ||
+@@ -42,11 +42,7 @@ export function scheduleCovered(host: HTMLElement): boolean {
+       '[role="dialog"], [role="alertdialog"], [data-radix-popper-content-wrapper]',
+     ),
+   ).some((element) => {
+-    if (
+-      element === dialog ||
+-      dialog.contains(element) ||
+-      element.getAttribute("data-state") === "closed"
+-    )
++    if (element === dialog || element.getAttribute("data-state") === "closed")
+       return false;
+     const style = getComputedStyle(element);
+     return (
+diff --git a/desktop/src/features/team-schedule/ui/ScheduleLinkPanel.tsx b/desktop/src/features/team-schedule/ui/ScheduleLinkPanel.tsx
+index 44acd3056..7df2409e2 100644
+--- a/desktop/src/features/team-schedule/ui/ScheduleLinkPanel.tsx
++++ b/desktop/src/features/team-schedule/ui/ScheduleLinkPanel.tsx
+@@ -9,6 +9,9 @@ import {
+   type ScheduleTab,
+ } from "../lib/scheduleTabs";
+ 
++/** Toolbar actions exposed to the full-page schedule header. */
++export type ScheduleLinkActions = { refresh: () => void; open: () => void };
++
+ /** Device-only addresses never reach the shared save function. */
+ export function ScheduleLinkPanel({
+   tab,
+@@ -17,7 +20,13 @@ export function ScheduleLinkPanel({
+   blocked = false,
+   onLocalChange,
+   reportError,
++  localOpen = false,
++  onLocalClose = () => {},
++  ref,
+ }: {
++  localOpen?: boolean;
++  onLocalClose?: () => void;
++  ref?: React.Ref<ScheduleLinkActions>;
+   tab?: ScheduleTab;
+   pubkey: string;
+   relay: string;
+@@ -26,16 +35,15 @@ export function ScheduleLinkPanel({
+   reportError: (message: string) => void;
+ }) {
+   const [localUrl, setLocalUrl] = React.useState("");
+-  const [expanded, setExpanded] = React.useState(false);
+   const [opening, setOpening] = React.useState(false);
+   const [, localChanged] = React.useReducer((n) => n + 1, 0);
+   const tabId = tab?.id;
+   React.useEffect(() => {
++    if (!localOpen) return;
+     setLocalUrl(
+       tabId ? (readLocalScheduleUrl(relay, pubkey, tabId) ?? "") : "",
+     );
+-    setExpanded(false);
+-  }, [tabId, relay, pubkey]);
++  }, [tabId, relay, pubkey, localOpen]);
+   const url = tab
+     ? (readLocalScheduleUrl(relay, pubkey, tab.id) ?? tab.url)
+     : "";
+@@ -43,7 +51,7 @@ export function ScheduleLinkPanel({
+     `${relay}|${pubkey}`,
+     tab?.id,
+     url,
+-    blocked || expanded,
++    blocked || localOpen,
+   );
+   const open = async () => {
+     if (!tab) return;
+@@ -56,35 +64,11 @@ export function ScheduleLinkPanel({
+       setOpening(false);
+     }
+   };
++  React.useImperativeHandle(ref, () => ({ refresh, open: () => void open() }));
+   if (!tab) return null;
+   return (
+     <div className="flex min-h-0 flex-1 flex-col gap-2">
+-      <div className="flex flex-wrap items-center gap-2">
+-        <h3 className="mr-auto text-sm font-semibold">{tab.title}</h3>
+-        <Button onClick={refresh} size="sm" type="button" variant="ghost">
+-          새로고침
+-        </Button>
+-        <Button
+-          disabled={opening}
+-          onClick={() => void open()}
+-          size="sm"
+-          type="button"
+-          variant="ghost"
+-        >
+-          새 창으로 열기
+-        </Button>
+-        <Button
+-          aria-expanded={expanded}
+-          aria-controls="schedule-local-form"
+-          onClick={() => setExpanded(!expanded)}
+-          size="sm"
+-          type="button"
+-          variant="outline"
+-        >
+-          이 기기 주소
+-        </Button>
+-      </div>
+-      {expanded ? (
++      {localOpen ? (
+         <form
+           id="schedule-local-form"
+           className="space-y-2 rounded-lg border p-3"
+@@ -95,7 +79,7 @@ export function ScheduleLinkPanel({
+               localChanged();
+               onLocalChange();
+               reportError("");
+-              setExpanded(false);
++              onLocalClose();
+             } catch {
+               reportError(
+                 "주소를 저장하지 못했습니다. https 주소와 기기 저장 공간을 확인해 주세요.",
+@@ -120,6 +104,14 @@ export function ScheduleLinkPanel({
+           <Button size="sm" type="submit" variant="outline">
+             이 기기에 저장
+           </Button>
++          <Button
++            type="button"
++            variant="ghost"
++            size="sm"
++            onClick={onLocalClose}
++          >
++            닫기
++          </Button>
+         </form>
+       ) : null}
+       <section
+diff --git a/desktop/src/features/team-schedule/ui/ScheduleOrderForm.tsx b/desktop/src/features/team-schedule/ui/ScheduleOrderForm.tsx
+new file mode 100644
+index 000000000..d6d5ec1a5
+--- /dev/null
++++ b/desktop/src/features/team-schedule/ui/ScheduleOrderForm.tsx
+@@ -0,0 +1,96 @@
++import * as React from "react";
++import { Button } from "@/shared/ui/button";
++import type { ScheduleTab } from "../lib/scheduleTabs";
++
++/** Collect reordering into one atomic shared save. */
++export function ScheduleOrderForm({
++  tabs,
++  saving,
++  onSave,
++  onCancel,
++}: {
++  tabs: ScheduleTab[];
++  saving: boolean;
++  onSave: (changes: ScheduleTab[]) => Promise<void>;
++  onCancel: () => void;
++}) {
++  const [order, setOrder] = React.useState(tabs.map((tab) => tab.id));
++  const [error, setError] = React.useState("");
++  const shown = order
++    .map((id) => tabs.find((tab) => tab.id === id))
++    .filter((tab): tab is ScheduleTab => !!tab);
++  const move = (index: number, delta: number) => {
++    const ids = shown.map((tab) => tab.id);
++    [ids[index], ids[index + delta]] = [
++      ids[index + delta] as string,
++      ids[index] as string,
++    ];
++    setOrder(ids);
++  };
++  return (
++    <form
++      className="space-y-2 rounded-lg border p-3"
++      aria-label="순서 바꾸기"
++      onSubmit={async (event) => {
++        event.preventDefault();
++        try {
++          // Include tabs added while editing, rather than overwriting their order.
++          const all = [
++            ...shown,
++            ...tabs.filter((tab) => !order.includes(tab.id)),
++          ];
++          await onSave(all.map((tab, index) => ({ ...tab, order: index })));
++        } catch {
++          setError("저장하지 못했습니다. 다시 눌러 주세요.");
++        }
++      }}
++    >
++      <ol className="space-y-2">
++        {shown.map((tab, index) => (
++          <li className="flex items-center gap-2 text-sm" key={tab.id}>
++            <span className="mr-auto">{tab.title}</span>
++            <Button
++              type="button"
++              size="sm"
++              variant="outline"
++              aria-label={`${tab.title} 위로`}
++              disabled={saving || index === 0}
++              onClick={() => move(index, -1)}
++            >
++              위로
++            </Button>
++            <Button
++              type="button"
++              size="sm"
++              variant="outline"
++              aria-label={`${tab.title} 아래로`}
++              disabled={saving || index === shown.length - 1}
++              onClick={() => move(index, 1)}
++            >
++              아래로
++            </Button>
++          </li>
++        ))}
++      </ol>
++      {error ? (
++        <p role="alert" className="text-sm text-destructive">
++          {error}
++        </p>
++      ) : null}
++      <div className="flex gap-2">
++        <Button type="submit" size="sm" disabled={saving}>
++          저장
++        </Button>
++        <Button
++          type="button"
++          size="sm"
++          variant="ghost"
++          disabled={saving}
++          onClick={onCancel}
++        >
++          취소
++        </Button>
++      </div>
++    </form>
++  );
++}
+diff --git a/desktop/src/features/team-schedule/ui/TeamScheduleDialog.tsx b/desktop/src/features/team-schedule/ui/TeamScheduleDialog.tsx
+deleted file mode 100644
+index c5610c2fe..000000000
+--- a/desktop/src/features/team-schedule/ui/TeamScheduleDialog.tsx
++++ /dev/null
+@@ -1,255 +0,0 @@
+-import * as React from "react";
+-import { TeamCalendarDialog } from "@/features/team-calendar/ui/TeamCalendarDialog";
+-import { Button } from "@/shared/ui/button";
+-import {
+-  Dialog,
+-  DialogContent,
+-  DialogDescription,
+-  DialogHeader,
+-  DialogTitle,
+-} from "@/shared/ui/dialog";
+-import {
+-  MAX_TABS,
+-  readLocalScheduleUrl,
+-  visibleScheduleTabs,
+-  type ScheduleTab,
+-} from "../lib/scheduleTabs";
+-import { useScheduleTabs } from "../lib/useScheduleTabs";
+-import { ScheduleLinkPanel } from "./ScheduleLinkPanel";
+-import { ScheduleTabForm } from "./ScheduleTabForm";
+-
+-/** Shared schedule links with a fixed embedded team calendar as the first tab. */
+-export function TeamScheduleDialog({
+-  pubkey,
+-  relayUrl,
+-  onOpenChange,
+-}: {
+-  pubkey: string;
+-  relayUrl: string;
+-  onOpenChange: (open: boolean) => void;
+-}) {
+-  const { tabs, canManage, loading, error, retry, saving, save } =
+-    useScheduleTabs(pubkey, relayUrl);
+-  const [selected, setSelected] = React.useState("calendar");
+-  const [editing, setEditing] = React.useState<string | null>(null);
+-  const [problem, setProblem] = React.useState("");
+-  const [, localChanged] = React.useReducer((n) => n + 1, 0);
+-  const links = visibleScheduleTabs(tabs);
+-  const tab = links.find(({ id }) => id === selected);
+-  const run = async (changes: ScheduleTab[]) => {
+-    try {
+-      await save(changes);
+-      setProblem("");
+-    } catch {
+-      setProblem("저장하지 못했습니다. 다시 눌러 주세요.");
+-    }
+-  };
+-  const move = (index: number, delta: number) => {
+-    const reordered = [...links];
+-    [reordered[index], reordered[index + delta]] = [
+-      reordered[index + delta] as ScheduleTab,
+-      reordered[index] as ScheduleTab,
+-    ];
+-    void run(
+-      reordered
+-        .map((entry, order) => ({ ...entry, order }))
+-        .filter((entry) => entry.order !== tabs[entry.id]?.order),
+-    );
+-  };
+-  const select = (entry: ScheduleTab) => {
+-    setSelected(entry.id);
+-    setEditing(null);
+-    setProblem("");
+-  };
+-  return (
+-    <Dialog onOpenChange={onOpenChange} open>
+-      <DialogContent
+-        className="flex h-[90vh] w-[90vw] min-w-[min(900px,calc(100vw-2rem))] max-w-none min-h-[min(600px,calc(100vh-2rem))] flex-col"
+-        data-no-translate=""
+-        data-testid="team-schedule-dialog"
+-      >
+-        <DialogHeader>
+-          <DialogTitle>일정</DialogTitle>
+-          <DialogDescription>
+-            팀 캘린더와 일정 페이지를 한곳에서 엽니다.
+-          </DialogDescription>
+-        </DialogHeader>
+-        <div className="flex min-h-0 flex-1 gap-4">
+-          <nav
+-            aria-label="일정 탭"
+-            className="flex w-48 shrink-0 flex-col gap-1 overflow-y-auto"
+-          >
+-            <Button
+-              aria-pressed={!tab}
+-              onClick={() => {
+-                setSelected("calendar");
+-                setEditing(null);
+-              }}
+-              type="button"
+-              variant={!tab ? "secondary" : "ghost"}
+-            >
+-              팀 캘린더
+-            </Button>
+-            {links.map((entry, index) => (
+-              <div className="space-y-1" key={entry.id}>
+-                <Button
+-                  aria-pressed={entry.id === tab?.id}
+-                  className="h-auto w-full flex-wrap justify-start whitespace-normal break-all"
+-                  onClick={() => select(entry)}
+-                  type="button"
+-                  variant={entry.id === tab?.id ? "secondary" : "ghost"}
+-                >
+-                  {entry.title}
+-                  {readLocalScheduleUrl(relayUrl, pubkey, entry.id) ? (
+-                    <span className="text-2xs text-muted-foreground">
+-                      이 기기 전용
+-                    </span>
+-                  ) : null}
+-                </Button>
+-                {canManage ? (
+-                  <div className="flex gap-1">
+-                    <Button
+-                      aria-label={`${entry.title} 위로`}
+-                      disabled={saving || index === 0}
+-                      onClick={() => move(index, -1)}
+-                      size="xs"
+-                      type="button"
+-                      variant="ghost"
+-                    >
+-                      위로
+-                    </Button>
+-                    <Button
+-                      aria-label={`${entry.title} 아래로`}
+-                      disabled={saving || index === links.length - 1}
+-                      onClick={() => move(index, 1)}
+-                      size="xs"
+-                      type="button"
+-                      variant="ghost"
+-                    >
+-                      아래로
+-                    </Button>
+-                  </div>
+-                ) : null}
+-              </div>
+-            ))}
+-            {loading ? (
+-              <p className="text-xs" role="status">
+-                일정을 불러오는 중…
+-              </p>
+-            ) : null}
+-            {error ? (
+-              <div role="alert" className="text-xs text-destructive">
+-                일정 탭을 불러오지 못했습니다.
+-                <Button
+-                  onClick={() => void retry()}
+-                  size="sm"
+-                  type="button"
+-                  variant="outline"
+-                >
+-                  다시 불러오기
+-                </Button>
+-              </div>
+-            ) : null}
+-            {canManage ? (
+-              <Button
+-                disabled={saving || Object.keys(tabs).length >= MAX_TABS}
+-                onClick={() => setEditing("new")}
+-                size="sm"
+-                type="button"
+-                variant="outline"
+-              >
+-                탭 추가
+-              </Button>
+-            ) : null}
+-          </nav>
+-          <section
+-            aria-label={tab?.title ?? "팀 캘린더"}
+-            className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-y-auto"
+-          >
+-            {problem ? (
+-              <p className="text-sm text-destructive" role="alert">
+-                {problem}
+-              </p>
+-            ) : null}
+-            {editing && !editing.startsWith("delete:") && canManage ? (
+-              <ScheduleTabForm
+-                key={editing}
+-                onCancel={() => setEditing(null)}
+-                onSave={async (title, url) => {
+-                  const old = tabs[editing];
+-                  await save([
+-                    {
+-                      id: old?.id ?? crypto.randomUUID(),
+-                      title,
+-                      url,
+-                      order: old?.order ?? links.length,
+-                      updatedAt: 1,
+-                      updatedBy: pubkey,
+-                    },
+-                  ]);
+-                }}
+-                saving={saving}
+-                tab={tabs[editing]}
+-              />
+-            ) : null}
+-            {tab ? (
+-              canManage ? (
+-                <div className="flex gap-2">
+-                  <Button
+-                    disabled={saving}
+-                    onClick={() => setEditing(tab.id)}
+-                    size="sm"
+-                    type="button"
+-                    variant="outline"
+-                  >
+-                    이름·주소 바꾸기
+-                  </Button>
+-                  <Button
+-                    disabled={saving}
+-                    onClick={() => setEditing(`delete:${tab.id}`)}
+-                    size="sm"
+-                    type="button"
+-                    variant="ghost"
+-                  >
+-                    탭 삭제
+-                  </Button>
+-                  {editing === `delete:${tab.id}` ? (
+-                    <Button
+-                      disabled={saving}
+-                      onClick={() =>
+-                        void run([
+-                          { ...tab, title: "", url: "", deleted: true },
+-                        ])
+-                      }
+-                      size="sm"
+-                      type="button"
+-                      variant="destructive"
+-                    >
+-                      삭제 확인
+-                    </Button>
+-                  ) : null}
+-                </div>
+-              ) : null
+-            ) : (
+-              <TeamCalendarDialog
+-                embedded
+-                onOpenChange={() => {}}
+-                open
+-                pubkey={pubkey}
+-                relayUrl={relayUrl}
+-              />
+-            )}
+-            <ScheduleLinkPanel
+-              tab={tab}
+-              blocked={!!editing}
+-              onLocalChange={localChanged}
+-              pubkey={pubkey}
+-              relay={relayUrl}
+-              reportError={setProblem}
+-            />
+-          </section>
+-        </div>
+-      </DialogContent>
+-    </Dialog>
+-  );
+-}
+diff --git a/desktop/src/features/team-schedule/ui/TeamScheduleScreen.tsx b/desktop/src/features/team-schedule/ui/TeamScheduleScreen.tsx
+new file mode 100644
+index 000000000..96c414fd9
+--- /dev/null
++++ b/desktop/src/features/team-schedule/ui/TeamScheduleScreen.tsx
+@@ -0,0 +1,18 @@
++import { useCommunities } from "@/features/communities/useCommunities";
++import { useIdentityQuery } from "@/shared/api/hooks";
++import { TeamScheduleView } from "./TeamScheduleView";
++
++/** Route content fills the body beside the sidebar and retires on navigation. */
++export function TeamScheduleScreen() {
++  const { activeCommunity } = useCommunities();
++  const { data: identity } = useIdentityQuery();
++  if (!activeCommunity || !identity)
++    return <p role="status">일정을 불러오는 중…</p>;
++  return (
++    <TeamScheduleView
++      key={`${activeCommunity.id}|${activeCommunity.relayUrl}|${identity.pubkey}`}
++      pubkey={identity.pubkey}
++      relayUrl={activeCommunity.relayUrl}
++    />
++  );
++}
+diff --git a/desktop/src/features/team-schedule/ui/TeamScheduleView.tsx b/desktop/src/features/team-schedule/ui/TeamScheduleView.tsx
+new file mode 100644
+index 000000000..61312a2f6
+--- /dev/null
++++ b/desktop/src/features/team-schedule/ui/TeamScheduleView.tsx
+@@ -0,0 +1,298 @@
++import { MoreHorizontal, RefreshCw } from "lucide-react";
++import * as React from "react";
++import { TeamCalendarDialog } from "@/features/team-calendar/ui/TeamCalendarDialog";
++import { Button } from "@/shared/ui/button";
++import {
++  DropdownMenu,
++  DropdownMenuContent,
++  DropdownMenuItem,
++  DropdownMenuTrigger,
++} from "@/shared/ui/dropdown-menu";
++import {
++  MAX_TABS,
++  readLocalScheduleUrl,
++  visibleScheduleTabs,
++  type ScheduleTab,
++} from "../lib/scheduleTabs";
++import { useScheduleTabs } from "../lib/useScheduleTabs";
++import {
++  ScheduleLinkPanel,
++  type ScheduleLinkActions,
++} from "./ScheduleLinkPanel";
++import { ScheduleTabForm } from "./ScheduleTabForm";
++import { ScheduleOrderForm } from "./ScheduleOrderForm";
++
++/** Shared schedule links and calendar, rendered inside the app's route outlet. */
++export function TeamScheduleView(props: { pubkey: string; relayUrl: string }) {
++  const state = useScheduleTabs(props.pubkey, props.relayUrl);
++  return <ScheduleContent {...props} {...state} />;
++}
++
++/** Full-page controls; the same permission result gates every management path. */
++export function ScheduleContent({
++  pubkey,
++  relayUrl,
++  tabs,
++  canManage,
++  loading,
++  error,
++  retry,
++  saving,
++  save,
++}: {
++  pubkey: string;
++  relayUrl: string;
++} & ReturnType<typeof useScheduleTabs>) {
++  const [selected, setSelected] = React.useState("calendar");
++  const [editing, setEditing] = React.useState<string | null>(null);
++  const [menuOpen, setMenuOpen] = React.useState(false);
++  const [localOpen, setLocalOpen] = React.useState(false);
++  const [problem, setProblem] = React.useState("");
++  const [, localChanged] = React.useReducer((n) => n + 1, 0);
++  const link = React.useRef<ScheduleLinkActions>(null);
++  const calendar = React.useRef<{ refresh: () => void }>(null);
++  const links = visibleScheduleTabs(tabs);
++  const tab = links.find((entry) => entry.id === selected);
++  const select = (id: string) => {
++    setSelected(id);
++    setEditing(null);
++    setLocalOpen(false);
++    setProblem("");
++  };
++  const run = async (changes: ScheduleTab[]) => {
++    if (!canManage) throw new Error("방장·관리자만 바꿀 수 있습니다.");
++    await save(changes);
++    setProblem("");
++    setEditing(null);
++  };
++  const refresh = () => {
++    void retry();
++    if (tab) link.current?.refresh();
++    else calendar.current?.refresh();
++  };
++  return (
++    <section
++      data-no-translate=""
++      data-schedule-surface=""
++      data-testid="team-schedule-screen"
++      aria-label="일정"
++      className="flex h-full min-h-0 min-w-0 flex-1 flex-col gap-3 p-4"
++    >
++      <header className="flex min-w-0 shrink-0 items-center gap-2">
++        <nav
++          aria-label="일정 탭"
++          className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto"
++        >
++          <Button
++            aria-pressed={!tab}
++            className="shrink-0 rounded-full"
++            variant={!tab ? "secondary" : "outline"}
++            size="lg"
++            type="button"
++            onClick={() => select("calendar")}
++          >
++            팀 캘린더
++          </Button>
++          {links.map((entry) => (
++            <Button
++              key={entry.id}
++              aria-pressed={entry.id === tab?.id}
++              className="shrink-0 rounded-full"
++              variant={entry.id === tab?.id ? "secondary" : "outline"}
++              size="lg"
++              type="button"
++              onClick={() => select(entry.id)}
++            >
++              {entry.title}
++              {readLocalScheduleUrl(relayUrl, pubkey, entry.id) ? (
++                <span className="text-xs text-muted-foreground">
++                  이 기기 전용
++                </span>
++              ) : null}
++            </Button>
++          ))}
++        </nav>
++        <Button
++          aria-label="새로고침"
++          size="icon"
++          variant="ghost"
++          type="button"
++          onClick={refresh}
++        >
++          <RefreshCw aria-hidden="true" />
++        </Button>
++        <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
++          <DropdownMenuTrigger asChild>
++            <Button
++              aria-label="일정 메뉴"
++              size="icon"
++              variant="ghost"
++              type="button"
++            >
++              <MoreHorizontal aria-hidden="true" />
++            </Button>
++          </DropdownMenuTrigger>
++          <DropdownMenuContent align="end">
++            <DropdownMenuItem
++              disabled={!tab}
++              onSelect={() => link.current?.open()}
++            >
++              새 창으로 열기
++            </DropdownMenuItem>
++            <DropdownMenuItem
++              disabled={!tab}
++              onSelect={() => {
++                setEditing(null);
++                setLocalOpen(true);
++              }}
++            >
++              이 기기 주소
++            </DropdownMenuItem>
++            {canManage ? (
++              <>
++                <DropdownMenuItem
++                  disabled={saving || Object.keys(tabs).length >= MAX_TABS}
++                  onSelect={() => {
++                    setLocalOpen(false);
++                    setEditing("new");
++                  }}
++                >
++                  탭 추가
++                </DropdownMenuItem>
++                <DropdownMenuItem
++                  disabled={saving || !tab}
++                  onSelect={() => {
++                    setLocalOpen(false);
++                    setEditing(tab?.id ?? null);
++                  }}
++                >
++                  이름·주소 바꾸기
++                </DropdownMenuItem>
++                <DropdownMenuItem
++                  disabled={saving || links.length < 2}
++                  onSelect={() => {
++                    setLocalOpen(false);
++                    setEditing("order");
++                  }}
++                >
++                  순서 바꾸기
++                </DropdownMenuItem>
++                <DropdownMenuItem
++                  disabled={saving || !tab}
++                  onSelect={() => {
++                    setLocalOpen(false);
++                    setEditing(`delete:${tab?.id}`);
++                  }}
++                >
++                  탭 삭제
++                </DropdownMenuItem>
++              </>
++            ) : null}
++          </DropdownMenuContent>
++        </DropdownMenu>
++      </header>
++      {loading ? (
++        <p role="status" className="text-xs">
++          일정을 불러오는 중…
++        </p>
++      ) : null}
++      {error ? (
++        <div role="alert" className="text-sm text-destructive">
++          일정 탭을 불러오지 못했습니다.{" "}
++          <Button type="button" variant="outline" onClick={() => void retry()}>
++            다시 불러오기
++          </Button>
++        </div>
++      ) : null}
++      {problem ? (
++        <p role="alert" className="text-sm text-destructive">
++          {problem}
++        </p>
++      ) : null}
++      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto">
++        {editing && canManage ? (
++          editing === "order" ? (
++            <ScheduleOrderForm
++              tabs={links}
++              saving={saving}
++              onCancel={() => setEditing(null)}
++              onSave={run}
++            />
++          ) : editing.startsWith("delete:") ? (
++            tab && editing === `delete:${tab.id}` ? (
++              <fieldset
++                className="flex items-center gap-2 rounded-lg border p-3"
++                aria-label="탭 삭제 확인"
++              >
++                <span className="text-sm">{tab.title} 탭을 삭제할까요?</span>
++                <Button
++                  type="button"
++                  variant="destructive"
++                  disabled={saving}
++                  onClick={() =>
++                    void run([
++                      { ...tab, title: "", url: "", deleted: true },
++                    ]).catch(() =>
++                      setProblem("삭제하지 못했습니다. 다시 눌러 주세요."),
++                    )
++                  }
++                >
++                  삭제 확인
++                </Button>
++                <Button
++                  type="button"
++                  variant="ghost"
++                  disabled={saving}
++                  onClick={() => setEditing(null)}
++                >
++                  취소
++                </Button>
++              </fieldset>
++            ) : null
++          ) : (
++            <ScheduleTabForm
++              key={editing}
++              tab={tabs[editing]}
++              saving={saving}
++              onCancel={() => setEditing(null)}
++              onSave={async (title, url) => {
++                const old = tabs[editing];
++                await run([
++                  {
++                    id: old?.id ?? crypto.randomUUID(),
++                    title,
++                    url,
++                    order: old?.order ?? links.length,
++                    updatedAt: 1,
++                    updatedBy: pubkey,
++                  },
++                ]);
++              }}
++            />
++          )
++        ) : null}
++        {!tab ? (
++          <TeamCalendarDialog
++            ref={calendar}
++            embedded
++            open
++            onOpenChange={() => {}}
++            pubkey={pubkey}
++            relayUrl={relayUrl}
++          />
++        ) : null}
++        <ScheduleLinkPanel
++          ref={link}
++          tab={tab}
++          blocked={menuOpen || (!!editing && canManage)}
++          localOpen={localOpen && !!tab}
++          onLocalClose={() => setLocalOpen(false)}
++          onLocalChange={localChanged}
++          pubkey={pubkey}
++          relay={relayUrl}
++          reportError={setProblem}
++        />
++      </div>
++    </section>
++  );
++}
+diff --git a/desktop/src/features/team-schedule/ui/scheduleForms.jsdom-test.mjs b/desktop/src/features/team-schedule/ui/scheduleForms.jsdom-test.mjs
+index 8c5d1a272..625ac1ac0 100644
+--- a/desktop/src/features/team-schedule/ui/scheduleForms.jsdom-test.mjs
++++ b/desktop/src/features/team-schedule/ui/scheduleForms.jsdom-test.mjs
+@@ -41,19 +41,29 @@ beforeEach(() => {
+     },
+   };
+ });
+-const panel = (props) =>
+-  React.createElement(
++function PanelHarness(props) {
++  const [localOpen, setLocalOpen] = React.useState(false);
++  return React.createElement(
+     "div",
+-    { role: "dialog", "data-state": "open" },
++    { "data-schedule-surface": "" },
++    React.createElement(
++      "button",
++      { type: "button", onClick: () => setLocalOpen(true) },
++      "이 기기 주소",
++    ),
+     React.createElement(ScheduleLinkPanel, {
+       tab: { id: "local", title: "일정표", url: "https://example.com/" },
+       pubkey: "a".repeat(64),
+       relay: "wss://relay.example.com",
+       onLocalChange() {},
+       reportError() {},
++      localOpen,
++      onLocalClose: () => setLocalOpen(false),
+       ...props,
+     }),
+   );
++}
++const panel = (props) => React.createElement(PanelHarness, props);
+ const count = (suffix) =>
+   calls.filter(({ cmd }) => cmd === `plugin:webview|${suffix}`).length;
+ 
+diff --git a/desktop/src/features/team-schedule/ui/scheduleNavigation.jsdom-test.mjs b/desktop/src/features/team-schedule/ui/scheduleNavigation.jsdom-test.mjs
+new file mode 100644
+index 000000000..04ec73f3f
+--- /dev/null
++++ b/desktop/src/features/team-schedule/ui/scheduleNavigation.jsdom-test.mjs
+@@ -0,0 +1,190 @@
++import { register } from "node:module";
++import assert from "node:assert/strict";
++import { afterEach, mock, test } from "node:test";
++import React from "react";
++import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
++// Node resolves the router's server condition even with jsdom. Use the same
++// browser branch as Vite so this test exercises its actual transition effects.
++register(
++  `data:text/javascript,${encodeURIComponent(`export function resolve(specifier, context, nextResolve) {
++  return nextResolve(specifier, specifier === "@tanstack/router-core/isServer" ? {...context, conditions: ["browser", "import", "default"]} : context);
++}`)}`,
++  import.meta.url,
++);
++const {
++  createMemoryHistory,
++  createRootRoute,
++  createRoute,
++  createRouter,
++  Outlet,
++  RouterProvider,
++} = await import("@tanstack/react-router");
++const { Route: ScheduleRoute } = await import("@/app/routes/schedule.tsx");
++const { deriveShellRoute } = await import("@/app/AppShell.helpers.ts");
++const { useAppNavigation } = await import(
++  "@/app/navigation/useAppNavigation.ts"
++);
++const { SidebarProvider } = await import("@/shared/ui/sidebar");
++const { TeamCalendarSidebarEntry } = await import(
++  "@/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx"
++);
++const { TeamFeatureHubSidebarEntry } = await import(
++  "@/features/team-hub/ui/TeamFeatureHubSidebarEntry.tsx"
++);
++const { TeamScheduleView } = await import("./TeamScheduleView.tsx");
++const { encodeScheduleTabs, scheduleDTag } = await import(
++  "../lib/scheduleTabs.ts"
++);
++const { prepareScheduleDom, pubkey, relayUrl, tabA, tabB } = await import(
++  "./scheduleTestSupport.mjs"
++);
++
++let env;
++afterEach(() => {
++  cleanup();
++  env?.client.clear();
++  mock.restoreAll();
++  localStorage.clear();
++  delete globalThis.isTauri;
++});
++function fixtures(role) {
++  const owner = "b".repeat(64);
++  return (filter) => {
++    if (filter.kinds.includes(13534))
++      return [
++        {
++          id: "membership",
++          kind: 13534,
++          created_at: 1,
++          pubkey: owner,
++          content: "",
++          tags: [
++            ["member", pubkey, role],
++            ["member", owner, "owner"],
++          ],
++        },
++      ];
++    if (filter["#d"]?.[0] === scheduleDTag(relayUrl))
++      return [
++        {
++          id: "tabs",
++          kind: 30078,
++          created_at: 1,
++          pubkey: owner,
++          tags: [["d", scheduleDTag(relayUrl)]],
++          content: encodeScheduleTabs({ first: tabA, second: tabB }),
++        },
++      ];
++    return [];
++  };
++}
++for (const role of ["owner", "admin", "member"]) {
++  test(`NIP-43 ${role} resolves to the correct overflow menu through the production query`, async () => {
++    env = prepareScheduleDom(fixtures(role));
++    const view = render(
++      React.createElement(TeamScheduleView, { pubkey, relayUrl }),
++      { wrapper: env.Providers },
++    );
++    await waitFor(() =>
++      assert.ok(view.getByRole("button", { name: "일정표", exact: true })),
++    );
++    fireEvent.keyDown(view.getByRole("button", { name: "일정 메뉴" }), {
++      key: "ArrowDown",
++      code: "ArrowDown",
++    });
++    await waitFor(() =>
++      assert.equal(
++        view.getAllByRole("menuitem").length,
++        role === "member" ? 2 : 6,
++      ),
++    );
++  });
++}
++
++test("sidebar and hub enter the schedule route; selecting a channel unmounts it and closes its native children", async () => {
++  env = prepareScheduleDom(fixtures("member"));
++  function Shell() {
++    const calendar = React.useRef(null);
++    const { goChannel } = useAppNavigation();
++    return React.createElement(
++      React.Fragment,
++      null,
++      React.createElement(
++        SidebarProvider,
++        null,
++        React.createElement(
++          "ul",
++          null,
++          React.createElement(TeamFeatureHubSidebarEntry, {
++            calendar,
++            pubkey,
++            relayUrl,
++            onSettings() {},
++          }),
++          React.createElement(TeamCalendarSidebarEntry, {
++            ref: calendar,
++            pubkey,
++            relayUrl,
++          }),
++        ),
++        React.createElement(
++          "button",
++          { type: "button", onClick: () => void goChannel("fixture") },
++          "테스트 채널",
++        ),
++      ),
++      React.createElement(Outlet),
++    );
++  }
++  const root = createRootRoute({ component: Shell });
++  const schedule = createRoute({
++    getParentRoute: () => root,
++    path: "/schedule",
++    component: ScheduleRoute.options.component,
++  });
++  const channel = createRoute({
++    getParentRoute: () => root,
++    path: "/channels/$channelId",
++    component: () => React.createElement("p", null, "채널 본문"),
++  });
++  const router = createRouter({
++    isServer: false,
++    routeTree: root.addChildren([schedule, channel]),
++    history: createMemoryHistory({ initialEntries: ["/channels/fixture"] }),
++  });
++  await router.load();
++  const view = render(React.createElement(RouterProvider, { router }), {
++    wrapper: env.Providers,
++  });
++  await waitFor(() => assert.ok(view.getByText("채널 본문")));
++  fireEvent.click(view.getByTestId("open-team-schedule"));
++  await waitFor(() => assert.ok(view.getByTestId("team-schedule-screen")));
++  assert.equal(router.state.location.pathname, "/schedule");
++  assert.deepEqual(deriveShellRoute("/schedule"), {
++    selectedChannelId: null,
++    selectedView: "schedule",
++  });
++  fireEvent.click(
++    await view.findByRole("button", { name: "일정표", exact: true }),
++  );
++  await waitFor(() => assert.equal(env.count("webview_show"), 1));
++  fireEvent.click(view.getByRole("button", { name: "테스트 채널" }));
++  await waitFor(() => assert.ok(view.getByText("채널 본문")));
++  await waitFor(() => assert.equal(env.count("webview_close"), 1));
++  assert.equal(view.queryByTestId("team-schedule-screen"), null);
++  fireEvent.click(view.getByTestId("open-team-features"));
++  fireEvent.click(
++    await view.findByRole("button", { name: "일정", exact: true }),
++  );
++  await waitFor(() =>
++    assert.equal(router.state.location.pathname, "/schedule"),
++  );
++  await waitFor(() => assert.ok(view.getByTestId("team-calendar-embedded")));
++  assert.equal(view.queryByRole("dialog"), null);
++  assert.equal(
++    env.calls.some(
++      (call) => call.cmd === "sign_event" || call.cmd === "publish_event",
++    ),
++    false,
++  );
++});
+diff --git a/desktop/src/features/team-schedule/ui/scheduleScreen.jsdom-test.mjs b/desktop/src/features/team-schedule/ui/scheduleScreen.jsdom-test.mjs
+new file mode 100644
+index 000000000..c63acd1ee
+--- /dev/null
++++ b/desktop/src/features/team-schedule/ui/scheduleScreen.jsdom-test.mjs
+@@ -0,0 +1,260 @@
++import assert from "node:assert/strict";
++import { afterEach, mock, test } from "node:test";
++import React from "react";
++import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
++import { ScheduleContent } from "./TeamScheduleView.tsx";
++import {
++  prepareScheduleDom,
++  pubkey,
++  relayUrl,
++  tabA,
++  tabB,
++} from "./scheduleTestSupport.mjs";
++import { readLocalScheduleUrl } from "../lib/scheduleTabs.ts";
++import { scheduleCovered } from "../lib/scheduleGeometry.ts";
++
++let env;
++afterEach(() => {
++  cleanup();
++  env?.client.clear();
++  mock.restoreAll();
++  localStorage.clear();
++  delete globalThis.isTauri;
++});
++function mount(canManage = false, extras = {}) {
++  env = prepareScheduleDom();
++  const props = {
++    pubkey,
++    relayUrl,
++    tabs: { first: tabA, second: tabB },
++    canManage,
++    loading: false,
++    error: false,
++    retry: async () => {},
++    saving: false,
++    save: async () => {},
++    ...extras,
++  };
++  const view = render(React.createElement(ScheduleContent, props), {
++    wrapper: env.Providers,
++  });
++  return { ...view, props };
++}
++function menu(view) {
++  fireEvent.keyDown(view.getByRole("button", { name: "일정 메뉴" }), {
++    key: "ArrowDown",
++    code: "ArrowDown",
++  });
++}
++
++test("member menu has only viewing actions; keyboard menu and local form hide the full-page webview", async () => {
++  const view = mount();
++  assert.equal(
++    view.getByTestId("team-schedule-screen").getAttribute("role"),
++    null,
++  );
++  assert.ok(view.getByTestId("team-calendar-embedded"));
++  fireEvent.click(view.getByRole("button", { name: "일정표", exact: true }));
++  await waitFor(() => assert.equal(env.count("webview_show"), 1));
++  const slot = view.getByTestId("schedule-page-slot");
++  assert.equal(scheduleCovered(slot), false);
++  menu(view);
++  await waitFor(() => assert.equal(view.getAllByRole("menuitem").length, 2));
++  await waitFor(() =>
++    assert.equal(
++      env.calls.filter((c) => c.cmd.startsWith("plugin:webview|")).at(-1).cmd,
++      "plugin:webview|webview_hide",
++    ),
++  );
++  fireEvent.click(view.getByRole("menuitem", { name: "이 기기 주소" }));
++  await waitFor(() =>
++    assert.ok(view.getByLabelText("이 기기에서만 다른 주소로 열기")),
++  );
++  fireEvent.change(view.getByLabelText("이 기기에서만 다른 주소로 열기"), {
++    target: { value: "https://example.com/#device=fixture-secret" },
++  });
++  fireEvent.click(view.getByRole("button", { name: "이 기기에 저장" }));
++  await waitFor(() =>
++    assert.equal(view.queryByLabelText("이 기기에서만 다른 주소로 열기"), null),
++  );
++  assert.match(
++    readLocalScheduleUrl(relayUrl, pubkey, "first"),
++    /fixture-secret/,
++  );
++  await waitFor(() => assert.ok(env.count("webview_show") >= 2));
++  menu(view);
++  await waitFor(() =>
++    assert.ok(view.getByRole("menuitem", { name: "새 창으로 열기" })),
++  );
++  fireEvent.click(view.getByRole("menuitem", { name: "새 창으로 열기" }));
++  await waitFor(() => assert.equal(env.count("create_webview_window"), 1));
++  assert.match(
++    env.calls.find((c) => c.cmd.endsWith("|create_webview_window")).args.options
++      .url,
++    /fixture-secret/,
++  );
++  const creates = env.count("create_webview");
++  fireEvent.click(view.getByRole("button", { name: "새로고침" }));
++  await waitFor(() => assert.equal(env.count("create_webview"), creates + 1));
++  view.unmount();
++  await waitFor(() => assert.ok(env.count("webview_close") >= 2));
++});
++
++test("manager menus edit, reorder atomically and delete; shared form never inherits the device URL", async () => {
++  const saves = [];
++  const view = mount(true, { save: async (changes) => saves.push(changes) });
++  fireEvent.click(view.getByRole("button", { name: "일정표", exact: true }));
++  await waitFor(() => assert.equal(env.count("webview_show"), 1));
++  menu(view);
++  await waitFor(() => assert.equal(view.getAllByRole("menuitem").length, 6));
++  fireEvent.click(view.getByRole("menuitem", { name: "이름·주소 바꾸기" }));
++  await waitFor(() =>
++    assert.equal(view.getByLabelText("팀과 공유할 주소").value, tabA.url),
++  );
++  fireEvent.change(view.getByLabelText("탭 이름"), {
++    target: { value: "바꾼 이름" },
++  });
++  fireEvent.click(view.getByRole("button", { name: "저장", exact: true }));
++  await waitFor(() => assert.equal(saves.length, 1));
++  assert.equal(saves[0][0].title, "바꾼 이름");
++  menu(view);
++  await waitFor(() =>
++    assert.ok(view.getByRole("menuitem", { name: "탭 추가" })),
++  );
++  fireEvent.click(view.getByRole("menuitem", { name: "탭 추가" }));
++  await waitFor(() =>
++    assert.equal(view.getByLabelText("팀과 공유할 주소").value, ""),
++  );
++  fireEvent.click(view.getByRole("button", { name: "취소", exact: true }));
++  menu(view);
++  await waitFor(() =>
++    assert.ok(view.getByRole("menuitem", { name: "순서 바꾸기" })),
++  );
++  fireEvent.click(view.getByRole("menuitem", { name: "순서 바꾸기" }));
++  await waitFor(() =>
++    assert.ok(view.getByRole("form", { name: "순서 바꾸기" })),
++  );
++  fireEvent.click(view.getByRole("button", { name: "촬영표 위로" }));
++  assert.equal(saves.length, 1);
++  fireEvent.click(view.getByRole("button", { name: "저장", exact: true }));
++  await waitFor(() => assert.equal(saves.length, 2));
++  assert.deepEqual(
++    saves[1].map((t) => [t.id, t.order]),
++    [
++      ["second", 0],
++      ["first", 1],
++    ],
++  );
++  menu(view);
++  await waitFor(() =>
++    assert.ok(view.getByRole("menuitem", { name: "탭 삭제" })),
++  );
++  fireEvent.click(view.getByRole("menuitem", { name: "탭 삭제" }));
++  await waitFor(() =>
++    assert.ok(view.getByRole("button", { name: "삭제 확인" })),
++  );
++  fireEvent.click(view.getByRole("button", { name: "삭제 확인" }));
++  await waitFor(() => assert.equal(saves.length, 3));
++  assert.equal(saves[2][0].deleted, true);
++});
++
++test("calendar switch, covering dialog, tab deletion and leaving schedule retire the native view", async () => {
++  const view = mount(true);
++  fireEvent.click(view.getByRole("button", { name: "일정표", exact: true }));
++  await waitFor(() => assert.equal(env.count("webview_show"), 1));
++  const modal = document.createElement("div");
++  modal.setAttribute("role", "dialog");
++  document.body.append(modal);
++  await waitFor(() =>
++    assert.equal(
++      env.calls.filter((c) => c.cmd.startsWith("plugin:webview|")).at(-1).cmd,
++      "plugin:webview|webview_hide",
++    ),
++  );
++  modal.remove();
++  await waitFor(() => assert.equal(env.count("webview_show"), 2));
++  fireEvent.click(view.getByRole("button", { name: "팀 캘린더", exact: true }));
++  await waitFor(() =>
++    assert.equal(
++      env.calls.filter((c) => c.cmd.startsWith("plugin:webview|")).at(-1).cmd,
++      "plugin:webview|webview_hide",
++    ),
++  );
++  const reads = env.queries.length;
++  fireEvent.click(view.getByRole("button", { name: "새로고침" }));
++  await waitFor(() => assert.ok(env.queries.length >= reads + 4));
++  assert.equal(
++    env.calls.some((c) => c.cmd === "sign_event"),
++    false,
++  );
++  fireEvent.click(view.getByRole("button", { name: "일정표", exact: true }));
++  await waitFor(() => assert.equal(env.count("webview_show"), 3));
++  view.rerender(
++    React.createElement(ScheduleContent, {
++      ...view.props,
++      tabs: { second: tabB },
++      canManage: false,
++    }),
++  );
++  await waitFor(() => assert.ok(view.getByTestId("team-calendar-embedded")));
++  await waitFor(() =>
++    assert.equal(
++      env.calls.filter((c) => c.cmd.startsWith("plugin:webview|")).at(-1).cmd,
++      "plugin:webview|webview_hide",
++    ),
++  );
++  view.unmount();
++  await waitFor(() => assert.equal(env.count("webview_close"), 1));
++});
++
++test("calendar refresh is read-only, ignores stale reads and keeps a failed refresh visible for retry", async () => {
++  const { useTeamCalendarMonth } = await import(
++    "@/features/team-calendar/lib/useTeamCalendar.ts"
++  );
++  const pending = [];
++  env = prepareScheduleDom(
++    () => new Promise((resolve, reject) => pending.push({ resolve, reject })),
++  );
++  function Month() {
++    const state = useTeamCalendarMonth(pubkey, relayUrl, "2026-11");
++    return React.createElement(
++      "div",
++      null,
++      React.createElement(
++        "span",
++        { "data-testid": "calendar-status" },
++        state.status,
++      ),
++      React.createElement(
++        "button",
++        { type: "button", onClick: state.refresh },
++        "달력 새로 읽기",
++      ),
++    );
++  }
++  const view = render(React.createElement(Month));
++  await waitFor(() => assert.equal(pending.length, 1));
++  fireEvent.click(view.getByRole("button", { name: "달력 새로 읽기" }));
++  assert.equal(pending.length, 2);
++  pending[1].resolve([]);
++  await waitFor(() =>
++    assert.equal(view.getByTestId("calendar-status").textContent, "ready"),
++  );
++  pending[0].reject(Error("old request failed"));
++  await new Promise((resolve) => setTimeout(resolve, 10));
++  assert.equal(view.getByTestId("calendar-status").textContent, "ready");
++  fireEvent.click(view.getByRole("button", { name: "달력 새로 읽기" }));
++  pending[2].reject(Error("offline"));
++  await waitFor(() =>
++    assert.equal(view.getByTestId("calendar-status").textContent, "error"),
++  );
++  fireEvent.click(view.getByRole("button", { name: "달력 새로 읽기" }));
++  pending[3].resolve([]);
++  await waitFor(() =>
++    assert.equal(view.getByTestId("calendar-status").textContent, "ready"),
++  );
++  assert.equal(
++    env.calls.some((c) => c.cmd === "sign_event" || c.cmd === "publish_event"),
++    false,
++  );
++});
+diff --git a/desktop/src/features/team-schedule/ui/scheduleTestSupport.mjs b/desktop/src/features/team-schedule/ui/scheduleTestSupport.mjs
+new file mode 100644
+index 000000000..628c3289c
+--- /dev/null
++++ b/desktop/src/features/team-schedule/ui/scheduleTestSupport.mjs
+@@ -0,0 +1,121 @@
++import { mock } from "node:test";
++import React from "react";
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { CommunitiesProvider } from "@/features/communities/useCommunities";
++import { ThemeProvider } from "@/shared/theme/ThemeProvider";
++import { relayClient } from "@/shared/api/relayClient";
++
++export const pubkey = "a".repeat(64);
++export const relayUrl = "wss://relay.example.com";
++export const tabA = {
++  id: "first",
++  title: "일정표",
++  url: "https://example.com/first",
++  order: 0,
++  updatedAt: 1,
++  updatedBy: pubkey,
++};
++export const tabB = {
++  ...tabA,
++  id: "second",
++  title: "촬영표",
++  url: "https://example.com/second",
++  order: 1,
++};
++export function prepareScheduleDom(fetchEvents = async () => []) {
++  globalThis.addEventListener = window.addEventListener.bind(window);
++  globalThis.removeEventListener = window.removeEventListener.bind(window);
++  globalThis.scrollTo = window.scrollTo = () => {};
++  const calls = [];
++  const queries = [];
++  localStorage.setItem(
++    "buzz-communities",
++    JSON.stringify([{ id: "fixture", name: "테스트", relayUrl }]),
++  );
++  localStorage.setItem("buzz-active-community-id", "fixture");
++  window.matchMedia = () => ({
++    matches: false,
++    addEventListener() {},
++    removeEventListener() {},
++  });
++  window.HTMLElement.prototype.scrollIntoView = () => {};
++  window.HTMLElement.prototype.scrollTo = () => {};
++  window.HTMLElement.prototype.hasPointerCapture = () => false;
++  window.HTMLElement.prototype.releasePointerCapture = () => {};
++  globalThis.ResizeObserver = class {
++    observe() {}
++    unobserve() {}
++    disconnect() {}
++  };
++  globalThis.requestAnimationFrame = window.requestAnimationFrame = (cb) =>
++    setTimeout(cb, 0);
++  globalThis.cancelAnimationFrame = window.cancelAnimationFrame = clearTimeout;
++  Object.defineProperty(document, "hidden", {
++    configurable: true,
++    value: false,
++  });
++  mock.method(HTMLElement.prototype, "getBoundingClientRect", () => ({
++    x: 260,
++    y: 90,
++    width: 800,
++    height: 550,
++    top: 90,
++    left: 260,
++    right: 1060,
++    bottom: 640,
++  }));
++  globalThis.isTauri = true;
++  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
++  window.__TAURI_INTERNALS__ = {
++    metadata: { currentWindow: { label: "main" } },
++    transformCallback: () => 1,
++    invoke: async (cmd, args) => {
++      calls.push({ cmd, args });
++      if (cmd === "plugin:window|scale_factor") return window.devicePixelRatio;
++      if (cmd === "get_identity") return { pubkey, display_name: "테스트" };
++      if (cmd === "get_users_batch") return { profiles: {}, missing: [] };
++      if (cmd === "list_channels") return [];
++      if (cmd === "plugin:window|get_all_windows") return [];
++      return null;
++    },
++  };
++  mock.method(relayClient, "fetchEvents", async (filter) => {
++    queries.push(filter);
++    return fetchEvents(filter);
++  });
++  mock.method(
++    relayClient,
++    "fetchFirstEvent",
++    async (filter) => (await fetchEvents(filter))[0] ?? null,
++  );
++  mock.method(relayClient, "subscribeLive", async () => async () => {});
++  mock.method(relayClient, "subscribeToReconnects", () => () => {});
++  mock.method(relayClient, "publishEvent", () => {
++    throw new Error("unexpected publish");
++  });
++  const client = new QueryClient({
++    defaultOptions: {
++      queries: { retry: false, staleTime: Infinity, gcTime: Infinity },
++    },
++  });
++  client.setQueryData(["identity"], { pubkey, displayName: "테스트" });
++  function Providers({ children }) {
++    return React.createElement(
++      QueryClientProvider,
++      { client },
++      React.createElement(
++        CommunitiesProvider,
++        null,
++        React.createElement(ThemeProvider, null, children),
++      ),
++    );
++  }
++  return {
++    calls,
++    queries,
++    client,
++    Providers,
++    count: (suffix) =>
++      calls.filter((call) => call.cmd === `plugin:webview|${suffix}`).length,
++  };
++}
+diff --git a/desktop/tests/e2e/team12.spec.ts b/desktop/tests/e2e/team12.spec.ts
+new file mode 100644
+index 000000000..c6bfe6a34
+--- /dev/null
++++ b/desktop/tests/e2e/team12.spec.ts
+@@ -0,0 +1,122 @@
++import { expect, test, type Page } from "@playwright/test";
++import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
++
++async function start(page: Page, role: "owner" | "member" = "member") {
++  await page.addInitScript(
++    (pubkeys) => {
++      for (const pubkey of pubkeys)
++        localStorage.setItem(
++          `buzz-team-welcome:${pubkey}:ws://localhost:3000`,
++          JSON.stringify({ welcomed: true, attempted: [] }),
++        );
++    },
++    [
++      "deadbeef".repeat(8),
++      ...Object.values(TEST_IDENTITIES).map(({ pubkey }) => pubkey),
++    ],
++  );
++  await installMockBridge(page, { relayRole: role });
++  await page.goto("/");
++  await expect(page.getByTestId("open-team-features")).toBeVisible();
++}
++
++async function openHub(page: Page) {
++  await page.getByTestId("open-team-features").click();
++  return page.getByTestId("team-feature-hub");
++}
++
++test("six tiles and keyboard navigation open the full schedule while retaining the calendar dialog", async ({
++  page,
++}) => {
++  await start(page);
++  const hub = await openHub(page);
++  for (const name of [
++    "일정",
++    "회의 시작",
++    "채널 파일",
++    "주간 공지",
++    "알림 설정",
++    "사용법",
++  ])
++    await expect(hub.getByRole("button", { name, exact: true })).toBeVisible();
++  await hub.getByRole("button", { name: "일정", exact: true }).focus();
++  await page.keyboard.press("Enter");
++  const schedule = page.getByTestId("team-schedule-screen");
++  await expect(schedule).toBeVisible();
++  await expect(schedule.getByTestId("team-calendar-embedded")).toBeVisible();
++  await expect(
++    schedule.getByRole("tab", { name: "스프린트", exact: true }),
++  ).toHaveAttribute("aria-selected", "true");
++  await schedule
++    .getByRole("button", { name: "일정 메뉴", exact: true })
++    .click();
++  await expect(
++    page.getByRole("menuitem", { name: "탭 추가", exact: true }),
++  ).toHaveCount(0);
++  await page.keyboard.press("Escape");
++  await page.getByTestId("open-team-calendar").click();
++  await expect(page.getByTestId("team-calendar-dialog")).toBeVisible();
++});
++
++test("hub retains digest, settings and help actions", async ({ page }) => {
++  await start(page);
++  let hub = await openHub(page);
++  await hub.getByRole("button", { name: "주간 공지", exact: true }).click();
++  await expect(page.getByTestId("team-calendar-digest")).toBeVisible();
++  await page.keyboard.press("Escape");
++  hub = await openHub(page);
++  await hub.getByRole("button", { name: "알림 설정", exact: true }).click();
++  await expect(page.getByTestId("settings-panel-notifications")).toBeVisible();
++  await page.keyboard.press("Escape");
++  hub = await openHub(page);
++  await hub.getByRole("button", { name: "사용법", exact: true }).click();
++  await expect(
++    page.getByRole("button", { name: "처음 안내 다시 보기", exact: true }),
++  ).toBeVisible();
++});
++
++test("owner can add a shared https schedule tab through the real signed-event seam", async ({
++  page,
++}) => {
++  await start(page, "owner");
++  await page.getByTestId("open-team-schedule").click();
++  const schedule = page.getByTestId("team-schedule-screen");
++  await schedule
++    .getByRole("button", { name: "일정 메뉴", exact: true })
++    .click();
++  await page.getByRole("menuitem", { name: "탭 추가", exact: true }).click();
++  await schedule.getByLabel("탭 이름", { exact: true }).fill("일정표");
++  await schedule
++    .getByLabel("팀과 공유할 주소", { exact: true })
++    .fill("https://example.com/schedule");
++  await schedule.getByRole("button", { name: "저장", exact: true }).click();
++  await expect
++    .poll(() =>
++      page.evaluate(
++        () =>
++          window.__BUZZ_E2E_SIGNED_EVENTS__?.filter(
++            (event) =>
++              event.kind === 30078 &&
++              event.tags.some(
++                ([name, value]) =>
++                  name === "d" && value?.startsWith("team-schedule-tabs:"),
++              ),
++          ).length ?? 0,
++      ),
++    )
++    .toBe(1);
++  const content = await page.evaluate(
++    () =>
++      window.__BUZZ_E2E_SIGNED_EVENTS__?.find((event) =>
++        event.tags.some(
++          ([name, value]) =>
++            name === "d" && value?.startsWith("team-schedule-tabs:"),
++        ),
++      )?.content,
++  );
++  expect(JSON.parse(content ?? "{}").tabs[0]).toMatchObject({
++    title: "일정표",
++    url: "https://example.com/schedule",
++  });
++  expect(content).not.toContain("localUrl");
++});

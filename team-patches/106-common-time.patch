@@ -1,0 +1,1157 @@
+diff --git a/desktop/src/features/team-calendar/lib/commonTime.test.mjs b/desktop/src/features/team-calendar/lib/commonTime.test.mjs
+new file mode 100644
+index 000000000..f2dad30b2
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/commonTime.test.mjs
+@@ -0,0 +1,190 @@
++import assert from "node:assert/strict";
++import test from "node:test";
++import {
++  compareCommonTime,
++  findCommonTime,
++  koreanToday,
++} from "./commonTime.ts";
++
++const person = (id, rules = [], extras = {}) => ({
++  id,
++  name: id,
++  rules,
++  updatedAt: 1,
++  updatedBy: "a".repeat(64),
++  ...extras,
++});
++const rule = (kind, start, end, extras = {}) => ({
++  id: kind,
++  kind,
++  start,
++  end,
++  title: `${kind} 일정`,
++  startDate: "2026-11-06",
++  endDate: "2026-11-06",
++  weekday: null,
++  exclude: [],
++  ...extras,
++});
++const options = {
++  from: "2026-11-06",
++  through: "2026-11-06",
++  start: 540,
++  end: 720,
++  duration: 60,
++};
++const search = (people, extra = {}) =>
++  findCommonTime(people, { ...options, ...extra });
++
++test("complete duration is checked, including a one-minute conflict in the middle", () => {
++  const result = search([person("A", [rule("busy", 571, 572)])]);
++  assert.equal(result.slots[0].people[0].status, "busy");
++  assert.equal(result.slots[1].people[0].status, "busy");
++  assert.equal(result.slots[2].people[0].status, "available");
++  assert.equal(result.slots[0].people[0].rules[0].title, "busy 일정");
++});
++
++test("half-open intervals permit meetings at the exact end and before the next start", () => {
++  const result = search(
++    [person("A", [rule("busy", 540, 1080), rule("busy", 1140, 1200)])],
++    { start: 1080, end: 1200 },
++  );
++  assert.equal(result.slots[0].available, 1); // 18:00–19:00
++  assert.equal(result.slots[1].available, 0); // 18:30–19:30
++  assert.equal(result.slots[2].available, 0); // 19:00–20:00
++});
++
++test("busy > tentative > available; blank time is available, with all overlapping titles retained", () => {
++  for (const [rules, expected] of [
++    [[], "available"],
++    [[rule("available", 540, 600)], "available"],
++    [[rule("available", 540, 600), rule("tentative", 555, 556)], "tentative"],
++    [
++      [
++        rule("available", 540, 600),
++        rule("tentative", 540, 600),
++        rule("busy", 599, 600),
++      ],
++      "busy",
++    ],
++  ]) {
++    const slot = search([person("A", rules)]).slots[0];
++    assert.equal(slot.people[0].status, expected);
++    assert.equal(slot.people[0].rules.length, rules.length);
++  }
++});
++
++test("existing recurrence matcher honors weekday, both period boundaries, exclusions and daily rules", () => {
++  const weekly = rule("busy", 0, 1440, {
++    startDate: "2026-11-06",
++    endDate: "2026-11-20",
++    weekday: 5,
++    exclude: ["2026-11-13"],
++  });
++  const result = search([person("A", [weekly])], {
++    from: "2026-11-05",
++    through: "2026-11-21",
++    end: 600,
++  });
++  const busyDates = result.slots
++    .filter((slot) => !slot.available)
++    .map((slot) => slot.date);
++  assert.deepEqual(busyDates, ["2026-11-06", "2026-11-20"]);
++  const daily = search(
++    [person("A", [rule("tentative", 0, 1440, { endDate: "2026-11-07" })])],
++    { through: "2026-11-08", end: 600 },
++  );
++  assert.deepEqual(
++    daily.slots.map((slot) => slot.people[0].status),
++    ["tentative", "tentative", "available"],
++  );
++});
++
++test("required attendees are always targeted and must be fully available, including tentative", () => {
++  const people = [
++    person("A", [rule("tentative", 540, 600)]),
++    person("B", [rule("busy", 600, 720)]),
++    person("C", [], { deleted: true }),
++  ];
++  const result = search(people, { targetIds: ["B", "C"], requiredIds: ["A"] });
++  assert.equal(result.slots[0].requiredAvailable, false);
++  assert.equal(result.slots[2].requiredAvailable, true);
++  assert.deepEqual(
++    result.slots[0].people.map((member) => member.person.id),
++    ["A", "B"],
++  );
++  assert.equal(result.recommendations[0].start, 600);
++  assert.throws(
++    () => search(people, { requiredIds: ["missing"] }),
++    /필수 인원/,
++  );
++});
++
++test("ranking is required available, more available, fewer tentative, date then time; at most eight", () => {
++  const slot = (
++    date,
++    start,
++    available,
++    tentative,
++    requiredAvailable = true,
++  ) => ({
++    date,
++    start,
++    end: start + 60,
++    available,
++    tentative,
++    requiredAvailable,
++    people: [],
++  });
++  const first = slot("2026-11-06", 540, 2, 0);
++  const later = slot("2026-11-06", 570, 2, 0);
++  const tomorrow = slot("2026-11-07", 540, 2, 0);
++  const tentative = slot("2026-11-06", 540, 2, 1);
++  const fewer = slot("2026-11-06", 540, 1, 0);
++  const blocked = slot("2026-11-06", 540, 3, 0, false);
++  assert.deepEqual(
++    [blocked, tomorrow, tentative, fewer, later, first].sort(compareCommonTime),
++    [first, later, tomorrow, tentative, fewer, blocked],
++  );
++  const result = search([person("A")], { through: "2026-11-07" });
++  assert.equal(result.recommendations.length, 8);
++  assert.deepEqual(result.recommendations, result.slots.slice(0, 8));
++});
++
++test("all 30-minute starts cover the chosen duration; midnight remains an exclusive 24:00 end", () => {
++  const result = search([person("A")], {
++    start: 1380,
++    end: 1440,
++    duration: 30,
++  });
++  assert.deepEqual(
++    result.slots.map(({ start, end }) => [start, end]),
++    [
++      [1380, 1410],
++      [1410, 1440],
++    ],
++  );
++  assert.equal(result.recommendations.length, 2);
++});
++
++test("Korean today is stable across UTC midnight and computers in other time zones", () => {
++  assert.equal(koreanToday(new Date("2026-11-05T14:59:59Z")), "2026-11-05");
++  assert.equal(koreanToday(new Date("2026-11-05T15:00:00Z")), "2026-11-06");
++});
++
++test("invalid dates, empty targets and excessive searches fail explicitly", () => {
++  for (const extra of [
++    { from: "" },
++    { from: "2026-02-30" },
++    { through: "2026-11-05" },
++    { through: "2026-12-07" },
++    { duration: 0 },
++    { duration: 45 },
++    { start: -30 },
++    { end: 1441 },
++    { duration: 240 },
++    { targetIds: [] },
++  ])
++    assert.throws(() => search([person("A")], extra));
++  assert.throws(() => search([]), /대상 인원/);
++});
+diff --git a/desktop/src/features/team-calendar/lib/commonTime.ts b/desktop/src/features/team-calendar/lib/commonTime.ts
+new file mode 100644
+index 000000000..f70ded580
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/commonTime.ts
+@@ -0,0 +1,159 @@
++import {
++  type AvailabilityRule,
++  type RuleKind,
++  type TeamPerson,
++  ruleAppliesOn,
++} from "./teamAvailability";
++import { addDays, daysBetween } from "./teamCalendar";
++
++/** Bounds the interactive search to at most 31 days and 48 starts per day. */
++export const MAX_COMMON_TIME_DAYS = 31;
++
++/** All dates and wall-clock minutes are interpreted in Korean time. */
++export type CommonTimeOptions = {
++  from: string;
++  through: string;
++  duration: number;
++  start: number;
++  end: number;
++  targetIds?: string[];
++  requiredIds?: string[];
++};
++
++/** One person's status for the complete interval, with all overlapping rules. */
++export type CommonTimePerson = {
++  person: TeamPerson;
++  status: RuleKind;
++  rules: AvailabilityRule[];
++};
++
++/** One candidate interval; unlisted time counts as available. */
++export type CommonTimeSlot = {
++  date: string;
++  start: number;
++  end: number;
++  people: CommonTimePerson[];
++  available: number;
++  tentative: number;
++  requiredAvailable: boolean;
++};
++
++/** Korean today's date, independent of the computer's time zone. */
++export function koreanToday(now: Date = new Date()): string {
++  return new Date(now.getTime() + 9 * 60 * 60 * 1_000)
++    .toISOString()
++    .slice(0, 10);
++}
++
++const validDate = (date: string) =>
++  /^\d{4}-\d{2}-\d{2}$/.test(date) && addDays(date, 0) === date;
++
++/** Why a search cannot run, or null. Also used by the form. */
++export function commonTimeError(options: CommonTimeOptions): string | null {
++  if (!validDate(options.from) || !validDate(options.through))
++    return "날짜를 확인해 주세요.";
++  const days = daysBetween(options.from, options.through) + 1;
++  if (days < 1 || days > MAX_COMMON_TIME_DAYS)
++    return `기간은 1~${MAX_COMMON_TIME_DAYS}일로 골라 주세요.`;
++  if (
++    ![options.duration, options.start, options.end].every(
++      (value) => Number.isInteger(value) && value % 30 === 0,
++    ) ||
++    options.duration < 30 ||
++    options.start < 0 ||
++    options.end > 1_440 ||
++    options.start + options.duration > options.end
++  )
++    return "필요한 시간과 찾을 시간대를 확인해 주세요.";
++  return null;
++}
++
++/** Required attendees first, then available count, fewer tentative, earlier. */
++export function compareCommonTime(
++  a: CommonTimeSlot,
++  b: CommonTimeSlot,
++): number {
++  return (
++    Number(b.requiredAvailable) - Number(a.requiredAvailable) ||
++    b.available - a.available ||
++    a.tentative - b.tentative ||
++    a.date.localeCompare(b.date) ||
++    a.start - b.start
++  );
++}
++
++/**
++ * Searches every 30-minute start using the existing availability recurrence
++ * matcher. Intervals are half-open: an event ending at 18:00 does not block
++ * a meeting starting at 18:00. Busy overrides tentative, then available.
++ * Required people are always included in the target group.
++ */
++export function findCommonTime(
++  people: TeamPerson[],
++  options: CommonTimeOptions,
++): {
++  dates: string[];
++  slots: CommonTimeSlot[];
++  recommendations: CommonTimeSlot[];
++} {
++  const problem = commonTimeError(options);
++  if (problem) throw new Error(problem);
++  const required = new Set(options.requiredIds ?? []);
++  const targets = options.targetIds ? new Set(options.targetIds) : null;
++  const active = people.filter(
++    (person) =>
++      !person.deleted &&
++      (!targets || targets.has(person.id) || required.has(person.id)),
++  );
++  if (!active.length) throw new Error("대상 인원을 골라 주세요.");
++  if ([...required].some((id) => !active.some((person) => person.id === id)))
++    throw new Error("필수 인원을 다시 골라 주세요.");
++  const dates = Array.from(
++    { length: daysBetween(options.from, options.through) + 1 },
++    (_, index) => addDays(options.from, index),
++  );
++  const slots: CommonTimeSlot[] = [];
++  for (const date of dates) {
++    const daily = active.map((person) => ({
++      person,
++      rules: person.rules.filter((rule) => ruleAppliesOn(rule, date)),
++    }));
++    for (
++      let start = options.start;
++      start + options.duration <= options.end;
++      start += 30
++    ) {
++      const end = start + options.duration;
++      const members: CommonTimePerson[] = daily.map(({ person, rules }) => {
++        const overlapping = rules.filter(
++          (rule) => rule.start < end && rule.end > start,
++        );
++        const status = overlapping.some((rule) => rule.kind === "busy")
++          ? "busy"
++          : overlapping.some((rule) => rule.kind === "tentative")
++            ? "tentative"
++            : "available";
++        return { person, rules: overlapping, status };
++      });
++      slots.push({
++        date,
++        start,
++        end,
++        people: members,
++        available: members.filter((member) => member.status === "available")
++          .length,
++        tentative: members.filter((member) => member.status === "tentative")
++          .length,
++        requiredAvailable: members.every(
++          (member) =>
++            !required.has(member.person.id) || member.status === "available",
++        ),
++      });
++    }
++  }
++  return {
++    dates,
++    slots,
++    recommendations: [...slots].sort(compareCommonTime).slice(0, 8),
++  };
++}
+diff --git a/desktop/src/features/team-calendar/ui/CommonTimePanel.tsx b/desktop/src/features/team-calendar/ui/CommonTimePanel.tsx
+new file mode 100644
+index 000000000..a0be70d7b
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/CommonTimePanel.tsx
+@@ -0,0 +1,383 @@
++import * as React from "react";
++
++import {
++  type CommonTimeSlot,
++  commonTimeError,
++  findCommonTime,
++  koreanToday,
++} from "../lib/commonTime";
++import {
++  RULE_KIND_SHORT,
++  type TeamPerson,
++  minuteLabel,
++} from "../lib/teamAvailability";
++import { addDays } from "../lib/teamCalendar";
++import { cn } from "@/shared/lib/cn";
++import { Button } from "@/shared/ui/button";
++import { Input } from "@/shared/ui/input";
++import { SELECT_CLASS } from "./EntryForm";
++
++const slotKey = (slot: CommonTimeSlot) => `${slot.date}/${slot.start}`;
++const slotLabel = (slot: CommonTimeSlot) =>
++  `${slot.date} ${minuteLabel(slot.start)}~${minuteLabel(slot.end)}`;
++const timeChoices = Array.from({ length: 49 }, (_, index) => index * 30);
++const cellColor = (available: number, total: number) =>
++  available === total
++    ? "bg-primary/40"
++    : available === 0
++      ? "bg-muted"
++      : available / total >= 0.5
++        ? "bg-primary/25"
++        : "bg-primary/10";
++
++/** Searches the shared team schedules; creating an entry only opens a draft. */
++export function CommonTimePanel({
++  people,
++  onPick,
++}: {
++  people: TeamPerson[];
++  onPick: (slot: CommonTimeSlot) => void;
++}) {
++  const [from, setFrom] = React.useState(koreanToday);
++  const [through, setThrough] = React.useState(() =>
++    addDays(koreanToday(), 13),
++  );
++  const [duration, setDuration] = React.useState(60);
++  const [start, setStart] = React.useState(540);
++  const [end, setEnd] = React.useState(1_320);
++  const [targetIds, setTargetIds] = React.useState<string[] | null>(null);
++  const [requiredIds, setRequiredIds] = React.useState<string[]>([]);
++  const [selected, setSelected] = React.useState<string | null>(null);
++  const targets = people.filter(
++    (person) => !targetIds || targetIds.includes(person.id),
++  );
++  const required = requiredIds.filter((id) =>
++    targets.some((person) => person.id === id),
++  );
++  const options = {
++    from,
++    through,
++    duration,
++    start,
++    end,
++    targetIds: targets.map((person) => person.id),
++    requiredIds: required,
++  };
++  const problem =
++    commonTimeError(options) ??
++    (targets.length ? null : "대상 인원을 골라 주세요.");
++  const targetKey = options.targetIds.join(",");
++  const requiredKey = required.join(",");
++  const result = React.useMemo(
++    () =>
++      problem
++        ? null
++        : findCommonTime(people, {
++            from,
++            through,
++            duration,
++            start,
++            end,
++            targetIds: targetKey.split(","),
++            requiredIds: requiredKey ? requiredKey.split(",") : [],
++          }),
++    [
++      people,
++      problem,
++      from,
++      through,
++      duration,
++      start,
++      end,
++      targetKey,
++      requiredKey,
++    ],
++  );
++  const detail = result?.slots.find((slot) => slotKey(slot) === selected);
++  const rows = result?.slots.filter((slot) => slot.date === from) ?? [];
++  const byKey = new Map(result?.slots.map((slot) => [slotKey(slot), slot]));
++  const headingId = React.useId();
++
++  const toggleTarget = (id: string) => {
++    const current = targets.map((person) => person.id);
++    setTargetIds(
++      current.includes(id)
++        ? current.filter((value) => value !== id)
++        : [...current, id],
++    );
++    setRequiredIds(required.filter((value) => value !== id));
++  };
++
++  return (
++    <section
++      aria-labelledby={headingId}
++      className="space-y-4 rounded-xl border border-border/70 p-4"
++      data-testid="common-time-panel"
++    >
++      <div>
++        <h3 className="text-sm font-semibold" id={headingId}>
++          함께 되는 시간 찾기
++        </h3>
++        <p className="text-xs text-muted-foreground">
++          한국시간 · 등록하지 않은 시간은 가능으로 봅니다.
++        </p>
++      </div>
++      <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
++        <label htmlFor={`${headingId}-from`} className="space-y-1 text-xs">
++          시작 날짜
++          <Input
++            id={`${headingId}-from`}
++            type="date"
++            value={from}
++            onChange={(event) => setFrom(event.target.value)}
++          />
++        </label>
++        <label htmlFor={`${headingId}-through`} className="space-y-1 text-xs">
++          종료 날짜
++          <Input
++            id={`${headingId}-through`}
++            type="date"
++            value={through}
++            onChange={(event) => setThrough(event.target.value)}
++          />
++        </label>
++        <label className="space-y-1 text-xs">
++          필요한 시간
++          <select
++            className={SELECT_CLASS}
++            value={duration}
++            onChange={(event) => setDuration(Number(event.target.value))}
++          >
++            {timeChoices.slice(1).map((value) => (
++              <option key={value} value={value}>
++                {value}분
++              </option>
++            ))}
++          </select>
++        </label>
++        <label className="space-y-1 text-xs">
++          찾을 시작 시간
++          <select
++            className={SELECT_CLASS}
++            value={start}
++            onChange={(event) => setStart(Number(event.target.value))}
++          >
++            {timeChoices.slice(0, -1).map((value) => (
++              <option key={value} value={value}>
++                {minuteLabel(value)}
++              </option>
++            ))}
++          </select>
++        </label>
++        <label className="space-y-1 text-xs">
++          찾을 종료 시간
++          <select
++            className={SELECT_CLASS}
++            value={end}
++            onChange={(event) => setEnd(Number(event.target.value))}
++          >
++            {timeChoices.slice(1).map((value) => (
++              <option key={value} value={value}>
++                {minuteLabel(value)}
++              </option>
++            ))}
++          </select>
++        </label>
++      </div>
++      <fieldset className="space-y-2">
++        <legend className="text-xs font-semibold">대상 인원</legend>
++        <Button
++          size="xs"
++          variant="outline"
++          type="button"
++          onClick={() => setTargetIds(null)}
++        >
++          전원 선택
++        </Button>
++        <div className="flex flex-wrap gap-3">
++          {people.map((person) => (
++            <label
++              key={person.id}
++              className="flex items-center gap-1.5 text-xs"
++            >
++              <input
++                type="checkbox"
++                checked={targets.some((target) => target.id === person.id)}
++                onChange={() => toggleTarget(person.id)}
++              />
++              {person.name}
++              {person.role ? ` · ${person.role}` : ""}
++            </label>
++          ))}
++        </div>
++      </fieldset>
++      <fieldset className="space-y-2">
++        <legend className="text-xs font-semibold">꼭 와야 하는 인원</legend>
++        <div className="flex flex-wrap gap-3">
++          {targets.map((person) => (
++            <label
++              key={person.id}
++              className="flex items-center gap-1.5 text-xs"
++            >
++              <input
++                type="checkbox"
++                checked={required.includes(person.id)}
++                onChange={() =>
++                  setRequiredIds(
++                    required.includes(person.id)
++                      ? required.filter((id) => id !== person.id)
++                      : [...required, person.id],
++                  )
++                }
++              />
++              {person.name}
++            </label>
++          ))}
++        </div>
++      </fieldset>
++      {problem ? (
++        <p role="alert" className="text-sm text-destructive">
++          {problem}
++        </p>
++      ) : null}
++      {result ? (
++        <>
++          <section aria-label="추천 시간" className="space-y-2">
++            <h4 className="text-sm font-semibold">추천 시간</h4>
++            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
++              {result.recommendations.map((slot) => (
++                <div
++                  key={slotKey(slot)}
++                  className="space-y-2 rounded-lg border border-border p-3"
++                >
++                  <button
++                    type="button"
++                    aria-pressed={slotKey(slot) === selected}
++                    onClick={() => setSelected(slotKey(slot))}
++                    className="w-full space-y-1 rounded text-left focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
++                  >
++                    <span className="block text-xs font-semibold">
++                      {slotLabel(slot)}
++                    </span>
++                    <span className="block text-xs">
++                      가능 {slot.available}/{slot.people.length}명 · 조율{" "}
++                      {slot.tentative}명
++                    </span>
++                    <span className="block text-2xs text-muted-foreground">
++                      {slot.requiredAvailable
++                        ? required.length
++                          ? "필수 인원 전원 가능"
++                          : "명단 보기"
++                        : "필수 인원 불가·조율 있음"}
++                    </span>
++                  </button>
++                  <Button
++                    size="xs"
++                    type="button"
++                    variant="outline"
++                    onClick={() => onPick(slot)}
++                  >
++                    이 시간으로 일정 만들기
++                  </Button>
++                </div>
++              ))}
++            </div>
++          </section>
++          {detail ? (
++            <section
++              aria-label="시간별 명단"
++              className="space-y-2 rounded-lg border border-border p-3"
++              aria-live="polite"
++            >
++              <h4 className="text-sm font-semibold">{slotLabel(detail)}</h4>
++              {(["available", "busy", "tentative"] as const).map((kind) => (
++                <div key={kind}>
++                  <h5 className="text-xs font-semibold">
++                    {RULE_KIND_SHORT[kind]}{" "}
++                    {
++                      detail.people.filter((member) => member.status === kind)
++                        .length
++                    }
++                    명
++                  </h5>
++                  <ul className="space-y-1 text-xs">
++                    {detail.people
++                      .filter((member) => member.status === kind)
++                      .map(({ person, rules }) => (
++                        <li key={person.id}>
++                          {person.name}
++                          {required.includes(person.id) ? " · 필수" : ""} —{" "}
++                          {rules.length
++                            ? rules.map((rule) => rule.title).join(", ")
++                            : "등록된 일정 없음"}
++                        </li>
++                      ))}
++                  </ul>
++                </div>
++              ))}
++            </section>
++          ) : null}
++          <div className="max-h-[32rem] overflow-auto rounded-lg border border-border">
++            <table className="w-full border-collapse text-xs">
++              <caption className="p-2 text-left text-muted-foreground">
++                30분마다 시작 · {duration}분 전체 기준 · 색이 진할수록 가능
++                인원이 많아요. 칸을 누르면 명단이 열립니다.
++              </caption>
++              <thead>
++                <tr>
++                  <th scope="col" className="sticky left-0 bg-background p-2">
++                    시작
++                  </th>
++                  {result.dates.map((date) => (
++                    <th
++                      scope="col"
++                      key={date}
++                      className="min-w-24 whitespace-nowrap p-2"
++                    >
++                      {date}
++                    </th>
++                  ))}
++                </tr>
++              </thead>
++              <tbody>
++                {rows.map((row) => (
++                  <tr key={row.start}>
++                    <th scope="row" className="sticky left-0 bg-background p-2">
++                      {minuteLabel(row.start)}
++                    </th>
++                    {result.dates.map((date) => {
++                      const slot = byKey.get(`${date}/${row.start}`);
++                      return (
++                        <td key={date} className="p-0.5">
++                          {slot ? (
++                            <button
++                              type="button"
++                              aria-pressed={selected === slotKey(slot)}
++                              aria-label={`${slotLabel(slot)} · 가능 ${slot.available}/${slot.people.length}명${slot.requiredAvailable ? "" : " · 필수 인원 불가·조율"}`}
++                              className={cn(
++                                "w-full rounded p-2 text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
++                                cellColor(slot.available, slot.people.length),
++                              )}
++                              onClick={() => setSelected(slotKey(slot))}
++                            >
++                              {slot.available}/{slot.people.length}
++                              {slot.requiredAvailable ? "" : " *"}
++                            </button>
++                          ) : null}
++                        </td>
++                      );
++                    })}
++                  </tr>
++                ))}
++              </tbody>
++            </table>
++          </div>
++          <p className="text-2xs text-muted-foreground">
++            * 필수 인원 불가·조율 있음 · 일정 만들기는 입력창만 열고, 저장은
++            직접 눌러 주세요.
++          </p>
++        </>
++      ) : null}
++    </section>
++  );
++}
+diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+index 20cd60728..55eca5e44 100644
+--- a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
++++ b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+@@ -16,6 +16,7 @@ import { availabilityOn } from "@/features/team-calendar/lib/teamAvailability";
+ import {
+   type CalendarColor,
+   type CalendarOccurrence,
++  addDays,
+   entriesOnDate,
+   expandRepeats,
+   isAttendee,
+@@ -52,6 +53,9 @@ import {
+   DialogHeader,
+   DialogTitle,
+ } from "@/shared/ui/dialog";
++import { type CommonTimeSlot, koreanToday } from "../lib/commonTime";
++import { minuteLabel } from "../lib/teamAvailability";
++import { CommonTimePanel } from "./CommonTimePanel";
+ import { AvailabilityPanel } from "./AvailabilityPanel";
+ import { CalendarGrid, dateLabel, weeksOf } from "./CalendarGrid";
+ import { DayPanel } from "./DayPanel";
+@@ -122,6 +126,7 @@ export function TeamCalendarDialog({
+     initialPanel === "calendar" ? "board" : initialPanel,
+   );
+   const [view, setViewState] = React.useState<View>(readView);
++  const [showCommonTime, setShowCommonTime] = React.useState(false);
+   const [panel, setPanel] = React.useState<Panel>(null);
+   const [selectedDate, setSelectedDate] = React.useState(today);
+   const [month, setMonth] = React.useState(() => monthOfDate(today));
+@@ -296,6 +301,18 @@ export function TeamCalendarDialog({
+     });
+   };
+ 
++  const pickCommonTime = (slot: CommonTimeSlot) => {
++    setTab("board");
++    setView("calendar");
++    selectDate(slot.date);
++    setDraft({
++      ...emptyDraft(slot.date),
++      time: minuteLabel(slot.start),
++      endDate: slot.end === 1_440 ? addDays(slot.date, 1) : slot.date,
++      endTime: slot.end === 1_440 ? "00:00" : minuteLabel(slot.end),
++    });
++  };
++
+   /** "+ 추가" in a sprint cell: a week-long task of that department. */
+   const addInSprint = (deptKey: string, week: SprintWeek) => {
+     setSelectedDate(week.start);
+@@ -538,16 +555,41 @@ export function TeamCalendarDialog({
+           relayUrl={relayUrl}
+         />
+       ) : tab === "people" ? (
+-        <AvailabilityPanel
+-          members={members}
+-          nameOf={nameOf}
+-          onDelete={availability.deletePerson}
+-          onSave={(person) => availability.savePeople([person])}
+-          people={people}
+-          pubkey={pubkey}
+-          status={availability.status}
+-          today={today}
+-        />
++        <div className="space-y-4">
++          <Button
++            type="button"
++            size="sm"
++            variant="outline"
++            aria-expanded={showCommonTime}
++            disabled={availability.status !== "ready"}
++            onClick={() => setShowCommonTime((shown) => !shown)}
++          >
++            함께 되는 시간 찾기
++          </Button>
++          {availability.status === "error" ? (
++            <Button
++              type="button"
++              size="sm"
++              variant="outline"
++              onClick={availability.refresh}
++            >
++              팀원 일정 다시 읽기
++            </Button>
++          ) : null}
++          {showCommonTime && availability.status === "ready" ? (
++            <CommonTimePanel people={people} onPick={pickCommonTime} />
++          ) : null}
++          <AvailabilityPanel
++            members={members}
++            nameOf={nameOf}
++            onDelete={availability.deletePerson}
++            onSave={(person) => availability.savePeople([person])}
++            people={people}
++            pubkey={pubkey}
++            status={availability.status}
++            today={koreanToday()}
++          />
++        </div>
+       ) : view === "sprint" ? (
+         <div className="flex flex-col gap-4 lg:flex-row">
+           <div className="min-w-0 flex-1">
+diff --git a/desktop/src/features/team-calendar/ui/commonTime.jsdom-test.mjs b/desktop/src/features/team-calendar/ui/commonTime.jsdom-test.mjs
+new file mode 100644
+index 000000000..5d40f5a13
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/commonTime.jsdom-test.mjs
+@@ -0,0 +1,248 @@
++import assert from "node:assert/strict";
++import { afterEach, mock, test } from "node:test";
++import React from "react";
++import {
++  cleanup,
++  fireEvent,
++  render,
++  waitFor,
++  within,
++} from "@testing-library/react";
++import { TeamCalendarDialog } from "./TeamCalendarDialog.tsx";
++import { CommonTimePanel } from "./CommonTimePanel.tsx";
++import { koreanToday } from "../lib/commonTime.ts";
++import { addDays } from "../lib/teamCalendar.ts";
++import { encodePeople, teamAvailabilityDTag } from "../lib/teamAvailability.ts";
++import {
++  prepareScheduleDom,
++  pubkey,
++  relayUrl,
++} from "../../team-schedule/ui/scheduleTestSupport.mjs";
++
++let env;
++afterEach(() => {
++  cleanup();
++  env?.client.clear();
++  mock.restoreAll();
++  localStorage.clear();
++  delete globalThis.isTauri;
++});
++const today = koreanToday();
++const person = (id, rules = []) => ({
++  id,
++  name: `테스트 ${id}`,
++  rules,
++  updatedAt: 1,
++  updatedBy: pubkey,
++});
++const busy = {
++  id: "r1",
++  kind: "busy",
++  title: "가짜 수업",
++  startDate: today,
++  endDate: addDays(today, 13),
++  weekday: null,
++  start: 540,
++  end: 1080,
++  exclude: [],
++};
++
++test("embedded 103 keeps sprint/calendar, people, import/export and opens an unsaved 106 draft", async () => {
++  const people = { a: person("가", [busy]), b: person("나") };
++  env = prepareScheduleDom(async (filter) =>
++    filter["#d"]?.[0] === teamAvailabilityDTag(relayUrl)
++      ? [
++          {
++            id: "1".repeat(64),
++            kind: 30078,
++            pubkey,
++            created_at: 1,
++            tags: [["d", teamAvailabilityDTag(relayUrl)]],
++            content: encodePeople(people),
++            sig: "",
++          },
++        ]
++      : [],
++  );
++  const ref = React.createRef();
++  const view = render(
++    React.createElement(TeamCalendarDialog, {
++      embedded: true,
++      open: true,
++      onOpenChange() {},
++      pubkey,
++      relayUrl,
++      ref,
++    }),
++    { wrapper: env.Providers },
++  );
++  assert.equal(
++    view
++      .getByRole("tab", { name: "스프린트", exact: true })
++      .getAttribute("aria-selected"),
++    "true",
++  );
++  assert.ok(view.getByRole("button", { name: "가져오기", exact: true }));
++  assert.ok(view.getByRole("button", { name: "배포", exact: true }));
++  assert.equal(
++    view.getByTestId("team-calendar-embedded").className.includes("96vw"),
++    false,
++  );
++  const previousQueries = env.queries.length;
++  ref.current.refresh();
++  await waitFor(() => assert.ok(env.queries.length > previousQueries));
++  fireEvent.click(view.getByRole("tab", { name: "팀원 일정", exact: true }));
++  const open = view.getByRole("button", {
++    name: "함께 되는 시간 찾기",
++    exact: true,
++  });
++  await waitFor(() => assert.equal(open.disabled, false));
++  fireEvent.click(open);
++  const panel = within(view.getByTestId("common-time-panel"));
++  assert.equal(panel.getByLabelText("시작 날짜").value, today);
++  assert.equal(panel.getByLabelText("종료 날짜").value, addDays(today, 13));
++  assert.equal(panel.getByLabelText("필요한 시간").value, "60");
++  const recommendations = within(
++    panel.getByRole("region", { name: "추천 시간" }),
++  );
++  const cards = recommendations.getAllByRole("button", {
++    name: /명단 보기/,
++  });
++  assert.equal(cards.length, 8);
++  assert.match(cards[0].textContent, /18:00~19:00/);
++  fireEvent.click(cards[0]);
++  assert.ok(panel.getByRole("region", { name: "시간별 명단" }));
++  fireEvent.click(
++    panel.getByRole("button", {
++      name: `${today} 09:00~10:00 · 가능 1/2명`,
++      exact: true,
++    }),
++  );
++  assert.match(
++    panel.getByRole("region", { name: "시간별 명단" }).textContent,
++    /테스트 가 — 가짜 수업/,
++  );
++  fireEvent.click(
++    recommendations.getAllByRole("button", {
++      name: "이 시간으로 일정 만들기",
++    })[0],
++  );
++  const form = view.getByTestId("team-calendar-form");
++  assert.equal(form.querySelector('input[type="time"]').value, "18:00");
++  assert.deepEqual(
++    [...form.querySelectorAll('input[type="date"]')].map(
++      (input) => input.value,
++    ),
++    [today, today],
++  );
++  assert.equal(form.querySelectorAll('input[type="time"]')[1].value, "19:00");
++  assert.equal(form.querySelector('input[maxlength="120"]')?.value ?? "", "");
++  assert.equal(
++    view
++      .getByRole("tab", { name: "달력", exact: true })
++      .getAttribute("aria-selected"),
++    "true",
++  );
++  // prepareScheduleDom throws on publication, so every step above is read-only.
++});
++
++test("selection, mandatory people, fresh details and invalid ranges use the real panel", () => {
++  const picks = [];
++  const view = render(
++    React.createElement(CommonTimePanel, {
++      people: [person("가", [busy]), person("나")],
++      onPick: (slot) => picks.push(slot),
++    }),
++  );
++  const targets = within(view.getByRole("group", { name: "대상 인원" }));
++  fireEvent.click(targets.getByRole("checkbox", { name: "테스트 나" }));
++  assert.equal(
++    targets.getByRole("checkbox", { name: "테스트 나" }).checked,
++    false,
++  );
++  const required = within(
++    view.getByRole("group", { name: "꼭 와야 하는 인원" }),
++  );
++  assert.equal(required.queryByRole("checkbox", { name: "테스트 나" }), null);
++  fireEvent.click(required.getByRole("checkbox", { name: "테스트 가" }));
++  assert.match(
++    view.getByRole("region", { name: "추천 시간" }).textContent,
++    /필수 인원 전원 가능/,
++  );
++  fireEvent.change(view.getByLabelText("찾을 시작 시간"), {
++    target: { value: "1380" },
++  });
++  fireEvent.change(view.getByLabelText("찾을 종료 시간"), {
++    target: { value: "1440" },
++  });
++  fireEvent.click(
++    view.getAllByRole("button", { name: "이 시간으로 일정 만들기" })[0],
++  );
++  assert.equal(picks[0].end, 1440);
++  fireEvent.change(view.getByLabelText("필요한 시간"), {
++    target: { value: "90" },
++  });
++  assert.match(view.getByRole("alert").textContent, /확인/);
++  assert.equal(view.queryByRole("region", { name: "추천 시간" }), null);
++  fireEvent.click(targets.getByRole("checkbox", { name: "테스트 가" }));
++  assert.equal(required.queryByRole("checkbox"), null);
++});
++
++test("a 24:00 recommendation populates next-day 00:00 and the existing dialog path remains available", async () => {
++  env = prepareScheduleDom(async (filter) =>
++    filter["#d"]?.[0] === teamAvailabilityDTag(relayUrl)
++      ? [
++          {
++            id: "1".repeat(64),
++            kind: 30078,
++            pubkey,
++            created_at: 1,
++            tags: [["d", teamAvailabilityDTag(relayUrl)]],
++            content: encodePeople({ a: person("가") }),
++            sig: "",
++          },
++        ]
++      : [],
++  );
++  const view = render(
++    React.createElement(TeamCalendarDialog, {
++      open: true,
++      onOpenChange() {},
++      pubkey,
++      relayUrl,
++    }),
++    { wrapper: env.Providers },
++  );
++  assert.ok(view.getByRole("dialog"));
++  assert.match(view.getByTestId("team-calendar-dialog").className, /96vw/);
++  fireEvent.click(view.getByRole("tab", { name: "팀원 일정", exact: true }));
++  const open = view.getByRole("button", {
++    name: "함께 되는 시간 찾기",
++    exact: true,
++  });
++  await waitFor(() => assert.equal(open.disabled, false));
++  fireEvent.click(open);
++  const panel = within(view.getByTestId("common-time-panel"));
++  fireEvent.change(panel.getByLabelText("찾을 종료 시간"), {
++    target: { value: "1440" },
++  });
++  fireEvent.change(panel.getByLabelText("찾을 시작 시간"), {
++    target: { value: "1380" },
++  });
++  fireEvent.click(
++    panel.getAllByRole("button", { name: "이 시간으로 일정 만들기" })[0],
++  );
++  const form = view.getByTestId("team-calendar-form");
++  assert.deepEqual(
++    [...form.querySelectorAll('input[type="date"]')].map(
++      (input) => input.value,
++    ),
++    [today, addDays(today, 1)],
++  );
++  assert.deepEqual(
++    [...form.querySelectorAll('input[type="time"]')].map(
++      (input) => input.value,
++    ),
++    ["23:00", "00:00"],
++  );
++});
+diff --git a/desktop/tests/e2e/team12.spec.ts b/desktop/tests/e2e/team12.spec.ts
+index c6bfe6a34..9596fa86e 100644
+--- a/desktop/tests/e2e/team12.spec.ts
++++ b/desktop/tests/e2e/team12.spec.ts
+@@ -120,3 +120,47 @@ test("owner can add a shared https schedule tab through the real signed-event se
+   });
+   expect(content).not.toContain("localUrl");
+ });
++
++test("106 finds time from fake member schedules and opens a draft without saving", async ({
++  page,
++}) => {
++  await start(page);
++  await page.getByTestId("open-team-schedule").click();
++  const schedule = page.getByTestId("team-schedule-screen");
++  await schedule.getByRole("tab", { name: "팀원 일정", exact: true }).click();
++  await schedule
++    .getByRole("button", { name: "팀원 추가", exact: true })
++    .click();
++  const personForm = schedule.getByTestId("availability-person-form");
++  await personForm.getByLabel("이름", { exact: true }).fill("테스트 팀원");
++  await personForm.getByRole("button", { name: "저장", exact: true }).click();
++  await expect(personForm).toHaveCount(0);
++  const before = await page.evaluate(
++    () => window.__BUZZ_E2E_SIGNED_EVENTS__?.length ?? 0,
++  );
++  await schedule
++    .getByRole("button", { name: "함께 되는 시간 찾기", exact: true })
++    .click();
++  const panel = schedule.getByTestId("common-time-panel");
++  await expect(
++    panel.getByRole("button", { name: "이 시간으로 일정 만들기", exact: true }),
++  ).toHaveCount(8);
++  await panel
++    .getByRole("button", { name: /명단 보기/ })
++    .first()
++    .click();
++  await expect(
++    panel.getByRole("region", { name: "시간별 명단" }),
++  ).toContainText("테스트 팀원");
++  await panel
++    .getByRole("button", { name: "이 시간으로 일정 만들기", exact: true })
++    .first()
++    .click();
++  const form = schedule.getByTestId("team-calendar-form");
++  await expect(form).toBeVisible();
++  await expect(form.locator('input[type="time"]').nth(0)).toHaveValue("09:00");
++  await expect(form.locator('input[type="time"]').nth(1)).toHaveValue("10:00");
++  expect(
++    await page.evaluate(() => window.__BUZZ_E2E_SIGNED_EVENTS__?.length ?? 0),
++  ).toBe(before);
++});
