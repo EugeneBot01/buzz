@@ -1,5 +1,5 @@
 diff --git a/desktop/src/features/team-calendar/README.md b/desktop/src/features/team-calendar/README.md
-index 02999b2aa..a3f5edfc7 100644
+index 02999b2aa..a24cdc033 100644
 --- a/desktop/src/features/team-calendar/README.md
 +++ b/desktop/src/features/team-calendar/README.md
 @@ -25,3 +25,11 @@
@@ -9,27 +9,28 @@ index 02999b2aa..a3f5edfc7 100644
 +
 +## 좁은 일정 화면 (108)
 +
-+- 앱 창이 아닌 일정 본문 폭을 관찰한다. 본문이 960px보다 좁으면 달력의 날짜 패널과 스프린트 편집창, 팀원 목록/상세를 위아래로 배치한다. 960px부터는 나란히 표시한다.
++- 앱 창이 아닌 일정 본문 폭을 관찰한다. 본문이 860px보다 좁으면 달력의 날짜 패널과 스프린트 편집창, 팀원 목록/상세를 위아래로 배치한다. 860px부터는 나란히 표시한다.
 +- 실제 날짜 칸이 110px보다 좁으면 종일 불가 배지를 `●N`으로 줄이고 전체 뜻은 툴팁과 날짜 버튼의 읽기 이름으로 유지한다. 날짜·`+N` 머리줄과 배지 줄을 분리하며 배지/일정 막대는 한 줄 말줄임으로 표시한다.
 +- 날짜 칸은 좁을 때 5rem, 넓을 때 7rem 높이다. 실제 칸 높이와 글자 확대 크기에 들어가는 막대만 최대 3줄까지 표시하고 나머지는 날짜 머리줄의 `+N`에 센다. 날짜를 누르면 아래/오른쪽 패널에서 전체 일정을 볼 수 있다.
 +- 도구줄과 팀원 일정의 필터는 줄바꿈한다. 스프린트와 30분 표는 내부 가로 스크롤을 사용하며, 시간 찾기의 입력칸/추천 카드는 패널 폭에 맞춰 열 수를 바꾼다.
 +- `calendarLayout.test.mjs`는 폭/높이/글자 확대 경계를 검사한다. `calendarLayout.jsdom-test.mjs`는 실제 달력과 화면의 크기 변경·배지/막대 클래스·숨긴 일정 수·날짜 선택을 검사한다. 실제 브라우저 레이아웃 검증과 네이티브 앱 검증은 별도로 기록한다.
 diff --git a/desktop/src/features/team-calendar/lib/calendarLayout.test.mjs b/desktop/src/features/team-calendar/lib/calendarLayout.test.mjs
 new file mode 100644
-index 000000000..54fe91896
+index 000000000..ce6d68d6f
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/calendarLayout.test.mjs
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,45 @@
 +import assert from "node:assert/strict";
 +import { test } from "node:test";
 +import { calendarCellLayout, stackScheduleColumns } from "./calendarLayout.ts";
 +
-+test("columns use body width, with the 960px boundary included", () => {
++test("columns use body width, with the 860px boundary included", () => {
 +  for (const [width, stacked] of [
 +    [0, true],
 +    [600, true],
 +    [800, true],
-+    [959.99, true],
++    [859.99, true],
++    [860, false],
 +    [960, false],
 +    [1200, false],
 +  ])
@@ -66,12 +67,12 @@ index 000000000..54fe91896
 +});
 diff --git a/desktop/src/features/team-calendar/lib/calendarLayout.ts b/desktop/src/features/team-calendar/lib/calendarLayout.ts
 new file mode 100644
-index 000000000..d1685d878
+index 000000000..dc64285b6
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/calendarLayout.ts
 @@ -0,0 +1,23 @@
 +/** The schedule body, excluding the app sidebar, needs this width for two columns. */
-+export const SCHEDULE_COLUMNS_MIN_WIDTH = 960;
++export const SCHEDULE_COLUMNS_MIN_WIDTH = 860;
 +
 +/** Unknown or narrow body widths keep the detail panel below the main view. */
 +export function stackScheduleColumns(bodyWidth: number): boolean {
@@ -150,7 +151,7 @@ index 818627025..8ebf87525 100644
    );
  }
 diff --git a/desktop/src/features/team-calendar/ui/CalendarGrid.tsx b/desktop/src/features/team-calendar/ui/CalendarGrid.tsx
-index 20610eab0..07f89c7d4 100644
+index 20610eab0..4cb118d1d 100644
 --- a/desktop/src/features/team-calendar/ui/CalendarGrid.tsx
 +++ b/desktop/src/features/team-calendar/ui/CalendarGrid.tsx
 @@ -1,3 +1,4 @@
@@ -158,7 +159,7 @@ index 20610eab0..07f89c7d4 100644
  import { ChevronLeft, ChevronRight } from "lucide-react";
  import * as React from "react";
  
-@@ -19,8 +20,38 @@ import { Checkbox } from "@/shared/ui/checkbox";
+@@ -19,8 +20,39 @@ import { Checkbox } from "@/shared/ui/checkbox";
  import { COLOR_STYLES } from "./EntryForm";
  
  export const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"] as const;
@@ -166,10 +167,11 @@ index 20610eab0..07f89c7d4 100644
 -const MAX_LANES = 3;
 +/** Measure the real day button, including font zoom and container resizing. */
 +function useCellLayout() {
-+  const ref = React.useRef<HTMLButtonElement>(null);
++  // Callback ref: the grid can mount before its first day cell exists
++  // (loading state), so re-measure whenever the measured cell changes.
++  const [cell, ref] = React.useState<HTMLButtonElement | null>(null);
 +  const [layout, setLayout] = React.useState({ compact: true, lanes: 2 });
 +  React.useEffect(() => {
-+    const cell = ref.current;
 +    if (!cell) return;
 +    const measure = () => {
 +      const { width, height } = cell.getBoundingClientRect();
@@ -193,13 +195,13 @@ index 20610eab0..07f89c7d4 100644
 +    const observer = new ResizeObserver(measure);
 +    observer.observe(cell);
 +    return () => observer.disconnect();
-+  }, []);
++  }, [cell]);
 +  return { ref, ...layout };
 +}
  
  /** The seven days of each of the grid's six weeks. */
  export function weeksOf<T>(cells: T[]): T[][] {
-@@ -76,6 +107,8 @@ export function CalendarGrid({
+@@ -76,6 +108,8 @@ export function CalendarGrid({
    onMineOnly: (value: boolean) => void;
    onShowPeople: (value: boolean) => void;
  }) {
@@ -208,7 +210,7 @@ index 20610eab0..07f89c7d4 100644
    const weeks = React.useMemo(() => weeksOf(monthGrid(month)), [month]);
  
    return (
-@@ -106,16 +139,24 @@ export function CalendarGrid({
+@@ -106,16 +140,24 @@ export function CalendarGrid({
          >
            <ChevronRight className="h-4 w-4" />
          </Button>
@@ -235,7 +237,7 @@ index 20610eab0..07f89c7d4 100644
              checked={mineOnly}
              data-testid="team-calendar-mine-only"
              onCheckedChange={(checked) => onMineOnly(checked === true)}
-@@ -152,12 +193,12 @@ export function CalendarGrid({
+@@ -152,12 +194,12 @@ export function CalendarGrid({
              entries,
              week.map((cell) => cell.date),
            );
@@ -250,7 +252,7 @@ index 20610eab0..07f89c7d4 100644
                    bar.startColumn <= column &&
                    column < bar.startColumn + bar.span,
                ).length,
-@@ -176,41 +217,51 @@ export function CalendarGrid({
+@@ -176,41 +218,51 @@ export function CalendarGrid({
                        }`}
                        aria-pressed={isSelected}
                        className={cn(
@@ -321,7 +323,7 @@ index 20610eab0..07f89c7d4 100644
                        </span>
                      </button>
                    );
-@@ -219,12 +270,12 @@ export function CalendarGrid({
+@@ -219,12 +271,12 @@ export function CalendarGrid({
                {/* Bars sit over the day buttons; clicks go through to them. */}
                <div
                  aria-hidden="true"
@@ -641,7 +643,7 @@ index c22c8a59e..50862c459 100644
    );
 diff --git a/desktop/src/features/team-calendar/ui/calendarLayout.jsdom-test.mjs b/desktop/src/features/team-calendar/ui/calendarLayout.jsdom-test.mjs
 new file mode 100644
-index 000000000..a489a7e18
+index 000000000..e04d95e0c
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/calendarLayout.jsdom-test.mjs
 @@ -0,0 +1,197 @@
@@ -759,8 +761,8 @@ index 000000000..a489a7e18
 +    [600, true],
 +    [800, true],
 +    [1200, false],
-+    [959, true],
-+    [960, false],
++    [859, true],
++    [860, false],
 +  ]) {
 +    measurements.resize(width);
 +    assert.equal(columns.dataset.stacked, String(stacked));
@@ -830,7 +832,7 @@ index 000000000..a489a7e18
 +    measurements.resize(width);
 +    assert.equal(
 +      view.getByTestId("calendar-columns").dataset.stacked,
-+      String(width < 960),
++      String(width < 860),
 +    );
 +  }
 +  fireEvent.click(view.getByRole("tab", { name: "스프린트", exact: true }));
