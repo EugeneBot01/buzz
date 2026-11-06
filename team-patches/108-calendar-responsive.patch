@@ -95,7 +95,7 @@ index 000000000..dc64285b6
 +  };
 +}
 diff --git a/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx b/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
-index 818627025..8ebf87525 100644
+index 818627025..7f6d54a79 100644
 --- a/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
 +++ b/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
 @@ -47,6 +47,7 @@ import {
@@ -122,7 +122,22 @@ index 818627025..8ebf87525 100644
        >
          <div className="flex items-center gap-2">
            <div className="relative min-w-0 flex-1">
-@@ -601,8 +599,8 @@ export function AvailabilityPanel({
+@@ -246,11 +244,13 @@ export function AvailabilityPanel({
+               setRuleDraft(null);
+               setPersonDraft({ id: newPersonId(), name: "", rules: [] });
+             }}
+-            size="icon"
++            className="shrink-0 gap-1"
++            size="sm"
+             type="button"
+             variant="outline"
+           >
+             <Plus className="h-4 w-4" />
++            팀원 추가
+           </Button>
+         </div>
+         {status === "ready" && !mine ? (
+@@ -601,8 +601,8 @@ export function AvailabilityPanel({
                </div>
              ) : null}
  
@@ -133,7 +148,7 @@ index 818627025..8ebf87525 100644
                  {(
                    [
                      ["all", "전체"],
-@@ -695,7 +693,7 @@ export function AvailabilityPanel({
+@@ -695,7 +695,7 @@ export function AvailabilityPanel({
                        ) : null}
                        <span
                          className={cn(
@@ -142,7 +157,7 @@ index 818627025..8ebf87525 100644
                            KIND_BADGE[rule.kind],
                          )}
                        >
-@@ -761,6 +759,6 @@ export function AvailabilityPanel({
+@@ -761,6 +761,6 @@ export function AvailabilityPanel({
            </p>
          )}
        </section>
