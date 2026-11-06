@@ -117,16 +117,17 @@ index ad44f86f9..39ebbcba4 100644
      use super::build_nostr_identity_binding_event;
 diff --git a/desktop/src/features/team-calendar/README.md b/desktop/src/features/team-calendar/README.md
 new file mode 100644
-index 000000000..bd1e34b5c
+index 000000000..478fd9fe5
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/README.md
-@@ -0,0 +1,25 @@
+@@ -0,0 +1,26 @@
 +# 팀원 일정 — 제작부 비밀번호 (107)
 +
-+- 팀원 일정 위쪽에서 방장·관리자가 **제작부 비밀번호 정하기**를 누른다. 길이 제한은 없다. 이미 정했다면 제작부를 먼저 열고 바꾼다. 비밀번호는 입력 그대로 사용하며 팀마다 결과가 다르다.
-+- 팀원은 **제작부 열기**로 이 기기에서 제작부가 된다. **제작부 잠그기**는 이 계정·팀에 기억한 내용을 지우고 표시 중인 사유와 입력창도 닫는다. 다른 기기의 기억은 새 비밀번호가 도착하면 사용할 수 없게 된다.
-+- 비밀번호 설정 뒤 저장하는 사유는 본인과 제작부에게 각각 NIP-44로 보관한다. 날짜·요일·시간·불가/가능/조율은 공개 상태라 달력과 함께 되는 시간 찾기는 계속 동작한다. 다른 팀원에게는 종류 이름만 보인다. 계정 비밀값은 JavaScript로 가져오지 않는다.
-+- 비밀번호를 아직 정하지 않으면 사유는 기존처럼 평문이다. 예전 평문도 그대로 읽는다. 제작부의 **예전 사유 숨기기**로 현재 목록을 한 번에 다시 저장한다. 과거에 배포된 문서·파일·사본까지 지우는 기능은 아니다.
++- 팀원 일정 오른쪽 위에는 제작부 상태 버튼 하나가 있다. 방장·관리자는 **🔒 제작부 비밀번호 만들기**에서 비밀번호를 두 번 적고 저장한다. 길이 제한은 없다. 저장한 기기는 바로 제작부로 열린다. 비밀번호는 입력 그대로 사용하며 팀마다 결과가 다르다.
++- 팀원은 **🔒 제작부**를 눌러 비밀번호를 적고 **열기**로 이 기기에서 제작부가 된다. **🔓 제작부 보는 중**을 누르면 **잠그기**, 방장·관리자는 **비밀번호 바꾸기**도 나온다. **잠그기**는 이 계정·팀에 기억한 내용을 지우고 표시 중인 사유와 입력창도 닫는다. 다른 기기의 기억은 새 비밀번호가 도착하면 사용할 수 없게 된다.
++- 비밀번호 설정 뒤 저장하는 사유는 본인과 제작부에게 각각 NIP-44로 보관한다. 날짜·요일·시간·불가/가능/조율은 공개 상태라 달력과 함께 되는 시간 찾기는 계속 동작한다. 다른 팀원에게는 종류 이름과 작은 자물쇠가 보인다. 자물쇠에 마우스를 올리거나 키보드로 이동하면 **본인과 제작부만 볼 수 있어요**를 안내한다. 계정 비밀값은 JavaScript로 가져오지 않는다.
++- 비밀번호를 아직 정하지 않으면 사유는 기존처럼 평문이다. 예전 평문도 그대로 읽는다. 제작부가 열려 있으면 예전 사유를 자동으로 한 번에 다시 저장하고 **예전 사유 N개를 숨겼어요**를 알린다. 설정·교체 직후와 기기 기억으로 다시 열 때도 동작한다. 실패하면 평문 원본을 유지하고 다음 조회(30초 주기·재연결·화면 재진입) 때 조용히 재시도한다. 저장 중에는 중복 실행하지 않는다. 과거에 배포된 문서·파일·사본까지 지우는 기능은 아니다.
++- 아직 연결한 이름이 없으면 목록 위 **내 이름을 눌러 연결해 주세요** 카드에서 이름을 검색하고 **OOO님이 맞나요?**를 확인한다. 연결은 한 번 저장하고 그 사람 일정을 연다. 내 이름은 목록 맨 위에 **나**로 표시하고, 연결된 사람은 작게 **연결됨**을 표시한다. 다음에 화면을 열면 내 일정을 자동으로 고른다.
 +- Buzz 계정과 연결된 사람은 본인과 제작부만 수정·삭제할 수 있다. 연결 안 된 사람은 누구나 수정하고 **이 사람이 나예요**로 자신을 연결한다. 기존 연결 해제·교체는 제작부가 한다. 저장 직전에도 최신 권한을 확인한다.
 +
 +## 저장·검사 경로
@@ -135,7 +136,7 @@ index 000000000..bd1e34b5c
 +
 +일반 수정은 로그인 계정의 이벤트로, 제작부 수정은 제작부가 서명한 내부 kind 30078 문서를 로그인 계정의 이벤트에 담아 게시한다. 릴레이는 로그인 계정과 다른 작성자의 직접 게시를 거부하므로 이 경로가 필요하다. 읽을 때 내부 서명과 정확한 문서 좌표를 검사한다. `updatedBy` 문자열을 권한 증거로 쓰지 않는다. `mergePeopleEvents`와 초기 읽기·실시간 갱신은 같은 작성자 검사 함수를 사용한다. 삭제 기록도 연결을 유지해 제3자가 연결 없는 삭제로 위장할 수 없게 한다.
 +
-+처음 설정할 때는 제작부 공개값만 공유한다. 비밀번호를 바꾸는 한 번의 관리자 게시에 이미 보호한 목록과 제작부 수정 기록을 새 제작부 서명으로 이어받는다. 잠근 사유는 이전 제작부로 읽은 뒤 새 제작부용으로 다시 보관하며, 아직 평문인 사유는 명시적으로 숨길 때까지 유지한다. 이 이어받기 때문에 비밀번호를 바꿔도 이전 제작부 수정이 사라지지 않는다. 너무 큰 문서는 부분 저장하지 않고 실패를 알린다. 실패한 입력은 화면에 남겨 다시 시도할 수 있다.
++처음 설정할 때는 제작부 공개값만 공유한다. 비밀번호를 바꾸는 한 번의 관리자 게시에 이미 보호한 목록과 제작부 수정 기록을 새 제작부 서명으로 이어받는다. 잠근 사유는 이전 제작부로 읽은 뒤 새 제작부용으로 다시 보관하며, 아직 평문인 사유는 이어받은 뒤 자동 숨기기 대상으로 남긴다. 이 이어받기 때문에 비밀번호를 바꿔도 이전 제작부 수정이 사라지지 않는다. 너무 큰 문서는 부분 저장하지 않고 실패를 알린다. 실패한 입력은 화면에 남겨 다시 시도할 수 있다.
 +
 +`VISION.md`의 일반 대화·서버 검색 모델과 달리 개인 사유에만 사용자 결정에 따른 보호를 적용한다. 공유 비밀번호를 아는 팀원이 제작부 역할을 갖는 팀판 기능이며, 다른 일정·대화의 접근 모델은 그대로다. 구버전 클라이언트는 이 읽기 검사를 하지 않으므로 팀원 모두 107 적용본을 사용해야 한다.
 +
@@ -145,7 +146,7 @@ index 000000000..bd1e34b5c
 +- `pnpm -C desktop exec tsc --noEmit`
 +- `cargo test --manifest-path desktop/src-tauri/Cargo.toml --features mesh-llm availability_reason`
 +
-+단위 테스트는 결정성·두 수신자의 사유 읽기·타인의 실패·평문 호환·설정 전 저장·작성자 검사·설정 권한·비밀번호 교체·게시 실패를 검사한다. DOM 테스트는 실제 캘린더와 조회/저장 훅에서 설정→열기→기기 기억→잠그기→이전 사유 숨기기→제작부 수정을 실행하고, 실시간 변조 및 늦게 끝난 사유 읽기를 검사한다. 테스트는 가짜 계정과 가짜 일정만 사용하며 실제 릴레이에 게시하지 않는다.
++단위 테스트는 결정성·두 수신자의 사유 읽기·타인의 실패·평문 호환·설정 전 저장·작성자 검사·설정 권한·비밀번호 교체·게시 실패를 검사한다. DOM 테스트는 실제 캘린더와 조회/저장 훅에서 설정→열기→기기 기억→잠그기→자동 사유 숨기기→제작부 수정을 실행하고, 실시간 변조 및 늦게 끝난 사유 읽기를 검사한다. 상태별 단일 버튼·관리자 권한·재입력 확인·자동 숨기기 성공 알림과 실패 재시도·이름 검색/확인/연결·내 일정 자동 선택/정렬·사유 자물쇠도 실제 화면 경로로 검사한다. 테스트는 가짜 계정과 가짜 일정만 사용하며 실제 릴레이에 게시하지 않는다.
 diff --git a/desktop/src/features/team-calendar/lib/availabilityMerge.ts b/desktop/src/features/team-calendar/lib/availabilityMerge.ts
 new file mode 100644
 index 000000000..89fc6a1dd
@@ -1511,12 +1512,13 @@ index 99b967200..a711a499f 100644
        ownCreatedAt = event.created_at;
 diff --git a/desktop/src/features/team-calendar/lib/useAvailabilityPrivacy.ts b/desktop/src/features/team-calendar/lib/useAvailabilityPrivacy.ts
 new file mode 100644
-index 000000000..7103321d7
+index 000000000..94fb3a239
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/lib/useAvailabilityPrivacy.ts
-@@ -0,0 +1,212 @@
+@@ -0,0 +1,245 @@
 +import { useQuery } from "@tanstack/react-query";
 +import * as React from "react";
++import { toast } from "sonner";
 +import { relayClient } from "@/shared/api/relayClient";
 +import { nip44DecryptFromSelf } from "@/shared/api/tauri";
 +import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
@@ -1562,6 +1564,10 @@ index 000000000..7103321d7
 +      : null;
 +  const generation = React.useRef({ scope, active: true });
 +  const busy = React.useRef(false);
++  const [working, setWorking] = React.useState(false);
++  const currentKey = React.useRef(key);
++  currentKey.current = key;
++  const legacyAttempt = React.useRef("");
 +  React.useEffect(() => {
 +    const current = { scope, active: true };
 +    generation.current = current;
@@ -1635,21 +1641,26 @@ index 000000000..7103321d7
 +      ? decoded.value
 +      : (raw ?? {});
 +  const people = React.useMemo(() => livePeople(value), [value]);
-+  const run = async (action: (active: () => boolean) => Promise<void>) => {
-+    if (busy.current) throw new Error("저장이 끝난 뒤 다시 눌러 주세요.");
-+    const current = generation.current;
-+    const active = () =>
-+      current.active &&
-+      generation.current === current &&
-+      current.scope === scope;
-+    busy.current = true;
-+    try {
-+      await action(active);
-+      if (active()) await refresh();
-+    } finally {
-+      busy.current = false;
-+    }
-+  };
++  const run = React.useCallback(
++    async (action: (active: () => boolean) => Promise<void>) => {
++      if (busy.current) throw new Error("저장이 끝난 뒤 다시 눌러 주세요.");
++      const current = generation.current;
++      const active = () =>
++        current.active &&
++        generation.current === current &&
++        current.scope === scope;
++      busy.current = true;
++      setWorking(true);
++      try {
++        await action(active);
++        if (active()) await refresh();
++      } finally {
++        busy.current = false;
++        setWorking(false);
++      }
++    },
++    [scope, refresh],
++  );
 +  const remember = (next: ProductionKey) => {
 +    localStorage.setItem(
 +      productionStorageKey(pubkey, relay),
@@ -1690,17 +1701,41 @@ index 000000000..7103321d7
 +      await setProductionPassword(relay, pubkey, next, key, active);
 +      if (active()) remember(next);
 +    });
-+  const hideLegacy = () =>
-+    run(async (active) => {
++  const updatedAt = query.dataUpdatedAt;
++  React.useEffect(() => {
++    // A failed attempt waits for the next query (poll/reconnect/reopen), never a tight retry loop.
++    const attempt = `${scope}|${key?.pubkey}|${updatedAt}`;
++    if (
++      working ||
++      busy.current ||
++      !key ||
++      !raw ||
++      legacyAttempt.current === attempt ||
++      !Object.values(raw).some(
++        (p) => !p.deleted && p.rules.some((r) => !r.lockedTitle),
++      )
++    )
++      return;
++    legacyAttempt.current = attempt;
++    void run(async (active) => {
++      const stillOpen = () => active() && currentKey.current === key;
 +      const snapshot = await readAvailabilitySnapshot(relay);
-+      if (!key || key.pubkey !== snapshot.settings?.pubkey)
-+        throw new Error("제작부를 먼저 열어 주세요.");
++      if (!stillOpen() || key.pubkey !== snapshot.settings?.pubkey) return;
 +      const inputs = Object.values(snapshot.people).filter(
 +        (p) => !p.deleted && p.rules.some((r) => !r.lockedTitle),
 +      );
-+      if (inputs.length)
-+        await saveAvailability(relay, pubkey, inputs, key, active);
++      const count = inputs.reduce(
++        (total, person) =>
++          total + person.rules.filter((rule) => !rule.lockedTitle).length,
++        0,
++      );
++      if (!count) return;
++      await saveAvailability(relay, pubkey, inputs, key, stillOpen);
++      if (stillOpen()) toast.success(`예전 사유 ${count}개를 숨겼어요`);
++    }).catch(() => {
++      // Plaintext remains in the shared snapshot, so the next query durably discovers the retry.
 +    });
++  }, [scope, key, raw, updatedAt, working, relay, pubkey, run]);
 +  return {
 +    people,
 +    status: query.isError
@@ -1719,7 +1754,6 @@ index 000000000..7103321d7
 +      unlock,
 +      lock,
 +      setPassword,
-+      hideLegacy,
 +    },
 +  };
 +}
@@ -1831,20 +1865,45 @@ index be3d1f9bd..19d618bef 100644
 -  return { people, status, savePeople, deletePerson, retry, refresh };
 -}
 diff --git a/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx b/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
-index e4e4ac66d..c79282493 100644
+index e4e4ac66d..a8753175e 100644
 --- a/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
 +++ b/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
-@@ -24,6 +24,9 @@ import {
+@@ -1,4 +1,11 @@
+-import { Pencil, Plus, Search, Trash2, UserRound } from "lucide-react";
++import {
++  LockKeyhole,
++  Pencil,
++  Plus,
++  Search,
++  Trash2,
++  UserRound,
++} from "lucide-react";
+ import * as React from "react";
+ import { toast } from "sonner";
+ 
+@@ -24,6 +31,21 @@ import {
    emptyRuleDraft,
    ruleDraftOf,
  } from "./AvailabilityRuleForm";
 +import { canEditAvailability } from "../lib/availabilityStore";
 +import type { AvailabilityProduction } from "../lib/useAvailabilityPrivacy";
-+import { ProductionControls } from "./ProductionControls";
++import {
++  AlertDialog,
++  AlertDialogContent,
++  AlertDialogTitle,
++  AlertDialogDescription,
++  AlertDialogCancel,
++} from "@/shared/ui/alert-dialog";
++import {
++  Tooltip,
++  TooltipTrigger,
++  TooltipContent,
++  TooltipProvider,
++} from "@/shared/ui/tooltip";
  import { SELECT_CLASS } from "./EntryForm";
  
  export const KIND_BADGE: Record<RuleKind, string> = {
-@@ -44,7 +47,7 @@ const newPersonId = () =>
+@@ -44,7 +66,7 @@ const newPersonId = () =>
  
  /**
   * Member schedules (team patch): everyone's 불가/가능/조율 times, which
@@ -1853,7 +1912,7 @@ index e4e4ac66d..c79282493 100644
   * members put their schedules into Buzz instead.
   */
  export function AvailabilityPanel({
-@@ -55,6 +58,8 @@ export function AvailabilityPanel({
+@@ -55,6 +77,8 @@ export function AvailabilityPanel({
    nameOf,
    today,
    onSave,
@@ -1862,7 +1921,7 @@ index e4e4ac66d..c79282493 100644
    onDelete,
  }: {
    pubkey: string;
-@@ -64,8 +69,11 @@ export function AvailabilityPanel({
+@@ -64,13 +88,23 @@ export function AvailabilityPanel({
    nameOf: (pubkey: string) => string;
    today: string;
    onSave: (person: PersonInput) => Promise<void>;
@@ -1874,10 +1933,27 @@ index e4e4ac66d..c79282493 100644
    const mine = people.find((person) => person.pubkey === pubkey);
    const [selectedId, setSelectedId] = React.useState<string | null>(
      () => mine?.id ?? null,
-@@ -80,6 +88,16 @@ export function AvailabilityPanel({
+   );
+   const [query, setQuery] = React.useState("");
++  const [claimQuery, setClaimQuery] = React.useState("");
++  const [claimId, setClaimId] = React.useState<string | null>(null);
++  const pendingClaim = people.find((person) => person.id === claimId);
++  const mineId = mine?.id;
++  React.useEffect(() => {
++    if (mineId) setSelectedId(mineId);
++  }, [mineId]);
+   const [filter, setFilter] = React.useState<Filter>("all");
+   const [ruleDraft, setRuleDraft] = React.useState<RuleDraft | null>(null);
+   const [personDraft, setPersonDraft] = React.useState<PersonInput | null>(
+@@ -80,11 +114,23 @@ export function AvailabilityPanel({
    const [saving, setSaving] = React.useState(false);
  
    const selected = people.find((person) => person.id === selectedId) ?? null;
+-  const shown = people.filter((person) =>
+-    `${person.name} ${person.role ?? ""}`
+-      .toLowerCase()
+-      .includes(query.trim().toLowerCase()),
+-  );
 +  const unlocked = production?.unlocked ?? false;
 +  const canEdit = selected
 +    ? canEditAvailability(selected, pubkey, unlocked)
@@ -1888,10 +1964,17 @@ index e4e4ac66d..c79282493 100644
 +    setPersonDraft(null);
 +    setConfirming(null);
 +  }, [unlocked, pubkey]);
-   const shown = people.filter((person) =>
-     `${person.name} ${person.role ?? ""}`
-       .toLowerCase()
-@@ -125,7 +143,7 @@ export function AvailabilityPanel({
++  const shown = [...people]
++    .sort((a, b) => Number(b.id === mine?.id) - Number(a.id === mine?.id))
++    .filter((person) =>
++      `${person.name} ${person.role ?? ""}`
++        .toLowerCase()
++        .includes(query.trim().toLowerCase()),
++    );
+   const rules = (selected?.rules ?? [])
+     .filter((rule) =>
+       filter === "weekly"
+@@ -125,7 +171,7 @@ export function AvailabilityPanel({
      });
  
    const submitRule = async (rule: AvailabilityRule) => {
@@ -1900,7 +1983,7 @@ index e4e4ac66d..c79282493 100644
      const others = selected.rules.filter((item) => item.id !== rule.id);
      if (others.length >= MAX_RULES_PER_PERSON) {
        toast.error(`한 사람당 일정은 ${MAX_RULES_PER_PERSON}개까지입니다.`);
-@@ -139,7 +157,7 @@ export function AvailabilityPanel({
+@@ -139,7 +185,7 @@ export function AvailabilityPanel({
    };
  
    const removeRule = (rule: AvailabilityRule) => {
@@ -1909,15 +1992,113 @@ index e4e4ac66d..c79282493 100644
      setConfirming(null);
      void run(
        () =>
-@@ -181,6 +199,7 @@ export function AvailabilityPanel({
-         aria-label="팀원 목록"
-         className="flex w-full shrink-0 flex-col gap-2 md:w-64"
-       >
-+        {production ? <ProductionControls production={production} /> : null}
-         <div className="flex items-center gap-2">
-           <div className="relative min-w-0 flex-1">
-             <Search className="pointer-events-none absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
-@@ -280,23 +299,31 @@ export function AvailabilityPanel({
+@@ -206,12 +252,86 @@ export function AvailabilityPanel({
+             <Plus className="h-4 w-4" />
+           </Button>
+         </div>
+-        {mine ? null : (
+-          <p className="rounded-md bg-muted px-2 py-1.5 text-2xs text-muted-foreground">
+-            내 이름을 고른 뒤 "이 사람이 나예요"를 누르면 다음부터 바로 내
+-            일정이 열립니다.
+-          </p>
+-        )}
++        {status === "ready" && !mine ? (
++          <div
++            className="flex flex-col gap-2 rounded-lg border border-border/70 p-3"
++            data-testid="availability-claim-card"
++          >
++            <p className="text-sm font-medium">내 이름을 눌러 연결해 주세요</p>
++            <Input
++              aria-label="내 이름 찾기"
++              placeholder="이름 검색"
++              value={claimQuery}
++              onChange={(event) => setClaimQuery(event.target.value)}
++            />
++            <div className="flex max-h-48 flex-wrap gap-2 overflow-y-auto">
++              {people
++                .filter(
++                  (person) =>
++                    !person.pubkey && person.name.includes(claimQuery.trim()),
++                )
++                .map((person) => (
++                  <Button
++                    key={person.id}
++                    size="sm"
++                    variant="outline"
++                    type="button"
++                    disabled={saving}
++                    onClick={() => setClaimId(person.id)}
++                  >
++                    {person.name}
++                  </Button>
++                ))}
++            </div>
++            {people.some(
++              (person) =>
++                !person.pubkey && person.name.includes(claimQuery.trim()),
++            ) ? null : (
++              <p className="text-xs text-muted-foreground">
++                찾는 이름이 없어요.
++              </p>
++            )}
++          </div>
++        ) : null}
++        <AlertDialog
++          open={!!pendingClaim && !mine}
++          onOpenChange={(open) => {
++            if (!open && !saving) setClaimId(null);
++          }}
++        >
++          <AlertDialogContent>
++            <AlertDialogTitle>
++              {pendingClaim?.name}님이 맞나요?
++            </AlertDialogTitle>
++            <AlertDialogDescription>
++              연결하면 다음부터 내 일정이 바로 열려요.
++            </AlertDialogDescription>
++            <div className="flex justify-end gap-2">
++              <AlertDialogCancel disabled={saving}>취소</AlertDialogCancel>
++              <Button
++                type="button"
++                disabled={saving || !!pendingClaim?.pubkey}
++                onClick={() => {
++                  if (!pendingClaim || pendingClaim.pubkey || mine || saving)
++                    return;
++                  void run(
++                    () => onSave({ ...pendingClaim, pubkey }),
++                    "연결하지 못했어요.",
++                  ).then((ok) => {
++                    if (ok) {
++                      setSelectedId(pendingClaim.id);
++                      setClaimId(null);
++                      setRuleDraft(null);
++                      setPersonDraft(null);
++                    }
++                  });
++                }}
++              >
++                확인
++              </Button>
++            </div>
++          </AlertDialogContent>
++        </AlertDialog>
+         <ul className="flex max-h-[26rem] flex-col gap-1 overflow-y-auto">
+           {shown.map((person) => (
+             <li key={person.id}>
+@@ -241,7 +361,11 @@ export function AvailabilityPanel({
+                     ) : null}
+                   </span>
+                   <span className="block truncate text-2xs text-muted-foreground">
+-                    {[person.role, `${counts(person)}개 일정`]
++                    {[
++                      person.role,
++                      person.pubkey ? "연결됨" : null,
++                      `${counts(person)}개 일정`,
++                    ]
+                       .filter(Boolean)
+                       .join(" · ")}
+                   </span>
+@@ -280,23 +404,31 @@ export function AvailabilityPanel({
                  : "팀원 추가"}
              </h3>
              <div className="grid grid-cols-2 gap-2">
@@ -1953,7 +2134,7 @@ index e4e4ac66d..c79282493 100644
                    }
                    placeholder="예: 촬영감독"
                    value={personDraft.role ?? ""}
-@@ -307,6 +334,7 @@ export function AvailabilityPanel({
+@@ -307,6 +439,7 @@ export function AvailabilityPanel({
                Buzz 멤버 연결 (선택)
                <select
                  className={SELECT_CLASS}
@@ -1961,7 +2142,7 @@ index e4e4ac66d..c79282493 100644
                  onChange={(event) =>
                    setPersonDraft({
                      ...personDraft,
-@@ -316,11 +344,13 @@ export function AvailabilityPanel({
+@@ -316,11 +449,13 @@ export function AvailabilityPanel({
                  value={personDraft.pubkey ?? ""}
                >
                  <option value="">연결 안 함</option>
@@ -1980,7 +2161,14 @@ index e4e4ac66d..c79282493 100644
                </select>
              </label>
              <div className="flex justify-end gap-2">
-@@ -367,20 +397,18 @@ export function AvailabilityPanel({
+@@ -361,26 +496,24 @@ export function AvailabilityPanel({
+                 <p className="text-2xs text-muted-foreground">
+                   {selected.pubkey
+                     ? `Buzz: ${nameOf(selected.pubkey)}`
+-                    : "Buzz 멤버와 연결 안 됨"}{" "}
++                    : "아직 연결 안 됐어요"}{" "}
+                   · 빈 시간은 기본적으로 가능해요. 안 되는 시간과 조율 중인
+                   시간만 적어 주세요.
                  </p>
                </div>
                <div className="flex flex-wrap gap-1">
@@ -2009,7 +2197,7 @@ index e4e4ac66d..c79282493 100644
                        }, "연결하지 못했습니다.")
                      }
                      size="xs"
-@@ -390,40 +418,44 @@ export function AvailabilityPanel({
+@@ -390,40 +523,44 @@ export function AvailabilityPanel({
                      <UserRound className="h-3 w-3" />이 사람이 나예요
                    </Button>
                  ) : null}
@@ -2086,7 +2274,7 @@ index e4e4ac66d..c79282493 100644
                <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs">
                  <span>
                    {selected.name}님과 일정 {selected.rules.length}개를 모두
-@@ -471,7 +503,7 @@ export function AvailabilityPanel({
+@@ -471,7 +608,7 @@ export function AvailabilityPanel({
                    </Button>
                  ))}
                </div>
@@ -2095,7 +2283,7 @@ index e4e4ac66d..c79282493 100644
                  <Button
                    data-testid="availability-add-rule"
                    onClick={() => setRuleDraft(emptyRuleDraft(today))}
-@@ -484,12 +516,14 @@ export function AvailabilityPanel({
+@@ -484,12 +621,14 @@ export function AvailabilityPanel({
                )}
              </div>
  
@@ -2112,7 +2300,38 @@ index e4e4ac66d..c79282493 100644
                  }
                  onSubmit={(rule) => void submitRule(rule)}
                  saving={saving}
-@@ -527,7 +561,7 @@ export function AvailabilityPanel({
+@@ -515,6 +654,30 @@ export function AvailabilityPanel({
+                       <span className="break-words font-medium">
+                         {rule.title}
+                       </span>
++                      {rule.lockedTitle &&
++                      !unlocked &&
++                      rule.lockedTitle.author !== pubkey ? (
++                        <TooltipProvider>
++                          <Tooltip>
++                            <TooltipTrigger asChild>
++                              <button
++                                type="button"
++                                aria-label="숨긴 사유 안내"
++                                className="inline-flex text-muted-foreground"
++                                data-testid="availability-reason-lock"
++                              >
++                                <LockKeyhole
++                                  aria-hidden="true"
++                                  className="h-3 w-3"
++                                />
++                              </button>
++                            </TooltipTrigger>
++                            <TooltipContent>
++                              본인과 제작부만 볼 수 있어요
++                            </TooltipContent>
++                          </Tooltip>
++                        </TooltipProvider>
++                      ) : null}
+                       <span
+                         className={cn(
+                           "rounded px-1.5 text-2xs font-semibold",
+@@ -527,7 +690,7 @@ export function AvailabilityPanel({
                      <p className="text-xs text-muted-foreground">
                        {ruleWhenLabel(rule)}
                      </p>
@@ -2121,7 +2340,7 @@ index e4e4ac66d..c79282493 100644
                        <div className="mt-1 flex justify-end">
                          <Button
                            disabled={saving}
-@@ -541,28 +575,32 @@ export function AvailabilityPanel({
+@@ -541,28 +704,32 @@ export function AvailabilityPanel({
                        </div>
                      ) : null}
                    </div>
@@ -2176,7 +2395,7 @@ index e4e4ac66d..c79282493 100644
                  </li>
                ))}
                {rules.length === 0 ? (
-@@ -575,7 +613,7 @@ export function AvailabilityPanel({
+@@ -575,7 +742,7 @@ export function AvailabilityPanel({
            </>
          ) : personDraft ? null : (
            <p className="px-2 py-10 text-center text-sm text-muted-foreground">
@@ -2297,159 +2516,228 @@ index d389313dd..b11653222 100644
                }}
 diff --git a/desktop/src/features/team-calendar/ui/ProductionControls.tsx b/desktop/src/features/team-calendar/ui/ProductionControls.tsx
 new file mode 100644
-index 000000000..9cc84f1a0
+index 000000000..f039cc5ff
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/ProductionControls.tsx
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,172 @@
 +import * as React from "react";
 +import type { AvailabilityProduction } from "../lib/useAvailabilityPrivacy";
 +import { Button } from "@/shared/ui/button";
 +import { Input } from "@/shared/ui/input";
++import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 +
-+/** A short password form, usable by keyboard as well as pointer. */
++/** One production status button with keyboard-accessible password and lock controls. */
 +export function ProductionControls({
 +  production,
 +}: {
 +  production: AvailabilityProduction;
 +}) {
 +  const passwordId = React.useId();
-+  const [mode, setMode] = React.useState<"set" | "open" | null>(null);
++  const repeatId = React.useId();
++  const [open, setOpen] = React.useState(false);
++  const [changing, setChanging] = React.useState(false);
 +  const [password, setPassword] = React.useState("");
++  const [repeat, setRepeat] = React.useState("");
 +  const [saving, setSaving] = React.useState(false);
 +  const [error, setError] = React.useState("");
-+  const run = async (action: () => Promise<void>) => {
-+    setSaving(true);
++  const setting = !production.configured || changing;
++  const reset = () => {
++    setChanging(false);
++    setPassword("");
++    setRepeat("");
 +    setError("");
-+    try {
-+      await action();
-+      setPassword("");
-+      setMode(null);
-+    } catch (e) {
-+      const message = e instanceof Error ? e.message : "저장하지 못했어요.";
-+      setError(message);
-+    } finally {
-+      setSaving(false);
-+    }
 +  };
++  if (!production.configured && !production.canManage) return null;
 +  return (
-+    <div className="flex flex-col gap-2">
-+      <div className="flex flex-wrap gap-2">
-+        {production.canManage ? (
-+          <Button
-+            size="sm"
-+            variant="outline"
-+            type="button"
-+            disabled={saving}
-+            onClick={() => {
-+              setMode("set");
-+              setError("");
-+            }}
-+          >
-+            제작부 비밀번호 정하기
-+          </Button>
-+        ) : null}
-+        {production.configured ? (
-+          production.unlocked ? (
-+            <>
++    <Popover
++      open={open}
++      onOpenChange={(next) => {
++        if (!saving) {
++          setOpen(next);
++          reset();
++        }
++      }}
++    >
++      <PopoverTrigger asChild>
++        <Button
++          size="sm"
++          variant="outline"
++          type="button"
++          disabled={saving}
++          data-testid="production-status"
++        >
++          {production.unlocked
++            ? "🔓 제작부 보는 중"
++            : production.configured
++              ? "🔒 제작부"
++              : "🔒 제작부 비밀번호 만들기"}
++        </Button>
++      </PopoverTrigger>
++      <PopoverContent align="end" aria-label="제작부">
++        {production.unlocked && !changing ? (
++          <div className="flex flex-col gap-1">
++            <Button
++              size="sm"
++              variant="ghost"
++              type="button"
++              onClick={() => {
++                try {
++                  production.lock();
++                  setOpen(false);
++                  reset();
++                } catch {
++                  setError("이 기기에서 잠그지 못했어요.");
++                }
++              }}
++            >
++              잠그기
++            </Button>
++            {production.canManage ? (
 +              <Button
 +                size="sm"
-+                variant="outline"
++                variant="ghost"
++                type="button"
++                onClick={() => {
++                  reset();
++                  setChanging(true);
++                }}
++              >
++                비밀번호 바꾸기
++              </Button>
++            ) : null}
++          </div>
++        ) : (
++          <form
++            className="flex flex-col gap-3"
++            onSubmit={async (event) => {
++              event.preventDefault();
++              if (saving) return;
++              setError("");
++              if (setting && password !== repeat) {
++                setError("비밀번호를 똑같이 적어 주세요");
++                return;
++              }
++              setSaving(true);
++              try {
++                if (setting) await production.setPassword(password);
++                else await production.unlock(password);
++                setOpen(false);
++                reset();
++              } catch (e) {
++                setError(e instanceof Error ? e.message : "저장하지 못했어요.");
++              } finally {
++                setSaving(false);
++              }
++            }}
++          >
++            <label htmlFor={passwordId} className="flex flex-col gap-1 text-xs">
++              비밀번호
++              <Input
++                id={passwordId}
++                autoFocus
++                type="password"
++                autoComplete={setting ? "new-password" : "current-password"}
++                value={password}
++                onChange={(e) => setPassword(e.target.value)}
++                disabled={saving}
++              />
++            </label>
++            {setting ? (
++              <>
++                <label
++                  htmlFor={repeatId}
++                  className="flex flex-col gap-1 text-xs"
++                >
++                  한 번 더
++                  <Input
++                    id={repeatId}
++                    type="password"
++                    autoComplete="new-password"
++                    value={repeat}
++                    onChange={(e) => setRepeat(e.target.value)}
++                    disabled={saving}
++                  />
++                </label>
++                <p className="text-xs text-muted-foreground">
++                  제작부 톡방에 공유해 주세요. 다른 팀원에게는 일정 사유가
++                  '불가'로만 보여요.
++                </p>
++              </>
++            ) : null}
++            <div className="flex justify-end gap-2">
++              <Button
++                size="sm"
++                variant="ghost"
 +                type="button"
 +                disabled={saving}
 +                onClick={() => {
-+                  try {
-+                    production.lock();
-+                    setMode(null);
-+                    setPassword("");
-+                  } catch {
-+                    setError("이 기기에서 잠그지 못했어요.");
-+                  }
++                  setOpen(false);
++                  reset();
 +                }}
 +              >
-+                제작부 잠그기
++                취소
 +              </Button>
-+              <Button
-+                size="sm"
-+                variant="outline"
-+                type="button"
-+                disabled={saving}
-+                onClick={() => void run(production.hideLegacy)}
-+              >
-+                예전 사유 숨기기
++              <Button size="sm" type="submit" disabled={saving}>
++                {setting ? "저장" : "열기"}
 +              </Button>
-+            </>
-+          ) : (
-+            <Button
-+              size="sm"
-+              variant="outline"
-+              type="button"
-+              disabled={saving}
-+              onClick={() => {
-+                setMode("open");
-+                setError("");
-+              }}
-+            >
-+              제작부 열기
-+            </Button>
-+          )
++            </div>
++          </form>
++        )}
++        {error ? (
++          <p role="alert" className="mt-2 text-xs text-destructive">
++            {error}
++          </p>
 +        ) : null}
-+      </div>
-+      {mode ? (
-+        <form
-+          className="flex flex-wrap items-end gap-2"
-+          onSubmit={(event) => {
-+            event.preventDefault();
-+            void run(() =>
-+              mode === "set"
-+                ? production.setPassword(password)
-+                : production.unlock(password),
-+            );
-+          }}
-+        >
-+          <label htmlFor={passwordId} className="flex flex-col gap-1 text-xs">
-+            {mode === "set" ? "새 제작부 비밀번호" : "제작부 비밀번호"}
-+            <Input
-+              id={passwordId}
-+              autoFocus
-+              type="password"
-+              autoComplete={
-+                mode === "set" ? "new-password" : "current-password"
-+              }
-+              value={password}
-+              onChange={(e) => setPassword(e.target.value)}
-+            />
-+          </label>
-+          <Button size="sm" type="submit" disabled={saving}>
-+            {mode === "set" ? "정하기" : "열기"}
-+          </Button>
-+          <Button
-+            size="sm"
-+            variant="ghost"
-+            type="button"
-+            disabled={saving}
-+            onClick={() => {
-+              setMode(null);
-+              setPassword("");
-+              setError("");
-+            }}
-+          >
-+            취소
-+          </Button>
-+        </form>
-+      ) : null}
-+      {error ? (
-+        <p role="alert" className="text-xs text-destructive">
-+          {error}
-+        </p>
-+      ) : null}
-+    </div>
++      </PopoverContent>
++    </Popover>
 +  );
 +}
 diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
-index 55eca5e44..c3081d5e7 100644
+index 55eca5e44..c22c8a59e 100644
 --- a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
 +++ b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
-@@ -580,6 +580,9 @@ export function TeamCalendarDialog({
+@@ -57,6 +57,7 @@ import { type CommonTimeSlot, koreanToday } from "../lib/commonTime";
+ import { minuteLabel } from "../lib/teamAvailability";
+ import { CommonTimePanel } from "./CommonTimePanel";
+ import { AvailabilityPanel } from "./AvailabilityPanel";
++import { ProductionControls } from "./ProductionControls";
+ import { CalendarGrid, dateLabel, weeksOf } from "./CalendarGrid";
+ import { DayPanel } from "./DayPanel";
+ import { DigestPanel } from "./DigestPanel";
+@@ -556,16 +557,22 @@ export function TeamCalendarDialog({
+         />
+       ) : tab === "people" ? (
+         <div className="space-y-4">
+-          <Button
+-            type="button"
+-            size="sm"
+-            variant="outline"
+-            aria-expanded={showCommonTime}
+-            disabled={availability.status !== "ready"}
+-            onClick={() => setShowCommonTime((shown) => !shown)}
+-          >
+-            함께 되는 시간 찾기
+-          </Button>
++          <div className="flex flex-wrap items-center justify-between gap-2">
++            <Button
++              type="button"
++              size="sm"
++              variant="outline"
++              aria-expanded={showCommonTime}
++              disabled={availability.status !== "ready"}
++              onClick={() => setShowCommonTime((shown) => !shown)}
++            >
++              함께 되는 시간 찾기
++            </Button>
++            <ProductionControls
++              key={`${pubkey}|${relayUrl}`}
++              production={availability.production}
++            />
++          </div>
+           {availability.status === "error" ? (
+             <Button
+               type="button"
+@@ -580,6 +587,9 @@ export function TeamCalendarDialog({
              <CommonTimePanel people={people} onPick={pickCommonTime} />
            ) : null}
            <AvailabilityPanel
@@ -2461,10 +2749,10 @@ index 55eca5e44..c3081d5e7 100644
              onDelete={availability.deletePerson}
 diff --git a/desktop/src/features/team-calendar/ui/availabilityPrivacy.jsdom-test.mjs b/desktop/src/features/team-calendar/ui/availabilityPrivacy.jsdom-test.mjs
 new file mode 100644
-index 000000000..eee009be2
+index 000000000..462e876e6
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/availabilityPrivacy.jsdom-test.mjs
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,500 @@
 +import assert from "node:assert/strict";
 +import { afterEach, test, mock } from "node:test";
 +import React from "react";
@@ -2492,6 +2780,7 @@ index 000000000..eee009be2
 +  pubkey,
 +  relayUrl,
 +} from "../../team-schedule/ui/scheduleTestSupport.mjs";
++import { toast } from "sonner";
 +import { relayClient } from "@/shared/api/relayClient";
 +
 +let env;
@@ -2537,16 +2826,29 @@ index 000000000..eee009be2
 +  sig: "",
 +});
 +
-+async function fixture({ manager = false, configured = true } = {}) {
++async function fixture({
++  manager = false,
++  configured = true,
++  legacy = false,
++  linked = false,
++  failMigration = false,
++} = {}) {
 +  const key = await productionKey("테스트", relayUrl);
 +  let events = [
 +    makeEvent({
 +      p1: person("p1", {
-+        rules: [configured ? lockRule(rule, alice, key.pubkey) : rule],
++        rules: [
++          configured && !legacy ? lockRule(rule, alice, key.pubkey) : rule,
++        ],
 +      }),
 +      p2: person("p2", { pubkey: undefined, rules: [] }),
 +    }),
 +  ];
++  if (linked)
++    events.push({
++      ...makeEvent({ p2: person("p2", { pubkey, rules: [] }) }),
++      pubkey,
++    });
 +  let settings = configured
 +    ? [
 +        {
@@ -2585,6 +2887,8 @@ index 000000000..eee009be2
 +  const publishes = [];
 +  mock.method(relayClient, "publishEvent", async (event) => {
 +    publishes.push(event);
++    if (event.tags[0][1] === d && failMigration)
++      throw new Error("가짜 저장 실패");
 +    if (event.tags[0][1] === d)
 +      events = [...events.filter((e) => e.pubkey !== event.pubkey), event];
 +    else settings = [event];
@@ -2607,6 +2911,9 @@ index 000000000..eee009be2
 +  };
 +  return {
 +    key,
++    allowMigration() {
++      failMigration = false;
++    },
 +    publishes,
 +    listeners,
 +    get events() {
@@ -2641,15 +2948,25 @@ index 000000000..eee009be2
 +  let view = calendar();
 +  let panel = await selectPerson(view);
 +  assert.equal(panel.queryByText("가짜 알바"), null);
++  assert.equal(view.getAllByTestId("production-status").length, 1);
++  assert.ok(panel.getByTestId("availability-reason-lock"));
++  fireEvent.focus(panel.getByTestId("availability-reason-lock"));
++  await waitFor(() =>
++    assert.equal(
++      view.getByRole("tooltip").textContent,
++      "본인과 제작부만 볼 수 있어요",
++    ),
++  );
++  fireEvent.blur(panel.getByTestId("availability-reason-lock"));
 +  assert.equal(panel.queryByRole("button", { name: "정보 수정" }), null);
 +  assert.equal(panel.queryByRole("button", { name: "팀원 삭제" }), null);
 +  assert.equal(panel.queryByRole("button", { name: "이 사람이 나예요" }), null);
 +  assert.equal(
-+    view.queryByRole("button", { name: "제작부 비밀번호 정하기" }),
++    view.queryByRole("button", { name: "🔒 제작부 비밀번호 만들기" }),
 +    null,
 +  );
-+  fireEvent.click(view.getByRole("button", { name: "제작부 열기" }));
-+  fireEvent.change(view.getByLabelText("제작부 비밀번호"), {
++  fireEvent.click(view.getByRole("button", { name: "🔒 제작부", exact: true }));
++  fireEvent.change(view.getByLabelText("비밀번호", { exact: true }), {
 +    target: { value: "틀림" },
 +  });
 +  fireEvent.submit(
@@ -2662,7 +2979,7 @@ index 000000000..eee009be2
 +    localStorage.getItem(productionStorageKey(pubkey, relayUrl)),
 +    null,
 +  );
-+  fireEvent.change(view.getByLabelText("제작부 비밀번호"), {
++  fireEvent.change(view.getByLabelText("비밀번호", { exact: true }), {
 +    target: { value: "테스트" },
 +  });
 +  fireEvent.submit(
@@ -2675,7 +2992,8 @@ index 000000000..eee009be2
 +  view = calendar();
 +  panel = await selectPerson(view);
 +  await waitFor(() => assert.ok(panel.getByText("가짜 알바")));
-+  fireEvent.click(view.getByRole("button", { name: "제작부 잠그기" }));
++  fireEvent.click(view.getByRole("button", { name: "🔓 제작부 보는 중" }));
++  fireEvent.click(view.getByRole("button", { name: "잠그기", exact: true }));
 +  assert.equal(panel.queryByText("가짜 알바"), null);
 +  assert.equal(panel.queryByRole("button", { name: "정보 수정" }), null);
 +  assert.equal(
@@ -2684,22 +3002,36 @@ index 000000000..eee009be2
 +  );
 +});
 +
-+test("manager sets password, leaves legacy plaintext until explicit migration, and production edits arrive with verifiable proof", async () => {
++test("manager sets matching passwords, automatically hides legacy once, and production edits arrive with verifiable proof", async () => {
++  const notice = mock.method(toast, "success", () => {});
 +  const f = await fixture({ manager: true, configured: false });
 +  const view = calendar();
 +  const panel = await selectPerson(view);
-+  fireEvent.click(view.getByRole("button", { name: "제작부 비밀번호 정하기" }));
-+  const input = view.getByLabelText("새 제작부 비밀번호");
++  fireEvent.click(
++    view.getByRole("button", { name: "🔒 제작부 비밀번호 만들기" }),
++  );
++  const input = view.getByLabelText("비밀번호", { exact: true });
 +  assert.equal(input.hasAttribute("maxlength"), false);
 +  assert.equal(input.hasAttribute("minlength"), false);
 +  fireEvent.change(input, { target: { value: "테스트" } });
 +  fireEvent.submit(input.closest("form"));
++  assert.ok(view.getByText("비밀번호를 똑같이 적어 주세요"));
++  assert.equal(f.publishes.length, 0);
++  fireEvent.change(view.getByLabelText("한 번 더"), {
++    target: { value: "테스트" },
++  });
++  fireEvent.submit(input.closest("form"));
 +  await waitFor(() =>
-+    assert.ok(view.getByRole("button", { name: "제작부 잠그기" })),
++    assert.ok(view.getByRole("button", { name: "🔓 제작부 보는 중" })),
 +  );
-+  assert.equal(f.publishes.length, 1);
-+  fireEvent.click(view.getByRole("button", { name: "예전 사유 숨기기" }));
 +  await waitFor(() => assert.equal(f.publishes.length, 2));
++  await waitFor(() => assert.equal(notice.mock.callCount(), 1));
++  assert.equal(notice.mock.calls[0].arguments[0], "예전 사유 1개를 숨겼어요");
++  assert.equal(view.queryByRole("button", { name: "예전 사유 숨기기" }), null);
++  await act(async () => {
++    for (const receive of f.listeners) receive(f.events[0]);
++  });
++  assert.equal(f.publishes.length, 2);
 +  assert.equal(f.publishes[1].content.includes("가짜 알바"), false);
 +  const proof = JSON.parse(f.publishes[1].content).production;
 +  assert.equal(proof.pubkey, f.key.pubkey);
@@ -2713,7 +3045,8 @@ index 000000000..eee009be2
 +  fireEvent.click(panel.getByRole("button", { name: "수정 저장" }));
 +  await waitFor(() => assert.equal(f.publishes.length, 3));
 +  await waitFor(() => assert.ok(panel.getByText("수정된 사유")));
-+  fireEvent.click(view.getByRole("button", { name: "제작부 잠그기" }));
++  fireEvent.click(view.getByRole("button", { name: "🔓 제작부 보는 중" }));
++  fireEvent.click(view.getByRole("button", { name: "잠그기", exact: true }));
 +  assert.equal(panel.queryByText("수정된 사유"), null);
 +});
 +
@@ -2755,6 +3088,170 @@ index 000000000..eee009be2
 +    resolveDecrypt("가짜 알바");
 +  });
 +  assert.equal(view.queryByText(/가짜 알바/), null);
++});
++
++test("unconfigured production has no button for a member; name card searches, confirms and opens my schedule", async () => {
++  const f = await fixture({ configured: false });
++  const view = calendar();
++  fireEvent.click(view.getByRole("tab", { name: "팀원 일정", exact: true }));
++  const card = await waitFor(() => view.getByTestId("availability-claim-card"));
++  assert.equal(view.queryByTestId("production-status"), null);
++  assert.equal(within(card).queryByRole("button", { name: "가짜 p1" }), null);
++  fireEvent.change(within(card).getByLabelText("내 이름 찾기"), {
++    target: { value: "없는 이름" },
++  });
++  assert.equal(within(card).queryByRole("button", { name: "가짜 p2" }), null);
++  fireEvent.change(within(card).getByLabelText("내 이름 찾기"), {
++    target: { value: "p2" },
++  });
++  fireEvent.click(within(card).getByRole("button", { name: "가짜 p2" }));
++  let confirmation = view.getByRole("alertdialog", {
++    name: "가짜 p2님이 맞나요?",
++  });
++  assert.equal(f.publishes.length, 0);
++  fireEvent.click(within(confirmation).getByRole("button", { name: "취소" }));
++  assert.equal(f.publishes.length, 0);
++  fireEvent.click(within(card).getByRole("button", { name: "가짜 p2" }));
++  confirmation = view.getByRole("alertdialog");
++  fireEvent.click(within(confirmation).getByRole("button", { name: "확인" }));
++  await waitFor(() =>
++    assert.ok(view.queryByTestId("availability-claim-card") === null),
++  );
++  assert.match(
++    view.getByTestId("availability-person-name").textContent,
++    /가짜 p2님의 일정/,
++  );
++  assert.match(
++    view.getAllByTestId("availability-person")[0].textContent,
++    /가짜 p2나.*연결됨/,
++  );
++  assert.equal(f.publishes.length, 1);
++});
++
++test("linked account selects its schedule after async load, sorts me first, and keeps other selections usable", async () => {
++  await fixture({ linked: true });
++  const view = calendar();
++  fireEvent.click(view.getByRole("tab", { name: "팀원 일정", exact: true }));
++  await waitFor(() =>
++    assert.match(
++      view.getByTestId("availability-person-name").textContent,
++      /가짜 p2님의 일정/,
++    ),
++  );
++  assert.ok(view.queryByTestId("availability-claim-card") === null);
++  assert.match(
++    view.getAllByTestId("availability-person")[0].textContent,
++    /가짜 p2나.*연결됨/,
++  );
++  fireEvent.click(view.getAllByTestId("availability-person")[1]);
++  assert.match(
++    view.getByTestId("availability-person-name").textContent,
++    /가짜 p1님의 일정/,
++  );
++});
++
++test("automatic hiding retries quietly on the next query and does not repeat successful migration on reopen", async () => {
++  const notice = mock.method(toast, "success", () => {});
++  const errors = mock.method(toast, "error", () => {});
++  const f = await fixture({ legacy: true, failMigration: true });
++  localStorage.setItem(
++    productionStorageKey(pubkey, relayUrl),
++    Buffer.from(f.key.secret).toString("hex"),
++  );
++  let view = calendar();
++  await selectPerson(view);
++  await waitFor(() => assert.equal(f.publishes.length, 1));
++  await act(async () => {
++    await new Promise((resolve) => setTimeout(resolve, 50));
++  });
++  assert.equal(f.publishes.length, 1);
++  assert.equal(notice.mock.callCount(), 0);
++  assert.equal(errors.mock.callCount(), 0);
++  f.allowMigration();
++  await act(async () => {
++    for (const receive of f.listeners) receive(f.events[0]);
++  });
++  await waitFor(() => assert.equal(f.publishes.length, 2));
++  await waitFor(() => assert.equal(notice.mock.callCount(), 1));
++  view.unmount();
++  view = calendar();
++  await selectPerson(view);
++  await act(async () => {
++    for (const receive of f.listeners) receive(f.events[0]);
++  });
++  assert.equal(f.publishes.length, 2);
++  assert.equal(notice.mock.callCount(), 1);
++});
++
++test("open manager menu changes password with confirmation and immediately hides new legacy reasons", async () => {
++  const notice = mock.method(toast, "success", () => {});
++  const f = await fixture({ manager: true });
++  localStorage.setItem(
++    productionStorageKey(pubkey, relayUrl),
++    Buffer.from(f.key.secret).toString("hex"),
++  );
++  const view = calendar();
++  await selectPerson(view);
++  await waitFor(() =>
++    assert.ok(view.getByRole("button", { name: "🔓 제작부 보는 중" })),
++  );
++  // A legacy rule arrives just before rotation; changing must also discover it.
++  f.replace([
++    makeEvent({
++      p1: person("p1", { rules: [rule] }),
++      p2: person("p2", { pubkey: undefined, rules: [] }),
++    }),
++  ]);
++  fireEvent.click(view.getByRole("button", { name: "🔓 제작부 보는 중" }));
++  fireEvent.click(view.getByRole("button", { name: "비밀번호 바꾸기" }));
++  fireEvent.change(view.getByLabelText("비밀번호", { exact: true }), {
++    target: { value: "새 값" },
++  });
++  fireEvent.change(view.getByLabelText("한 번 더"), {
++    target: { value: "새 값" },
++  });
++  fireEvent.submit(
++    view.getByLabelText("비밀번호", { exact: true }).closest("form"),
++  );
++  await waitFor(() => assert.equal(f.publishes.length, 2));
++  await waitFor(() => assert.equal(notice.mock.callCount(), 1));
++  assert.ok(view.getByRole("button", { name: "🔓 제작부 보는 중" }));
++  const next = await productionKey("새 값", relayUrl);
++  assert.equal(
++    JSON.parse(f.publishes[1].content).production.pubkey,
++    next.pubkey,
++  );
++  assert.equal(f.publishes[1].content.includes(rule.title), false);
++});
++
++test("locking during automatic hiding cancels the pending publish and success notice", async () => {
++  const notice = mock.method(toast, "success", () => {});
++  const f = await fixture({ legacy: true });
++  localStorage.setItem(
++    productionStorageKey(pubkey, relayUrl),
++    Buffer.from(f.key.secret).toString("hex"),
++  );
++  const invoke = window.__TAURI_INTERNALS__.invoke;
++  let release;
++  window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
++    if (cmd === "sign_event")
++      await new Promise((resolve) => {
++        release = resolve;
++      });
++    return invoke(cmd, args);
++  };
++  const view = calendar();
++  await selectPerson(view);
++  await waitFor(() => assert.equal(typeof release, "function"));
++  fireEvent.click(view.getByRole("button", { name: "🔓 제작부 보는 중" }));
++  assert.equal(view.queryByRole("button", { name: "비밀번호 바꾸기" }), null);
++  fireEvent.click(view.getByRole("button", { name: "잠그기", exact: true }));
++  await act(async () => {
++    release();
++  });
++  assert.equal(f.publishes.length, 0);
++  assert.equal(notice.mock.callCount(), 0);
++  assert.ok(view.getByRole("button", { name: "🔒 제작부", exact: true }));
 +});
 diff --git a/desktop/src/shared/api/tauri.ts b/desktop/src/shared/api/tauri.ts
 index 3824df838..12d963f3a 100644
