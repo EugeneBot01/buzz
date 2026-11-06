@@ -39,7 +39,7 @@ Patches applied on top of an upstream `desktop-vX.Y.Z` tag, in patch-number orde
 | `104-schedule-tabs.patch` | Shared schedule link tabs, local device URLs and embedded child webviews | `BUZZ-SCHEDULE-TABS-PATCH.md` |
 | `105-team-hub.patch` | Six team feature tiles, full-page schedule and existing feature navigation | `BUZZ-TEAM-HUB-PATCH.md` |
 | `106-common-time.patch` | Find common meeting time from member schedules, ranked cards and 30-minute table | `BUZZ-COMMON-TIME-PATCH.md` |
-| `107-availability-production-lock.patch` | Member schedule privacy, one production button, automatic legacy hiding, easy name linking and verified edit ownership | `BUZZ-AVAILABILITY-PRODUCTION-LOCK-PATCH.md` |
+| `107-availability-production-lock.patch` | Member schedule privacy, one production button, automatic legacy hiding, easy name linking/self-add and verified edit ownership | `BUZZ-AVAILABILITY-PRODUCTION-LOCK-PATCH.md` |
 
 
 

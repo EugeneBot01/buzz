@@ -117,10 +117,10 @@ index ad44f86f9..39ebbcba4 100644
      use super::build_nostr_identity_binding_event;
 diff --git a/desktop/src/features/team-calendar/README.md b/desktop/src/features/team-calendar/README.md
 new file mode 100644
-index 000000000..478fd9fe5
+index 000000000..02999b2aa
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/README.md
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,27 @@
 +# 팀원 일정 — 제작부 비밀번호 (107)
 +
 +- 팀원 일정 오른쪽 위에는 제작부 상태 버튼 하나가 있다. 방장·관리자는 **🔒 제작부 비밀번호 만들기**에서 비밀번호를 두 번 적고 저장한다. 길이 제한은 없다. 저장한 기기는 바로 제작부로 열린다. 비밀번호는 입력 그대로 사용하며 팀마다 결과가 다르다.
@@ -128,6 +128,7 @@ index 000000000..478fd9fe5
 +- 비밀번호 설정 뒤 저장하는 사유는 본인과 제작부에게 각각 NIP-44로 보관한다. 날짜·요일·시간·불가/가능/조율은 공개 상태라 달력과 함께 되는 시간 찾기는 계속 동작한다. 다른 팀원에게는 종류 이름과 작은 자물쇠가 보인다. 자물쇠에 마우스를 올리거나 키보드로 이동하면 **본인과 제작부만 볼 수 있어요**를 안내한다. 계정 비밀값은 JavaScript로 가져오지 않는다.
 +- 비밀번호를 아직 정하지 않으면 사유는 기존처럼 평문이다. 예전 평문도 그대로 읽는다. 제작부가 열려 있으면 예전 사유를 자동으로 한 번에 다시 저장하고 **예전 사유 N개를 숨겼어요**를 알린다. 설정·교체 직후와 기기 기억으로 다시 열 때도 동작한다. 실패하면 평문 원본을 유지하고 다음 조회(30초 주기·재연결·화면 재진입) 때 조용히 재시도한다. 저장 중에는 중복 실행하지 않는다. 과거에 배포된 문서·파일·사본까지 지우는 기능은 아니다.
 +- 아직 연결한 이름이 없으면 목록 위 **내 이름을 눌러 연결해 주세요** 카드에서 이름을 검색하고 **OOO님이 맞나요?**를 확인한다. 연결은 한 번 저장하고 그 사람 일정을 연다. 내 이름은 목록 맨 위에 **나**로 표시하고, 연결된 사람은 작게 **연결됨**을 표시한다. 다음에 화면을 열면 내 일정을 자동으로 고른다.
++- 이름 카드 아래 **목록에 내 이름이 없어요 · 나를 추가하기**는 검색 결과가 없어도 항상 보인다. 작은 창의 이름은 Buzz 표시 이름으로 채우며 역할은 선택이다. **추가**하면 새 사람 생성과 내 계정 연결을 한 번에 저장하고 내 일정을 연다. 같은 이름의 미연결 사람이 있으면 **OOO님이 목록에 있어요. 이 이름으로 연결할까요?**를 확인한 뒤 기존 사람에 연결한다. 기존 역할·일정은 유지하며, 저장 실패 시 입력과 오류 안내를 남겨 다시 시도할 수 있다.
 +- Buzz 계정과 연결된 사람은 본인과 제작부만 수정·삭제할 수 있다. 연결 안 된 사람은 누구나 수정하고 **이 사람이 나예요**로 자신을 연결한다. 기존 연결 해제·교체는 제작부가 한다. 저장 직전에도 최신 권한을 확인한다.
 +
 +## 저장·검사 경로
@@ -146,7 +147,7 @@ index 000000000..478fd9fe5
 +- `pnpm -C desktop exec tsc --noEmit`
 +- `cargo test --manifest-path desktop/src-tauri/Cargo.toml --features mesh-llm availability_reason`
 +
-+단위 테스트는 결정성·두 수신자의 사유 읽기·타인의 실패·평문 호환·설정 전 저장·작성자 검사·설정 권한·비밀번호 교체·게시 실패를 검사한다. DOM 테스트는 실제 캘린더와 조회/저장 훅에서 설정→열기→기기 기억→잠그기→자동 사유 숨기기→제작부 수정을 실행하고, 실시간 변조 및 늦게 끝난 사유 읽기를 검사한다. 상태별 단일 버튼·관리자 권한·재입력 확인·자동 숨기기 성공 알림과 실패 재시도·이름 검색/확인/연결·내 일정 자동 선택/정렬·사유 자물쇠도 실제 화면 경로로 검사한다. 테스트는 가짜 계정과 가짜 일정만 사용하며 실제 릴레이에 게시하지 않는다.
++단위 테스트는 결정성·두 수신자의 사유 읽기·타인의 실패·평문 호환·설정 전 저장·작성자 검사·설정 권한·비밀번호 교체·게시 실패를 검사한다. DOM 테스트는 실제 캘린더와 조회/저장 훅에서 설정→열기→기기 기억→잠그기→자동 사유 숨기기→제작부 수정을 실행하고, 실시간 변조 및 늦게 끝난 사유 읽기를 검사한다. 상태별 단일 버튼·관리자 권한·재입력 확인·자동 숨기기 성공 알림과 실패 재시도·이름 검색/확인/연결·내 일정 자동 선택/정렬·사유 자물쇠도 실제 화면 경로로 검사한다. 나를 추가하기는 버튼 상시 표시·표시 이름 미리 채움·생성/연결/선택의 한 번 저장·107 권한 검사 통과(제작부 설정 전/후)·동명인 연결과 기존 일정 보존·취소·저장 실패 후 재시도를 검사한다. 테스트는 가짜 계정과 가짜 일정만 사용하며 실제 릴레이에 게시하지 않는다.
 diff --git a/desktop/src/features/team-calendar/lib/availabilityMerge.ts b/desktop/src/features/team-calendar/lib/availabilityMerge.ts
 new file mode 100644
 index 000000000..89fc6a1dd
@@ -1864,8 +1865,198 @@ index be3d1f9bd..19d618bef 100644
 -
 -  return { people, status, savePeople, deletePerson, retry, refresh };
 -}
+diff --git a/desktop/src/features/team-calendar/ui/AddMyselfDialog.tsx b/desktop/src/features/team-calendar/ui/AddMyselfDialog.tsx
+new file mode 100644
+index 000000000..2e321a856
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/AddMyselfDialog.tsx
+@@ -0,0 +1,184 @@
++import * as React from "react";
++import {
++  MAX_NAME_LENGTH,
++  MAX_PEOPLE,
++  MAX_ROLE_LENGTH,
++  type TeamPerson,
++} from "../lib/teamAvailability";
++import type { PersonInput } from "../lib/useTeamSprint";
++import { Button } from "@/shared/ui/button";
++import { Input } from "@/shared/ui/input";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogTitle,
++  DialogTrigger,
++} from "@/shared/ui/dialog";
++
++/** Add and link yourself in one save, or confirm an existing unlinked name. */
++export function AddMyselfDialog({
++  pubkey,
++  displayName,
++  people,
++  disabled,
++  onSave,
++  onAdded,
++}: {
++  pubkey: string;
++  displayName: string;
++  people: TeamPerson[];
++  disabled: boolean;
++  onSave: (person: PersonInput) => Promise<void>;
++  onAdded: (id: string) => void;
++}) {
++  const formId = React.useId();
++  const [open, setOpen] = React.useState(false);
++  const [name, setName] = React.useState("");
++  const [role, setRole] = React.useState("");
++  const [matchId, setMatchId] = React.useState<string | null>(null);
++  const [saving, setSaving] = React.useState(false);
++  const [error, setError] = React.useState("");
++  const match = people.find((person) => person.id === matchId);
++
++  const submit = async () => {
++    if (saving || disabled || !name.trim()) return;
++    setError("");
++    if (people.some((person) => person.pubkey === pubkey)) {
++      setError("이미 내 이름에 연결돼 있어요. 창을 닫고 확인해 주세요.");
++      return;
++    }
++    // Recheck the current list on both submit and confirmation.
++    const existing = people.find(
++      (person) => !person.pubkey && person.name.trim() === name.trim(),
++    );
++    if (existing && existing.id !== matchId) {
++      setMatchId(existing.id);
++      return;
++    }
++    if (matchId && (!existing || existing.id !== matchId)) {
++      setMatchId(null);
++      setError("목록이 바뀌었어요. 이름을 다시 확인해 주세요.");
++      return;
++    }
++    if (!existing && people.length >= MAX_PEOPLE) {
++      setError(`팀원은 ${MAX_PEOPLE}명까지 넣을 수 있어요.`);
++      return;
++    }
++    const input: PersonInput = existing
++      ? { ...existing, pubkey }
++      : {
++          id: `p${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`,
++          name: name.trim(),
++          role: role.trim() || undefined,
++          rules: [],
++          pubkey,
++        };
++    setSaving(true);
++    try {
++      await onSave(input);
++      setOpen(false);
++      onAdded(input.id);
++    } catch (cause) {
++      setError(cause instanceof Error ? cause.message : "저장하지 못했어요.");
++    } finally {
++      setSaving(false);
++    }
++  };
++
++  return (
++    <Dialog
++      open={open}
++      onOpenChange={(next) => {
++        if (saving) return;
++        if (next) {
++          setName(displayName.slice(0, MAX_NAME_LENGTH));
++          setRole("");
++          setMatchId(null);
++          setError("");
++        }
++        setOpen(next);
++      }}
++    >
++      <DialogTrigger asChild>
++        <Button type="button" variant="outline" size="sm" disabled={disabled}>
++          목록에 내 이름이 없어요 · 나를 추가하기
++        </Button>
++      </DialogTrigger>
++      <DialogContent className="max-w-sm" showCloseButton={false}>
++        <DialogTitle className="text-base">
++          {matchId
++            ? `${match?.name ?? name.trim()}님이 목록에 있어요. 이 이름으로 연결할까요?`
++            : "나를 추가하기"}
++        </DialogTitle>
++        <DialogDescription>
++          {matchId
++            ? "기존 일정은 그대로 두고 내 계정에 연결해요."
++            : "이름을 추가하면 내 일정이 바로 열려요."}
++        </DialogDescription>
++        <form
++          className="flex flex-col gap-3"
++          onSubmit={(event) => {
++            event.preventDefault();
++            void submit();
++          }}
++        >
++          {matchId ? null : (
++            <>
++              <label
++                htmlFor={`${formId}-name`}
++                className="flex flex-col gap-1 text-sm"
++              >
++                이름
++                <Input
++                  id={`${formId}-name`}
++                  maxLength={MAX_NAME_LENGTH}
++                  value={name}
++                  onChange={(event) => setName(event.target.value)}
++                  disabled={saving}
++                  required
++                />
++              </label>
++              <label
++                htmlFor={`${formId}-role`}
++                className="flex flex-col gap-1 text-sm"
++              >
++                역할 (선택)
++                <Input
++                  id={`${formId}-role`}
++                  maxLength={MAX_ROLE_LENGTH}
++                  value={role}
++                  onChange={(event) => setRole(event.target.value)}
++                  disabled={saving}
++                />
++              </label>
++            </>
++          )}
++          {error ? (
++            <p role="alert" className="text-sm text-destructive">
++              {error}
++            </p>
++          ) : null}
++          <div className="flex justify-end gap-2">
++            <Button
++              type="button"
++              variant="outline"
++              disabled={saving}
++              onClick={() => {
++                if (matchId) {
++                  setMatchId(null);
++                  setError("");
++                } else setOpen(false);
++              }}
++            >
++              취소
++            </Button>
++            <Button type="submit" disabled={saving || disabled || !name.trim()}>
++              {saving ? "저장 중…" : matchId ? "연결" : "추가"}
++            </Button>
++          </div>
++        </form>
++      </DialogContent>
++    </Dialog>
++  );
++}
 diff --git a/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx b/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
-index e4e4ac66d..a8753175e 100644
+index e4e4ac66d..818627025 100644
 --- a/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
 +++ b/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
 @@ -1,4 +1,11 @@
@@ -1881,7 +2072,7 @@ index e4e4ac66d..a8753175e 100644
  import * as React from "react";
  import { toast } from "sonner";
  
-@@ -24,6 +31,21 @@ import {
+@@ -24,7 +31,23 @@ import {
    emptyRuleDraft,
    ruleDraftOf,
  } from "./AvailabilityRuleForm";
@@ -1901,9 +2092,11 @@ index e4e4ac66d..a8753175e 100644
 +  TooltipProvider,
 +} from "@/shared/ui/tooltip";
  import { SELECT_CLASS } from "./EntryForm";
++import { AddMyselfDialog } from "./AddMyselfDialog";
  
  export const KIND_BADGE: Record<RuleKind, string> = {
-@@ -44,7 +66,7 @@ const newPersonId = () =>
+   busy: "bg-red-500/15 text-red-700 dark:text-red-300",
+@@ -44,7 +67,7 @@ const newPersonId = () =>
  
  /**
   * Member schedules (team patch): everyone's 불가/가능/조율 times, which
@@ -1912,7 +2105,7 @@ index e4e4ac66d..a8753175e 100644
   * members put their schedules into Buzz instead.
   */
  export function AvailabilityPanel({
-@@ -55,6 +77,8 @@ export function AvailabilityPanel({
+@@ -55,6 +78,8 @@ export function AvailabilityPanel({
    nameOf,
    today,
    onSave,
@@ -1921,7 +2114,7 @@ index e4e4ac66d..a8753175e 100644
    onDelete,
  }: {
    pubkey: string;
-@@ -64,13 +88,23 @@ export function AvailabilityPanel({
+@@ -64,13 +89,23 @@ export function AvailabilityPanel({
    nameOf: (pubkey: string) => string;
    today: string;
    onSave: (person: PersonInput) => Promise<void>;
@@ -1945,7 +2138,7 @@ index e4e4ac66d..a8753175e 100644
    const [filter, setFilter] = React.useState<Filter>("all");
    const [ruleDraft, setRuleDraft] = React.useState<RuleDraft | null>(null);
    const [personDraft, setPersonDraft] = React.useState<PersonInput | null>(
-@@ -80,11 +114,23 @@ export function AvailabilityPanel({
+@@ -80,11 +115,23 @@ export function AvailabilityPanel({
    const [saving, setSaving] = React.useState(false);
  
    const selected = people.find((person) => person.id === selectedId) ?? null;
@@ -1974,7 +2167,7 @@ index e4e4ac66d..a8753175e 100644
    const rules = (selected?.rules ?? [])
      .filter((rule) =>
        filter === "weekly"
-@@ -125,7 +171,7 @@ export function AvailabilityPanel({
+@@ -125,7 +172,7 @@ export function AvailabilityPanel({
      });
  
    const submitRule = async (rule: AvailabilityRule) => {
@@ -1983,7 +2176,7 @@ index e4e4ac66d..a8753175e 100644
      const others = selected.rules.filter((item) => item.id !== rule.id);
      if (others.length >= MAX_RULES_PER_PERSON) {
        toast.error(`한 사람당 일정은 ${MAX_RULES_PER_PERSON}개까지입니다.`);
-@@ -139,7 +185,7 @@ export function AvailabilityPanel({
+@@ -139,7 +186,7 @@ export function AvailabilityPanel({
    };
  
    const removeRule = (rule: AvailabilityRule) => {
@@ -1992,7 +2185,7 @@ index e4e4ac66d..a8753175e 100644
      setConfirming(null);
      void run(
        () =>
-@@ -206,12 +252,86 @@ export function AvailabilityPanel({
+@@ -206,12 +253,100 @@ export function AvailabilityPanel({
              <Plus className="h-4 w-4" />
            </Button>
          </div>
@@ -2041,6 +2234,20 @@ index e4e4ac66d..a8753175e 100644
 +                찾는 이름이 없어요.
 +              </p>
 +            )}
++            <AddMyselfDialog
++              key={pubkey}
++              pubkey={pubkey}
++              displayName={nameOf(pubkey)}
++              people={people}
++              disabled={saving}
++              onSave={onSave}
++              onAdded={(id) => {
++                setSelectedId(id);
++                setRuleDraft(null);
++                setPersonDraft(null);
++                setClaimId(null);
++              }}
++            />
 +          </div>
 +        ) : null}
 +        <AlertDialog
@@ -2085,7 +2292,7 @@ index e4e4ac66d..a8753175e 100644
          <ul className="flex max-h-[26rem] flex-col gap-1 overflow-y-auto">
            {shown.map((person) => (
              <li key={person.id}>
-@@ -241,7 +361,11 @@ export function AvailabilityPanel({
+@@ -241,7 +376,11 @@ export function AvailabilityPanel({
                      ) : null}
                    </span>
                    <span className="block truncate text-2xs text-muted-foreground">
@@ -2098,7 +2305,7 @@ index e4e4ac66d..a8753175e 100644
                        .filter(Boolean)
                        .join(" · ")}
                    </span>
-@@ -280,23 +404,31 @@ export function AvailabilityPanel({
+@@ -280,23 +419,31 @@ export function AvailabilityPanel({
                  : "팀원 추가"}
              </h3>
              <div className="grid grid-cols-2 gap-2">
@@ -2134,7 +2341,7 @@ index e4e4ac66d..a8753175e 100644
                    }
                    placeholder="예: 촬영감독"
                    value={personDraft.role ?? ""}
-@@ -307,6 +439,7 @@ export function AvailabilityPanel({
+@@ -307,6 +454,7 @@ export function AvailabilityPanel({
                Buzz 멤버 연결 (선택)
                <select
                  className={SELECT_CLASS}
@@ -2142,7 +2349,7 @@ index e4e4ac66d..a8753175e 100644
                  onChange={(event) =>
                    setPersonDraft({
                      ...personDraft,
-@@ -316,11 +449,13 @@ export function AvailabilityPanel({
+@@ -316,11 +464,13 @@ export function AvailabilityPanel({
                  value={personDraft.pubkey ?? ""}
                >
                  <option value="">연결 안 함</option>
@@ -2161,7 +2368,7 @@ index e4e4ac66d..a8753175e 100644
                </select>
              </label>
              <div className="flex justify-end gap-2">
-@@ -361,26 +496,24 @@ export function AvailabilityPanel({
+@@ -361,26 +511,24 @@ export function AvailabilityPanel({
                  <p className="text-2xs text-muted-foreground">
                    {selected.pubkey
                      ? `Buzz: ${nameOf(selected.pubkey)}`
@@ -2197,7 +2404,7 @@ index e4e4ac66d..a8753175e 100644
                        }, "연결하지 못했습니다.")
                      }
                      size="xs"
-@@ -390,40 +523,44 @@ export function AvailabilityPanel({
+@@ -390,40 +538,44 @@ export function AvailabilityPanel({
                      <UserRound className="h-3 w-3" />이 사람이 나예요
                    </Button>
                  ) : null}
@@ -2274,7 +2481,7 @@ index e4e4ac66d..a8753175e 100644
                <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs">
                  <span>
                    {selected.name}님과 일정 {selected.rules.length}개를 모두
-@@ -471,7 +608,7 @@ export function AvailabilityPanel({
+@@ -471,7 +623,7 @@ export function AvailabilityPanel({
                    </Button>
                  ))}
                </div>
@@ -2283,7 +2490,7 @@ index e4e4ac66d..a8753175e 100644
                  <Button
                    data-testid="availability-add-rule"
                    onClick={() => setRuleDraft(emptyRuleDraft(today))}
-@@ -484,12 +621,14 @@ export function AvailabilityPanel({
+@@ -484,12 +636,14 @@ export function AvailabilityPanel({
                )}
              </div>
  
@@ -2300,7 +2507,7 @@ index e4e4ac66d..a8753175e 100644
                  }
                  onSubmit={(rule) => void submitRule(rule)}
                  saving={saving}
-@@ -515,6 +654,30 @@ export function AvailabilityPanel({
+@@ -515,6 +669,30 @@ export function AvailabilityPanel({
                        <span className="break-words font-medium">
                          {rule.title}
                        </span>
@@ -2331,7 +2538,7 @@ index e4e4ac66d..a8753175e 100644
                        <span
                          className={cn(
                            "rounded px-1.5 text-2xs font-semibold",
-@@ -527,7 +690,7 @@ export function AvailabilityPanel({
+@@ -527,7 +705,7 @@ export function AvailabilityPanel({
                      <p className="text-xs text-muted-foreground">
                        {ruleWhenLabel(rule)}
                      </p>
@@ -2340,7 +2547,7 @@ index e4e4ac66d..a8753175e 100644
                        <div className="mt-1 flex justify-end">
                          <Button
                            disabled={saving}
-@@ -541,28 +704,32 @@ export function AvailabilityPanel({
+@@ -541,28 +719,32 @@ export function AvailabilityPanel({
                        </div>
                      ) : null}
                    </div>
@@ -2395,7 +2602,7 @@ index e4e4ac66d..a8753175e 100644
                  </li>
                ))}
                {rules.length === 0 ? (
-@@ -575,7 +742,7 @@ export function AvailabilityPanel({
+@@ -575,7 +757,7 @@ export function AvailabilityPanel({
            </>
          ) : personDraft ? null : (
            <p className="px-2 py-10 text-center text-sm text-muted-foreground">
@@ -2749,10 +2956,10 @@ index 55eca5e44..c22c8a59e 100644
              onDelete={availability.deletePerson}
 diff --git a/desktop/src/features/team-calendar/ui/availabilityPrivacy.jsdom-test.mjs b/desktop/src/features/team-calendar/ui/availabilityPrivacy.jsdom-test.mjs
 new file mode 100644
-index 000000000..462e876e6
+index 000000000..4c20e0864
 --- /dev/null
 +++ b/desktop/src/features/team-calendar/ui/availabilityPrivacy.jsdom-test.mjs
-@@ -0,0 +1,500 @@
+@@ -0,0 +1,676 @@
 +import assert from "node:assert/strict";
 +import { afterEach, test, mock } from "node:test";
 +import React from "react";
@@ -2773,7 +2980,11 @@ index 000000000..462e876e6
 +  lockRule,
 +} from "../lib/availabilityPrivacy.ts";
 +import { productionDTag } from "../lib/availabilityStore.ts";
-+import { encodePeople, teamAvailabilityDTag } from "../lib/teamAvailability.ts";
++import {
++  decodePeople,
++  encodePeople,
++  teamAvailabilityDTag,
++} from "../lib/teamAvailability.ts";
 +import { koreanToday } from "../lib/commonTime.ts";
 +import {
 +  prepareScheduleDom,
@@ -2895,6 +3106,13 @@ index 000000000..462e876e6
 +  });
 +  const originalInvoke = window.__TAURI_INTERNALS__.invoke;
 +  window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
++    if (cmd === "get_users_batch") {
++      env.calls.push({ cmd, args });
++      return {
++        profiles: { [pubkey]: { display_name: "가짜 표시 이름" } },
++        missing: [],
++      };
++    }
 +    if (cmd === "sign_event")
 +      return JSON.stringify({
 +        id: String(publishes.length + 3)
@@ -3095,12 +3313,16 @@ index 000000000..462e876e6
 +  const view = calendar();
 +  fireEvent.click(view.getByRole("tab", { name: "팀원 일정", exact: true }));
 +  const card = await waitFor(() => view.getByTestId("availability-claim-card"));
++  const addMyself = "목록에 내 이름이 없어요 · 나를 추가하기";
++  assert.ok(view.getByRole("button", { name: addMyself }));
 +  assert.equal(view.queryByTestId("production-status"), null);
 +  assert.equal(within(card).queryByRole("button", { name: "가짜 p1" }), null);
 +  fireEvent.change(within(card).getByLabelText("내 이름 찾기"), {
 +    target: { value: "없는 이름" },
 +  });
 +  assert.equal(within(card).queryByRole("button", { name: "가짜 p2" }), null);
++  assert.ok(within(card).getByText("찾는 이름이 없어요."));
++  assert.ok(view.getByRole("button", { name: addMyself }));
 +  fireEvent.change(within(card).getByLabelText("내 이름 찾기"), {
 +    target: { value: "p2" },
 +  });
@@ -3126,6 +3348,167 @@ index 000000000..462e876e6
 +    /가짜 p2나.*연결됨/,
 +  );
 +  assert.equal(f.publishes.length, 1);
++});
++
++for (const configured of [false, true]) {
++  test(`add myself creates, links and selects in one authorized save (production configured: ${configured})`, async () => {
++    const f = await fixture({ configured });
++    let view = calendar();
++    fireEvent.click(view.getByRole("tab", { name: "팀원 일정", exact: true }));
++    const card = await waitFor(() =>
++      view.getByTestId("availability-claim-card"),
++    );
++    fireEvent.change(within(card).getByLabelText("내 이름 찾기"), {
++      target: { value: "없는 이름" },
++    });
++    assert.ok(within(card).getByText("찾는 이름이 없어요."));
++    // Wait for the real member-profile query before opening the prefilled form.
++    await waitFor(() =>
++      assert.ok(env.calls.some((call) => call.cmd === "get_users_batch")),
++    );
++    fireEvent.click(
++      view.getByRole("button", {
++        name: "목록에 내 이름이 없어요 · 나를 추가하기",
++      }),
++    );
++    const dialog = within(view.getByRole("dialog", { name: "나를 추가하기" }));
++    assert.equal(dialog.getByLabelText("이름").value, "가짜 표시 이름");
++    assert.equal(dialog.getByLabelText("역할 (선택)").value, "");
++    fireEvent.change(dialog.getByLabelText("이름"), {
++      target: { value: "  가짜 새 팀원  " },
++    });
++    fireEvent.change(dialog.getByLabelText("역할 (선택)"), {
++      target: { value: "  촬영  " },
++    });
++    // Enter and pointer activation both go through the form submit seam.
++    fireEvent.submit(
++      dialog.getByRole("button", { name: "추가", exact: true }).closest("form"),
++    );
++    await waitFor(() =>
++      assert.ok(view.queryByTestId("availability-claim-card") === null),
++    );
++    assert.ok(view.queryByRole("dialog") === null);
++    assert.match(
++      view.getByTestId("availability-person-name").textContent,
++      /가짜 새 팀원님의 일정/,
++    );
++    const rows = view.getAllByTestId("availability-person");
++    assert.equal(rows.length, 3);
++    assert.equal(rows[0].getAttribute("aria-pressed"), "true");
++    assert.match(rows[0].textContent, /가짜 새 팀원나.*촬영.*연결됨/);
++    assert.equal(f.publishes.length, 1);
++    assert.equal(f.publishes[0].pubkey, pubkey);
++    const saved = Object.values(JSON.parse(f.publishes[0].content).people);
++    assert.equal(saved.length, 1);
++    assert.equal(saved[0].name, "가짜 새 팀원");
++    assert.equal(saved[0].role, "촬영");
++    assert.equal(saved[0].pubkey, pubkey);
++    assert.deepEqual(saved[0].rules, []);
++    // A fresh mount reads through the real 107 ownership merge, not local draft state.
++    view.unmount();
++    view = calendar();
++    fireEvent.click(view.getByRole("tab", { name: "팀원 일정", exact: true }));
++    await waitFor(() =>
++      assert.match(
++        view.getByTestId("availability-person-name").textContent,
++        /가짜 새 팀원님의 일정/,
++      ),
++    );
++    assert.ok(view.queryByTestId("availability-claim-card") === null);
++  });
++}
++
++test("add myself confirms the existing unlinked name and preserves its role and schedule without a duplicate", async () => {
++  const f = await fixture({ configured: false });
++  f.replace([
++    makeEvent({
++      p1: person("p1"),
++      p2: person("p2", {
++        name: "가짜 표시 이름",
++        role: "편집",
++        pubkey: undefined,
++      }),
++    }),
++  ]);
++  const view = calendar();
++  fireEvent.click(view.getByRole("tab", { name: "팀원 일정", exact: true }));
++  const card = await waitFor(() => view.getByTestId("availability-claim-card"));
++  fireEvent.click(
++    within(card).getByRole("button", {
++      name: "목록에 내 이름이 없어요 · 나를 추가하기",
++    }),
++  );
++  let dialog = within(view.getByRole("dialog"));
++  fireEvent.change(dialog.getByLabelText("이름"), {
++    target: { value: "  가짜 표시 이름  " },
++  });
++  fireEvent.change(dialog.getByLabelText("역할 (선택)"), {
++    target: { value: "새 역할" },
++  });
++  fireEvent.click(dialog.getByRole("button", { name: "추가", exact: true }));
++  dialog = within(
++    view.getByRole("dialog", {
++      name: "가짜 표시 이름님이 목록에 있어요. 이 이름으로 연결할까요?",
++    }),
++  );
++  assert.equal(f.publishes.length, 0);
++  fireEvent.click(dialog.getByRole("button", { name: "취소" }));
++  assert.equal(f.publishes.length, 0);
++  assert.equal(dialog.getByLabelText("이름").value, "  가짜 표시 이름  ");
++  fireEvent.click(dialog.getByRole("button", { name: "추가", exact: true }));
++  fireEvent.click(dialog.getByRole("button", { name: "연결", exact: true }));
++  await waitFor(() =>
++    assert.ok(view.queryByTestId("availability-claim-card") === null),
++  );
++  assert.equal(f.publishes.length, 1);
++  const savedPeople = decodePeople(f.publishes[0].content);
++  const saved = Object.values(savedPeople);
++  assert.equal(saved.length, 1);
++  assert.deepEqual(Object.keys(savedPeople), ["p2"]);
++  assert.equal(saved[0].pubkey, pubkey);
++  assert.equal(saved[0].role, "편집");
++  assert.deepEqual(saved[0].rules, [rule]);
++  assert.equal(view.getAllByTestId("availability-person").length, 2);
++  assert.match(
++    view.getByTestId("availability-person-name").textContent,
++    /가짜 표시 이름님의 일정/,
++  );
++  assert.ok(
++    within(view.getByTestId("availability-panel")).getByText(rule.title),
++  );
++});
++
++test("add myself keeps the form on failed save so the member can retry; cancel never saves", async () => {
++  const f = await fixture({ failMigration: true });
++  const view = calendar();
++  fireEvent.click(view.getByRole("tab", { name: "팀원 일정", exact: true }));
++  const card = await waitFor(() => view.getByTestId("availability-claim-card"));
++  const trigger = within(card).getByRole("button", {
++    name: "목록에 내 이름이 없어요 · 나를 추가하기",
++  });
++  fireEvent.click(trigger);
++  fireEvent.click(
++    within(view.getByRole("dialog")).getByRole("button", { name: "취소" }),
++  );
++  assert.equal(f.publishes.length, 0);
++  fireEvent.click(trigger);
++  const dialog = within(view.getByRole("dialog"));
++  fireEvent.change(dialog.getByLabelText("이름"), {
++    target: { value: "가짜 재시도" },
++  });
++  fireEvent.click(dialog.getByRole("button", { name: "추가", exact: true }));
++  await waitFor(() =>
++    assert.match(dialog.getByRole("alert").textContent, /가짜 저장 실패/),
++  );
++  assert.equal(dialog.getByLabelText("이름").value, "가짜 재시도");
++  assert.ok(view.getByTestId("availability-claim-card"));
++  f.allowMigration();
++  fireEvent.click(dialog.getByRole("button", { name: "추가", exact: true }));
++  await waitFor(() => assert.ok(view.queryByRole("dialog") === null));
++  assert.match(
++    view.getByTestId("availability-person-name").textContent,
++    /가짜 재시도님의 일정/,
++  );
 +});
 +
 +test("linked account selects its schedule after async load, sorts me first, and keeps other selections usable", async () => {
