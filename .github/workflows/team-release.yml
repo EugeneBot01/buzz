@@ -163,7 +163,7 @@ jobs:
     name: Build macOS (${{ matrix.arch }})
     needs: [setup, check]
     if: ${{ !inputs.check_only }}
-    runs-on: macos-15-intel  # macos-latest(arm64) had no capacity 2026-11
+    runs-on: macos-latest
     timeout-minutes: 90
     strategy:
       fail-fast: true
