@@ -108,10 +108,10 @@ index e2fc80587..e34308421 100644
      label: "App",
 diff --git a/desktop/src/features/team-welcome/lib/defaults.test.mjs b/desktop/src/features/team-welcome/lib/defaults.test.mjs
 new file mode 100644
-index 000000000..2c67fd23c
+index 000000000..573fb20d1
 --- /dev/null
 +++ b/desktop/src/features/team-welcome/lib/defaults.test.mjs
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,214 @@
 +import assert from "node:assert/strict";
 +import test from "node:test";
 +
@@ -127,6 +127,7 @@ index 000000000..2c67fd23c
 +  pendingDefaults,
 +  readProgress,
 +  writeProgress,
++  welcomeInputs,
 +} from "./defaults.ts";
 +
 +const ADMIN = "a".repeat(64);
@@ -267,12 +268,70 @@ index 000000000..2c67fd23c
 +  });
 +  assert.equal(readProgress(MEMBER, "wss://r.example", storage), null);
 +});
++
++test("unknown join time continues as an existing member", async () => {
++  const defaults = doc([{ id: "a", name: "공지" }]);
++  const result = await welcomeInputs(
++    async () => defaults,
++    async () => {
++      throw Error("unknown");
++    },
++    true,
++  );
++  assert.equal(result.doc, defaults);
++  assert.equal(result.newcomer, false);
++  assert.equal(result.defaultsPending, false);
++  assert.deepEqual(
++    pendingDefaults(
++      result.doc,
++      new Set(),
++      new Set(firstRunAttempted(result.newcomer, ["a"], result.doc)),
++    ),
++    [],
++  );
++});
++
++test("failed defaults read leaves a durable first-run retry", async () => {
++  const result = await welcomeInputs(
++    async () => {
++      throw Error("offline");
++    },
++    async () => null,
++    true,
++  );
++  assert.deepEqual(result, {
++    doc: null,
++    newcomer: false,
++    defaultsPending: true,
++  });
++  const store = new Map();
++  const storage = {
++    getItem: (key) => store.get(key),
++    setItem: (key, value) => store.set(key, value),
++  };
++  writeProgress(
++    ADMIN,
++    "wss://r.example",
++    { welcomed: true, attempted: [], defaultsPending: true },
++    storage,
++  );
++  const progress = readProgress(ADMIN, "wss://r.example", storage);
++  assert.equal(progress.defaultsPending, true);
++  assert.deepEqual(progress.attempted, []);
++  const retry = await welcomeInputs(
++    async () => doc([{ id: "a", name: "공지" }]),
++    async () => null,
++    progress.defaultsPending,
++  );
++  assert.equal(retry.newcomer, true);
++  assert.equal(retry.defaultsPending, false);
++});
 diff --git a/desktop/src/features/team-welcome/lib/defaults.ts b/desktop/src/features/team-welcome/lib/defaults.ts
 new file mode 100644
-index 000000000..8a68c5520
+index 000000000..e6b0d031f
 --- /dev/null
 +++ b/desktop/src/features/team-welcome/lib/defaults.ts
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,209 @@
 +import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
 +
 +/**
@@ -374,6 +433,8 @@ index 000000000..8a68c5520
 +
 +export type WelcomeProgress = Readonly<{
 +  welcomed: boolean;
++  /** Defaults could not be read; retry first-run classification next launch. */
++  defaultsPending?: true;
 +  attempted: readonly string[];
 +}>;
 +
@@ -394,6 +455,9 @@ index 000000000..8a68c5520
 +    const { welcomed, attempted } = raw as Record<string, unknown>;
 +    return {
 +      welcomed: welcomed === true,
++      ...(raw.defaultsPending === true
++        ? { defaultsPending: true as const }
++        : {}),
 +      attempted: Array.isArray(attempted)
 +        ? attempted.filter((id): id is string => typeof id === "string")
 +        : [],
@@ -453,12 +517,36 @@ index 000000000..8a68c5520
 +    ]),
 +  ];
 +}
++
++/** Read failures must never suppress the first-run guide or force a join. */
++export async function welcomeInputs(
++  readDefaults: () => Promise<OnboardingDoc | null>,
++  readJoinTime: () => Promise<number | null>,
++  classify: boolean,
++) {
++  let doc: OnboardingDoc | null = null;
++  let defaultsPending = false;
++  let newcomer = false;
++  try {
++    doc = await readDefaults();
++  } catch {
++    defaultsPending = true;
++  }
++  if (classify && !defaultsPending) {
++    try {
++      newcomer = isNewcomer(await readJoinTime());
++    } catch {
++      // Unknown join time counts as an existing member.
++    }
++  }
++  return { doc, defaultsPending, newcomer };
++}
 diff --git a/desktop/src/features/team-welcome/lib/useTeamWelcome.ts b/desktop/src/features/team-welcome/lib/useTeamWelcome.ts
 new file mode 100644
-index 000000000..0b3ae1a34
+index 000000000..bb4f2b8c9
 --- /dev/null
 +++ b/desktop/src/features/team-welcome/lib/useTeamWelcome.ts
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,189 @@
 +import { useQueryClient } from "@tanstack/react-query";
 +import * as React from "react";
 +
@@ -471,12 +559,12 @@ index 000000000..0b3ae1a34
 +import {
 +  type OnboardingDoc,
 +  firstRunAttempted,
-+  isNewcomer,
 +  latestOnboarding,
 +  onboardingDTag,
 +  pendingDefaults,
 +  readProgress,
 +  writeProgress,
++  welcomeInputs,
 +} from "./defaults";
 +
 +// ---- whether the guide is open, shared by the app shell and Settings ----
@@ -590,30 +678,27 @@ index 000000000..0b3ae1a34
 +    void (async () => {
 +      const progress = readProgress(pubkey, relayUrl);
 +      const team = channels.filter(isTeamChannel);
-+      let doc: OnboardingDoc | null = null;
-+      let newcomer = false;
-+      try {
-+        doc = await readDefaultChannels(relayUrl);
-+        if (!progress) newcomer = isNewcomer(await earliestJoin(pubkey, team));
-+      } catch {
-+        // Try again next launch; guessing here could pull an existing member
-+        // back into channels they left.
-+        return;
-+      }
++      const initializing = !progress || progress.defaultsPending === true;
++      const { doc, newcomer, defaultsPending } = await welcomeInputs(
++        () => readDefaultChannels(relayUrl),
++        () => earliestJoin(pubkey, team),
++        initializing,
++      );
 +      if (cancelled) return;
 +
 +      const joined = new Set(
 +        team.filter((channel) => channel.isMember).map(({ id }) => id),
 +      );
 +      const attempted = new Set(
-+        progress?.attempted ??
-+          firstRunAttempted(
-+            newcomer,
-+            team
-+              .filter((c) => !c.isMember && c.visibility === "open")
-+              .map(({ id }) => id),
-+            doc,
-+          ),
++        defaultsPending || !initializing
++          ? (progress?.attempted ?? [])
++          : firstRunAttempted(
++              newcomer,
++              team
++                .filter((c) => !c.isMember && c.visibility === "open")
++                .map(({ id }) => id),
++              doc,
++            ),
 +      );
 +      const byId = new Map(team.map((channel) => [channel.id, channel]));
 +      const names: string[] = [];
@@ -632,8 +717,10 @@ index 000000000..0b3ae1a34
 +          // A channel that was removed or made private is skipped for good.
 +        }
 +      }
++      if (cancelled) return;
 +      writeProgress(pubkey, relayUrl, {
 +        welcomed: true,
++        ...(defaultsPending ? { defaultsPending: true as const } : {}),
 +        attempted: [...attempted],
 +      });
 +      if (names.length > 0)
@@ -648,6 +735,89 @@ index 000000000..0b3ae1a34
 +      if (ranRef.current === scope) ranRef.current = "";
 +    };
 +  }, [pubkey, relayUrl, loaded, queryClient]);
++}
+diff --git a/desktop/src/features/team-welcome/lib/welcome.jsdom-test.mjs b/desktop/src/features/team-welcome/lib/welcome.jsdom-test.mjs
+new file mode 100644
+index 000000000..0012db991
+--- /dev/null
++++ b/desktop/src/features/team-welcome/lib/welcome.jsdom-test.mjs
+@@ -0,0 +1,77 @@
++import assert from "node:assert/strict";
++import { afterEach, test } from "node:test";
++import React from "react";
++import { cleanup, renderHook, waitFor } from "@testing-library/react";
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { relayClient } from "@/shared/api/relayClient";
++import { encodeOnboarding, readProgress } from "./defaults.ts";
++import {
++  closeWelcomeGuide,
++  useTeamWelcome,
++  useWelcomeGuideState,
++} from "./useTeamWelcome.ts";
++
++const pubkey = "a".repeat(64);
++const relay = "wss://relay.example.com";
++const originalFetch = relayClient.fetchEvents;
++const originalFirst = relayClient.fetchFirstEvent;
++afterEach(() => {
++  cleanup();
++  closeWelcomeGuide();
++  localStorage.clear();
++  relayClient.fetchEvents = originalFetch;
++  relayClient.fetchFirstEvent = originalFirst;
++});
++
++for (const failure of ["defaults", "join-time"]) {
++  test(`first-run guide opens after ${failure} failure without joining`, async () => {
++    const joins = [];
++    window.__TAURI_INTERNALS__ = {
++      invoke: async (cmd) => {
++        if (cmd === "get_channel_members") throw Error("unknown");
++        if (cmd === "join_channel") joins.push(cmd);
++        return null;
++      },
++    };
++    relayClient.fetchFirstEvent = async () => ({
++      tags: [["member", pubkey, "owner"]],
++      created_at: 1,
++    });
++    relayClient.fetchEvents = async (filter) => {
++      if (filter.kinds.includes(13534))
++        return [{ tags: [["member", pubkey, "owner"]], created_at: 1 }];
++      if (failure === "defaults") throw Error("offline");
++      return [
++        {
++          pubkey,
++          created_at: 1,
++          content: encodeOnboarding([{ id: "new", name: "새 채널" }]),
++        },
++      ];
++    };
++    const client = new QueryClient({
++      defaultOptions: { queries: { retry: false } },
++    });
++    const wrapper = ({ children }) =>
++      React.createElement(QueryClientProvider, { client }, children);
++    const channels = [
++      { id: "old", channelType: "stream", isMember: true, visibility: "open" },
++      { id: "new", channelType: "stream", isMember: false, visibility: "open" },
++    ];
++    const hook = renderHook(
++      () => {
++        useTeamWelcome(pubkey, relay, channels);
++        return useWelcomeGuideState();
++      },
++      { wrapper },
++    );
++    await waitFor(() => assert.equal(hook.result.current.open, true));
++    assert.deepEqual(joins, []);
++    assert.deepEqual(
++      readProgress(pubkey, relay).attempted,
++      failure === "defaults" ? [] : ["new"],
++    );
++    if (failure === "defaults")
++      assert.equal(readProgress(pubkey, relay).defaultsPending, true);
++  });
 +}
 diff --git a/desktop/src/features/team-welcome/ui/TeamWelcomeSettingsCard.tsx b/desktop/src/features/team-welcome/ui/TeamWelcomeSettingsCard.tsx
 new file mode 100644
