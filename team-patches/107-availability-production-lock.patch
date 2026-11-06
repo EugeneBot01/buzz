@@ -1,0 +1,2805 @@
+diff --git a/desktop/package.json b/desktop/package.json
+index 0d3ed7667..f92cebcb9 100644
+--- a/desktop/package.json
++++ b/desktop/package.json
+@@ -33,6 +33,7 @@
+     "@fontsource-variable/inter": "^5.2.8",
+     "@fontsource/jetbrains-mono": "^5.3.0",
+     "@mediapipe/tasks-vision": "^0.10.35",
++    "@noble/hashes": "^2.0.1",
+     "@radix-ui/react-alert-dialog": "^1.1.15",
+     "@radix-ui/react-avatar": "^1.1.11",
+     "@radix-ui/react-checkbox": "^1.3.3",
+@@ -71,6 +72,7 @@
+     "lucide-react": "^1.0.0",
+     "mdast-util-from-markdown": "^2.0.3",
+     "motion": "^12.38.0",
++    "nostr-tools": "^2.23.3",
+     "qrcode": "^1.5.4",
+     "qrcode.react": "^4.2.0",
+     "react": "^19.1.0",
+@@ -90,7 +92,6 @@
+     "zod": "^4.4.3"
+   },
+   "devDependencies": {
+-    "@noble/hashes": "^2.0.1",
+     "@playwright/test": "^1.58.2",
+     "@tailwindcss/postcss": "^4.3.0",
+     "@tanstack/router-plugin": "^1.167.12",
+@@ -101,7 +102,6 @@
+     "@types/react-dom": "^19.1.6",
+     "@vitejs/plugin-react": "^6.0.0",
+     "jsdom": "^27.4.0",
+-    "nostr-tools": "^2.23.3",
+     "postcss": "^8.5.8",
+     "tailwindcss": "^4.3.0",
+     "tw-animate-css": "^1.4.0",
+diff --git a/desktop/src-tauri/src/commands/identity.rs b/desktop/src-tauri/src/commands/identity.rs
+index ad44f86f9..39ebbcba4 100644
+--- a/desktop/src-tauri/src/commands/identity.rs
++++ b/desktop/src-tauri/src/commands/identity.rs
+@@ -736,21 +736,73 @@ pub async fn nip44_encrypt_to_self(
+     .map_err(|e| format!("spawn_blocking failed: {e}"))?
+ }
+ 
++fn decrypt_account_reason(
++    keys: &Keys,
++    sender_public_key: Option<&str>,
++    ciphertext: &str,
++) -> Result<String, String> {
++    let sender = match sender_public_key {
++        Some(sender) => PublicKey::from_hex(sender).map_err(|e| format!("invalid sender: {e}"))?,
++        None => keys.public_key(),
++    };
++    nip44::decrypt(keys.secret_key(), &sender, ciphertext)
++        .map_err(|e| format!("nip44 decrypt failed: {e}"))
++}
++
++/// Decrypt for the active account; omitted sender preserves existing self-only callers.
+ #[tauri::command]
+ pub async fn nip44_decrypt_from_self(
+     ciphertext: String,
++    sender_public_key: Option<String>,
+     state: State<'_, AppState>,
+ ) -> Result<String, String> {
+     let keys = state.signing_keys()?;
+-
+     tauri::async_runtime::spawn_blocking(move || {
+-        nip44::decrypt(keys.secret_key(), &keys.public_key(), &ciphertext)
+-            .map_err(|e| format!("nip44 decrypt failed: {e}"))
++        decrypt_account_reason(&keys, sender_public_key.as_deref(), &ciphertext)
+     })
+     .await
+     .map_err(|e| format!("spawn_blocking failed: {e}"))?
+ }
+ 
++#[cfg(test)]
++mod availability_reason_tests {
++    use super::decrypt_account_reason;
++    use nostr::{nips::nip44, Keys};
++
++    #[test]
++    fn availability_reason_account_peer_and_self_round_trip(
++    ) -> Result<(), Box<dyn std::error::Error>> {
++        let account = Keys::generate();
++        let sender = Keys::generate();
++        let stranger = Keys::generate();
++        let ciphertext = nip44::encrypt(
++            sender.secret_key(),
++            &account.public_key(),
++            "가짜 수업",
++            nip44::Version::V2,
++        )?;
++        assert_eq!(
++            decrypt_account_reason(&account, Some(&sender.public_key().to_hex()), &ciphertext)?,
++            "가짜 수업"
++        );
++        assert!(decrypt_account_reason(
++            &stranger,
++            Some(&sender.public_key().to_hex()),
++            &ciphertext
++        )
++        .is_err());
++        assert!(decrypt_account_reason(&account, Some("invalid"), &ciphertext).is_err());
++        let legacy = nip44::encrypt(
++            account.secret_key(),
++            &account.public_key(),
++            "legacy",
++            nip44::Version::V2,
++        )?;
++        assert_eq!(decrypt_account_reason(&account, None, &legacy)?, "legacy");
++        Ok(())
++    }
++}
++
+ #[cfg(test)]
+ mod nostr_identity_binding_tests {
+     use super::build_nostr_identity_binding_event;
+diff --git a/desktop/src/features/team-calendar/README.md b/desktop/src/features/team-calendar/README.md
+new file mode 100644
+index 000000000..bd1e34b5c
+--- /dev/null
++++ b/desktop/src/features/team-calendar/README.md
+@@ -0,0 +1,25 @@
++# 팀원 일정 — 제작부 비밀번호 (107)
++
++- 팀원 일정 위쪽에서 방장·관리자가 **제작부 비밀번호 정하기**를 누른다. 길이 제한은 없다. 이미 정했다면 제작부를 먼저 열고 바꾼다. 비밀번호는 입력 그대로 사용하며 팀마다 결과가 다르다.
++- 팀원은 **제작부 열기**로 이 기기에서 제작부가 된다. **제작부 잠그기**는 이 계정·팀에 기억한 내용을 지우고 표시 중인 사유와 입력창도 닫는다. 다른 기기의 기억은 새 비밀번호가 도착하면 사용할 수 없게 된다.
++- 비밀번호 설정 뒤 저장하는 사유는 본인과 제작부에게 각각 NIP-44로 보관한다. 날짜·요일·시간·불가/가능/조율은 공개 상태라 달력과 함께 되는 시간 찾기는 계속 동작한다. 다른 팀원에게는 종류 이름만 보인다. 계정 비밀값은 JavaScript로 가져오지 않는다.
++- 비밀번호를 아직 정하지 않으면 사유는 기존처럼 평문이다. 예전 평문도 그대로 읽는다. 제작부의 **예전 사유 숨기기**로 현재 목록을 한 번에 다시 저장한다. 과거에 배포된 문서·파일·사본까지 지우는 기능은 아니다.
++- Buzz 계정과 연결된 사람은 본인과 제작부만 수정·삭제할 수 있다. 연결 안 된 사람은 누구나 수정하고 **이 사람이 나예요**로 자신을 연결한다. 기존 연결 해제·교체는 제작부가 한다. 저장 직전에도 최신 권한을 확인한다.
++
++## 저장·검사 경로
++
++`team-availability:<정규화한 릴레이>`의 기존 kind 30078 문서를 사용한다. 설정은 같은 좌표에 `:production`을 붙여 방장·관리자 이벤트만 받는다. scrypt(N=16384, r=8, p=1, 32바이트)의 소금은 버전 접두사와 정규화한 커뮤니티 릴레이 주소다. 설정에 비밀번호나 비밀값은 올리지 않는다. 기기에 기억할 값은 계정·릴레이별 localStorage에만 둔다.
++
++일반 수정은 로그인 계정의 이벤트로, 제작부 수정은 제작부가 서명한 내부 kind 30078 문서를 로그인 계정의 이벤트에 담아 게시한다. 릴레이는 로그인 계정과 다른 작성자의 직접 게시를 거부하므로 이 경로가 필요하다. 읽을 때 내부 서명과 정확한 문서 좌표를 검사한다. `updatedBy` 문자열을 권한 증거로 쓰지 않는다. `mergePeopleEvents`와 초기 읽기·실시간 갱신은 같은 작성자 검사 함수를 사용한다. 삭제 기록도 연결을 유지해 제3자가 연결 없는 삭제로 위장할 수 없게 한다.
++
++처음 설정할 때는 제작부 공개값만 공유한다. 비밀번호를 바꾸는 한 번의 관리자 게시에 이미 보호한 목록과 제작부 수정 기록을 새 제작부 서명으로 이어받는다. 잠근 사유는 이전 제작부로 읽은 뒤 새 제작부용으로 다시 보관하며, 아직 평문인 사유는 명시적으로 숨길 때까지 유지한다. 이 이어받기 때문에 비밀번호를 바꿔도 이전 제작부 수정이 사라지지 않는다. 너무 큰 문서는 부분 저장하지 않고 실패를 알린다. 실패한 입력은 화면에 남겨 다시 시도할 수 있다.
++
++`VISION.md`의 일반 대화·서버 검색 모델과 달리 개인 사유에만 사용자 결정에 따른 보호를 적용한다. 공유 비밀번호를 아는 팀원이 제작부 역할을 갖는 팀판 기능이며, 다른 일정·대화의 접근 모델은 그대로다. 구버전 클라이언트는 이 읽기 검사를 하지 않으므로 팀원 모두 107 적용본을 사용해야 한다.
++
++## 검증
++
++- `pnpm -C desktop test`
++- `pnpm -C desktop exec tsc --noEmit`
++- `cargo test --manifest-path desktop/src-tauri/Cargo.toml --features mesh-llm availability_reason`
++
++단위 테스트는 결정성·두 수신자의 사유 읽기·타인의 실패·평문 호환·설정 전 저장·작성자 검사·설정 권한·비밀번호 교체·게시 실패를 검사한다. DOM 테스트는 실제 캘린더와 조회/저장 훅에서 설정→열기→기기 기억→잠그기→이전 사유 숨기기→제작부 수정을 실행하고, 실시간 변조 및 늦게 끝난 사유 읽기를 검사한다. 테스트는 가짜 계정과 가짜 일정만 사용하며 실제 릴레이에 게시하지 않는다.
+diff --git a/desktop/src/features/team-calendar/lib/availabilityMerge.ts b/desktop/src/features/team-calendar/lib/availabilityMerge.ts
+new file mode 100644
+index 000000000..89fc6a1dd
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/availabilityMerge.ts
+@@ -0,0 +1,114 @@
++import type { RelayEvent } from "@/shared/api/types";
++import type { PeopleById } from "./teamAvailability";
++import {
++  availabilityCopies,
++  mergeAuthorizedPeople,
++} from "./availabilityPrivacy";
++/** Manager-selected public identity and the snapshot carried over on rotation. */
++export type ProductionSettings = { pubkey: string; baseline?: RelayEvent };
++const newer = (a: RelayEvent, b: RelayEvent) =>
++  a.created_at > b.created_at || (a.created_at === b.created_at && a.id < b.id);
++
++/** Each member owns one replaceable coordinate; reject wrong kinds and coordinates. */
++export function newestAvailabilityEvents(
++  events: RelayEvent[],
++  dTag: string,
++): RelayEvent[] {
++  const newest = new Map<string, RelayEvent>();
++  for (const event of events) {
++    if (
++      event.kind !== 30078 ||
++      event.tags.filter((t) => t[0] === "d").length !== 1 ||
++      !event.tags.some((t) => t[0] === "d" && t[1] === dTag)
++    )
++      continue;
++    const old = newest.get(event.pubkey);
++    if (!old || newer(event, old)) newest.set(event.pubkey, event);
++  }
++  return [...newest.values()];
++}
++
++/** Only current community managers can establish or replace the production password. */
++export function readProductionSettings(
++  events: RelayEvent[],
++  managers: Set<string>,
++  dTag: string,
++): ProductionSettings | null {
++  const authorized = newestAvailabilityEvents(events, dTag)
++    .filter((e) => managers.has(e.pubkey))
++    .sort((a, b) => (newer(a, b) ? -1 : 1));
++  for (const event of authorized) {
++    try {
++      const value = JSON.parse(event.content);
++      if (/^[0-9a-f]{64}$/.test(value.pubkey))
++        return { pubkey: value.pubkey, baseline: value.baseline };
++    } catch {
++      /* A malformed settings copy is not a password setting. */
++    }
++  }
++  return null;
++}
++
++/** Merge authenticated writers, including production proofs, on history and live refresh alike. */
++export function mergeAvailabilityEvents(
++  events: RelayEvent[],
++  dTag: string,
++  settings: ProductionSettings | null,
++): PeopleById {
++  const copies = newestAvailabilityEvents(events, dTag).flatMap((e) =>
++    availabilityCopies(e, dTag, settings?.pubkey),
++  );
++  if (settings?.baseline) {
++    copies.unshift(
++      ...availabilityCopies(
++        {
++          kind: 30078,
++          pubkey: "",
++          id: "",
++          created_at: 0,
++          sig: "",
++          tags: [["d", dTag]],
++          content: JSON.stringify({ production: settings.baseline }),
++        },
++        dTag,
++        settings.pubkey,
++      ).filter((c) => c.writer === settings.pubkey),
++    );
++  }
++  const rows = copies.flatMap((copy) =>
++    Object.values(copy.people).map((person) => ({
++      writer: copy.writer,
++      person,
++    })),
++  );
++  // Establish genuine linked records before considering unlinked copies: stripping
++  // pubkey from an unauthorized copy must not erase a known binding on cold load.
++  const bindings = rows
++    .filter(
++      ({ writer, person }) =>
++        person.pubkey &&
++        (writer === person.pubkey || writer === settings?.pubkey),
++    )
++    .sort(
++      (a, b) =>
++        a.person.updatedAt - b.person.updatedAt ||
++        a.writer.localeCompare(b.writer),
++    );
++  let merged: PeopleById = {};
++  for (const { writer, person } of [
++    ...bindings,
++    ...rows.sort(
++      (a, b) =>
++        a.person.updatedAt - b.person.updatedAt ||
++        a.writer.localeCompare(b.writer),
++    ),
++  ]) {
++    merged = mergeAuthorizedPeople(
++      merged,
++      { [person.id]: person },
++      writer,
++      settings?.pubkey,
++    );
++  }
++  return merged;
++}
+diff --git a/desktop/src/features/team-calendar/lib/availabilityPrivacy.test.mjs b/desktop/src/features/team-calendar/lib/availabilityPrivacy.test.mjs
+new file mode 100644
+index 000000000..88270c953
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/availabilityPrivacy.test.mjs
+@@ -0,0 +1,556 @@
++import { buildCalendarBackup, parseCalendarImport } from "./calendarImport.ts";
++import assert from "node:assert/strict";
++import { test, mock, afterEach } from "node:test";
++import { getPublicKey, finalizeEvent } from "nostr-tools/pure";
++import * as nip44 from "nostr-tools/nip44";
++import {
++  productionKey,
++  lockRule,
++  unlockTitle,
++  visiblePeople,
++  restoreProduction,
++  productionSecretHex,
++  signProductionPeople,
++} from "./availabilityPrivacy.ts";
++import {
++  mergeAvailabilityEvents,
++  readProductionSettings,
++  productionDTag,
++  saveAvailability,
++  setProductionPassword,
++  readAvailabilitySnapshot,
++} from "./availabilityStore.ts";
++import {
++  mergePeopleEvents,
++  decodePeople,
++  encodePeople,
++  teamAvailabilityDTag,
++} from "./teamAvailability.ts";
++import { ruleDraftOf, ruleOfDraft } from "../ui/AvailabilityRuleForm.tsx";
++import { relayClient } from "@/shared/api/relayClient";
++
++const key = (n) => {
++  const secret = new Uint8Array(32);
++  secret[31] = n;
++  return { secret, pubkey: getPublicKey(secret) };
++};
++const alice = key(1),
++  bob = key(2),
++  production = key(3),
++  next = key(4);
++const relay = "wss://relay.example.test";
++const d = teamAvailabilityDTag(relay);
++const rule = {
++  id: "r1",
++  title: "가짜 수업",
++  kind: "busy",
++  startDate: "2026-11-06",
++  endDate: "2026-11-06",
++  weekday: null,
++  start: 540,
++  end: 720,
++  exclude: [],
++};
++const person = (overrides = {}) => ({
++  id: "p1",
++  name: "가짜 팀원",
++  pubkey: alice.pubkey,
++  rules: [rule],
++  updatedAt: 10,
++  updatedBy: alice.pubkey,
++  ...overrides,
++});
++const event = (who, people, created_at = 1) =>
++  finalizeEvent(
++    {
++      kind: 30078,
++      created_at,
++      tags: [["d", d]],
++      content: encodePeople(people),
++    },
++    who.secret,
++  );
++const wrap = (who, people, created_at = 1) =>
++  finalizeEvent(
++    {
++      kind: 30078,
++      created_at,
++      tags: [["d", d]],
++      content: JSON.stringify({
++        people: {},
++        production: signProductionPeople(people, d, production, created_at),
++      }),
++    },
++    who.secret,
++  );
++afterEach(() => {
++  mock.restoreAll();
++  delete globalThis.window;
++});
++
++test("password derivation is deterministic, community-scoped, accepts empty/short/long passwords exactly", async () => {
++  const a = await productionKey("제작부", relay);
++  assert.equal((await productionKey("제작부", `${relay}/`)).pubkey, a.pubkey);
++  assert.notEqual(
++    (await productionKey("제작부", `${relay}/other`)).pubkey,
++    a.pubkey,
++  );
++  assert.notEqual((await productionKey("제작부 ", relay)).pubkey, a.pubkey);
++  assert.ok(await productionKey("", relay));
++  assert.ok(await productionKey("a".repeat(1024), relay));
++  assert.equal(
++    restoreProduction(productionSecretHex(a), a.pubkey).pubkey,
++    a.pubkey,
++  );
++  assert.equal(restoreProduction(productionSecretHex(a), bob.pubkey), null);
++  assert.equal(restoreProduction("broken", a.pubkey), null);
++});
++
++test("NIP-44 reason is readable only by its author and production; serialized copies never leak view plaintext", async () => {
++  const locked = lockRule(rule, alice.pubkey, production.pubkey);
++  assert.equal(unlockTitle(locked.lockedTitle, alice), rule.title);
++  assert.equal(unlockTitle(locked.lockedTitle, production), rule.title);
++  assert.throws(() => unlockTitle(locked.lockedTitle, bob));
++  assert.throws(() =>
++    nip44.decrypt(
++      locked.lockedTitle.forAuthor,
++      nip44.getConversationKey(bob.secret, locked.lockedTitle.sender),
++    ),
++  );
++  const raw = { p1: person({ rules: [locked] }) };
++  const viewed = await visiblePeople(
++    raw,
++    alice.pubkey,
++    null,
++    async (ciphertext, sender) =>
++      nip44.decrypt(ciphertext, nip44.getConversationKey(alice.secret, sender)),
++  );
++  assert.equal(viewed.p1.rules[0].title, rule.title);
++  assert.equal(
++    (await visiblePeople(raw, bob.pubkey, null, () => assert.fail())).p1
++      .rules[0].title,
++    "참여 불가",
++  );
++  assert.equal(
++    (await visiblePeople(raw, bob.pubkey, production, () => assert.fail())).p1
++      .rules[0].title,
++    rule.title,
++  );
++  assert.equal(encodePeople(viewed).includes(rule.title), false);
++  assert.deepEqual(decodePeople(encodePeople(viewed)), raw);
++  const draft = ruleDraftOf(viewed.p1.rules[0]);
++  assert.deepEqual(
++    ruleOfDraft({ ...draft, end: "13:00" }).rule.lockedTitle,
++    locked.lockedTitle,
++  );
++  assert.equal(
++    ruleOfDraft({ ...draft, title: "바뀐 사유" }).rule.lockedTitle,
++    undefined,
++  );
++});
++
++test("merge filters third-party edits, spoofed updatedBy, unlink, deletion and copied binding on cold load", () => {
++  const original = event(alice, { p1: person() });
++  for (const patch of [
++    { name: "변조" },
++    { pubkey: undefined, name: "변조" },
++    { deleted: true, rules: [] },
++  ]) {
++    const attack = event(bob, {
++      p1: person({ ...patch, updatedAt: 99, updatedBy: alice.pubkey }),
++    });
++    for (const list of [
++      [original, attack],
++      [attack, original],
++    ])
++      assert.equal(
++        mergePeopleEvents(list, d, alice.pubkey, { pubkey: production.pubkey })
++          .merged.p1.name,
++        "가짜 팀원",
++      );
++  }
++  const accepted = wrap(bob, {
++    p1: person({
++      name: "제작부 수정",
++      updatedAt: 20,
++      updatedBy: production.pubkey,
++    }),
++  });
++  assert.equal(
++    mergeAvailabilityEvents([original, accepted], d, {
++      pubkey: production.pubkey,
++    }).p1.name,
++    "제작부 수정",
++  );
++  const tampered = JSON.parse(JSON.stringify(accepted));
++  const payload = JSON.parse(tampered.content);
++  payload.production.content = encodePeople({
++    p1: person({ name: "변조", updatedAt: 90 }),
++  });
++  tampered.content = JSON.stringify(payload);
++  assert.equal(
++    mergeAvailabilityEvents([original, tampered], d, {
++      pubkey: production.pubkey,
++    }).p1.name,
++    "가짜 팀원",
++  );
++  assert.deepEqual(
++    mergeAvailabilityEvents([{ ...original, kind: 1 }], d, null),
++    {},
++  );
++});
++
++test("legacy plaintext and unconfigured schedules retain their format and unlinked collaboration", () => {
++  assert.equal(
++    decodePeople(encodePeople({ p1: person() })).p1.rules[0].title,
++    rule.title,
++  );
++  const old = event(alice, { p1: person({ pubkey: undefined }) });
++  const edited = event(bob, {
++    p1: person({ pubkey: undefined, updatedAt: 20, name: "함께 수정" }),
++  });
++  assert.equal(
++    mergeAvailabilityEvents([old, edited], d, null).p1.name,
++    "함께 수정",
++  );
++});
++
++test("only manager settings apply; obsolete and wrong-coordinate copies are ignored", () => {
++  const config = (who, pubkey, created_at) =>
++    finalizeEvent(
++      {
++        kind: 30078,
++        created_at,
++        tags: [["d", productionDTag(relay)]],
++        content: JSON.stringify({ pubkey }),
++      },
++      who.secret,
++    );
++  assert.equal(
++    readProductionSettings(
++      [config(alice, production.pubkey, 1), config(bob, bob.pubkey, 9)],
++      new Set([alice.pubkey]),
++      productionDTag(relay),
++    ).pubkey,
++    production.pubkey,
++  );
++  assert.equal(
++    readProductionSettings(
++      [config(bob, bob.pubkey, 9)],
++      new Set([alice.pubkey]),
++      productionDTag(relay),
++    ),
++    null,
++  );
++});
++
++function storeFixture({ configured = true } = {}) {
++  let events = [
++    event(alice, {
++      p1: person(),
++      p2: person({ id: "p2", pubkey: undefined, name: "이전 팀원" }),
++    }),
++  ];
++  let config = configured
++    ? [
++        finalizeEvent(
++          {
++            kind: 30078,
++            created_at: 1,
++            tags: [["d", productionDTag(relay)]],
++            content: JSON.stringify({ pubkey: production.pubkey }),
++          },
++          alice.secret,
++        ),
++      ]
++    : [];
++  let signer = bob;
++  const publishes = [];
++  globalThis.window = {
++    __TAURI_INTERNALS__: {
++      invoke: async (cmd, args) => {
++        assert.equal(cmd, "sign_event");
++        return JSON.stringify(
++          finalizeEvent(
++            {
++              kind: args.kind,
++              content: args.content,
++              tags: args.tags,
++              created_at: args.createdAt,
++            },
++            signer.secret,
++          ),
++        );
++      },
++    },
++  };
++  mock.method(relayClient, "fetchFirstEvent", async () => ({
++    tags: [
++      ["member", alice.pubkey, "owner"],
++      ["member", bob.pubkey, "member"],
++    ],
++    created_at: 1,
++  }));
++  mock.method(relayClient, "fetchEvents", async (f) =>
++    f["#d"]?.[0] === d ? events : config,
++  );
++  mock.method(relayClient, "publishEvent", async (e) => {
++    publishes.push(e);
++    if (e.tags[0][1] === d)
++      events = [...events.filter((old) => old.pubkey !== e.pubkey), e];
++    else config = [...config.filter((old) => old.pubkey !== e.pubkey), e];
++  });
++  return {
++    publishes,
++    setSigner(who) {
++      signer = who;
++    },
++    get events() {
++      return events;
++    },
++    get config() {
++      return config;
++    },
++  };
++}
++
++test("real save seam rejects another member, preserves ciphertext, signs production inside logged-in event and retains it on subsequent self save", async () => {
++  const f = storeFixture();
++  await assert.rejects(
++    saveAvailability(
++      relay,
++      bob.pubkey,
++      [person({ name: "横取り" })],
++      null,
++      () => true,
++    ),
++    /本|본인/,
++  );
++  assert.equal(f.publishes.length, 0);
++  await saveAvailability(
++    relay,
++    bob.pubkey,
++    [person({ rules: [{ ...rule, title: "가짜 알바" }] })],
++    production,
++    () => true,
++  );
++  assert.equal(f.publishes.length, 1);
++  assert.equal(f.publishes[0].pubkey, bob.pubkey);
++  assert.equal(f.publishes[0].content.includes("가짜 알바"), false);
++  const snapshot = await readAvailabilitySnapshot(relay);
++  assert.equal(
++    unlockTitle(snapshot.people.p1.rules[0].lockedTitle, alice),
++    "가짜 알바",
++  );
++  assert.equal(
++    unlockTitle(snapshot.people.p1.rules[0].lockedTitle, production),
++    "가짜 알바",
++  );
++  await saveAvailability(
++    relay,
++    bob.pubkey,
++    [person({ id: "p2", pubkey: undefined })],
++    null,
++    () => true,
++  );
++  assert.equal(
++    (await readAvailabilitySnapshot(relay)).people.p1.rules[0].lockedTitle
++      .forAuthor,
++    snapshot.people.p1.rules[0].lockedTitle.forAuthor,
++  );
++  f.setSigner(alice);
++  await saveAvailability(
++    relay,
++    alice.pubkey,
++    [{ ...snapshot.people.p2, rules: [] }],
++    null,
++    () => true,
++  );
++  assert.equal(f.publishes.at(-1).content.includes(rule.title), false);
++  await saveAvailability(
++    relay,
++    alice.pubkey,
++    [{ ...snapshot.people.p1, role: "수정" }],
++    null,
++    () => true,
++  );
++  assert.equal(
++    (await readAvailabilitySnapshot(relay)).people.p1.rules[0].lockedTitle
++      .forAuthor,
++    snapshot.people.p1.rules[0].lockedTitle.forAuthor,
++  );
++});
++
++test("unconfigured save keeps plaintext; setup and explicit legacy hiding then rotation preserve data", async () => {
++  const f = storeFixture({ configured: false });
++  f.setSigner(alice);
++  await saveAvailability(relay, alice.pubkey, [person()], null, () => true);
++  assert.equal(
++    JSON.parse(f.publishes[0].content).people.p1.rules[0].title,
++    rule.title,
++  );
++  await assert.rejects(
++    setProductionPassword(relay, bob.pubkey, production, null, () => true),
++    /방장/,
++  );
++  await setProductionPassword(
++    relay,
++    alice.pubkey,
++    production,
++    null,
++    () => true,
++  );
++  assert.equal(f.config.at(-1).content.includes(rule.title), false);
++  assert.equal(JSON.parse(f.config.at(-1).content).baseline, undefined);
++  assert.equal(
++    (await readAvailabilitySnapshot(relay)).people.p1.rules[0].title,
++    rule.title,
++  );
++  await saveAvailability(
++    relay,
++    alice.pubkey,
++    Object.values((await readAvailabilitySnapshot(relay)).people),
++    production,
++    () => true,
++  );
++  assert.equal(f.publishes.at(-1).content.includes(rule.title), false);
++  await assert.rejects(
++    setProductionPassword(relay, alice.pubkey, next, null, () => true),
++    /먼저/,
++  );
++  await setProductionPassword(
++    relay,
++    alice.pubkey,
++    next,
++    production,
++    () => true,
++  );
++  const snapshot = await readAvailabilitySnapshot(relay);
++  assert.equal(snapshot.settings.pubkey, next.pubkey);
++  assert.equal(
++    unlockTitle(snapshot.people.p1.rules[0].lockedTitle, next),
++    rule.title,
++  );
++  assert.throws(() =>
++    unlockTitle(snapshot.people.p1.rules[0].lockedTitle, production),
++  );
++  assert.equal(f.config.at(-1).content.includes(rule.title), false);
++});
++
++test("failed publish propagates and cancelled scope never publishes", async () => {
++  const f = storeFixture();
++  f.setSigner(alice);
++  await assert.rejects(
++    saveAvailability(relay, alice.pubkey, [person()], null, () => false),
++    /다른 팀/,
++  );
++  mock.method(relayClient, "publishEvent", async () => {
++    throw new Error("fake offline");
++  });
++  await assert.rejects(
++    saveAvailability(relay, alice.pubkey, [person()], null, () => true),
++    /fake offline/,
++  );
++});
++
++test("production can change a binding; owners cannot unlink themselves or claim a second person", async () => {
++  const f = storeFixture();
++  f.setSigner(alice);
++  await assert.rejects(
++    saveAvailability(
++      relay,
++      alice.pubkey,
++      [person({ pubkey: undefined })],
++      null,
++      () => true,
++    ),
++    /본인과 제작부/,
++  );
++  await assert.rejects(
++    saveAvailability(
++      relay,
++      alice.pubkey,
++      [person({ id: "p2" })],
++      null,
++      () => true,
++    ),
++    /다른 이름/,
++  );
++  await saveAvailability(
++    relay,
++    alice.pubkey,
++    [person()],
++    production,
++    () => true,
++  );
++  const protectedPerson = (await readAvailabilitySnapshot(relay)).people.p1;
++  await saveAvailability(
++    relay,
++    alice.pubkey,
++    [{ ...protectedPerson, pubkey: bob.pubkey }],
++    production,
++    () => true,
++  );
++  assert.equal(
++    unlockTitle(
++      (await readAvailabilitySnapshot(relay)).people.p1.rules[0].lockedTitle,
++      bob,
++    ),
++    rule.title,
++  );
++  assert.equal(
++    (await readAvailabilitySnapshot(relay)).people.p1.pubkey,
++    bob.pubkey,
++  );
++  f.setSigner(bob);
++  await saveAvailability(
++    relay,
++    bob.pubkey,
++    [person({ pubkey: bob.pubkey, name: "새 연결 본인" })],
++    null,
++    () => true,
++  );
++  assert.equal(
++    (await readAvailabilitySnapshot(relay)).people.p1.name,
++    "새 연결 본인",
++  );
++});
++
++test("unreadable reasons remain intact and cannot leak into serialized fallback views", async () => {
++  const locked = lockRule(rule, alice.pubkey, production.pubkey);
++  const raw = { p1: person({ rules: [locked] }) };
++  const view = await visiblePeople(raw, alice.pubkey, null, async () => {
++    throw new Error("fake account unavailable");
++  });
++  assert.equal(view.p1.rules[0].title, "참여 불가");
++  assert.equal(view.p1.rules[0].lockedTitle, locked.lockedTitle);
++  assert.deepEqual(decodePeople(encodePeople(view)), raw);
++});
++
++test("protected backup/import round trip preserves the reason without exporting view plaintext", async () => {
++  const f = storeFixture();
++  f.setSigner(alice);
++  const locked = lockRule(rule, alice.pubkey, production.pubkey);
++  const text = buildCalendarBackup({
++    plan: null,
++    entries: [],
++    people: [person({ rules: [{ ...locked, title: rule.title }] })],
++  });
++  assert.equal(text.includes(rule.title), false);
++  const imported = parseCalendarImport(text);
++  assert.deepEqual(imported.people[0].rules[0].lockedTitle, locked.lockedTitle);
++  await saveAvailability(
++    relay,
++    alice.pubkey,
++    imported.people,
++    null,
++    () => true,
++  );
++  assert.equal(
++    unlockTitle(
++      (await readAvailabilitySnapshot(relay)).people.p1.rules[0].lockedTitle,
++      alice,
++    ),
++    rule.title,
++  );
++});
+diff --git a/desktop/src/features/team-calendar/lib/availabilityPrivacy.ts b/desktop/src/features/team-calendar/lib/availabilityPrivacy.ts
+new file mode 100644
+index 000000000..97187867f
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/availabilityPrivacy.ts
+@@ -0,0 +1,209 @@
++import { scryptAsync } from "@noble/hashes/scrypt.js";
++import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
++import {
++  finalizeEvent,
++  generateSecretKey,
++  getPublicKey,
++  verifyEvent,
++} from "nostr-tools/pure";
++import * as nip44 from "nostr-tools/nip44";
++import type { RelayEvent } from "@/shared/api/types";
++import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
++import {
++  RULE_KIND_LABELS,
++  type AvailabilityRule,
++  type PeopleById,
++  decodePeople,
++  encodePeople,
++  mergePeople,
++} from "./teamAvailability";
++
++/** Derived production identity, held only on the current device. */
++export type ProductionKey = { secret: Uint8Array; pubkey: string };
++/** Two independent NIP-44 payloads from one ephemeral sender. */
++export type LockedTitle = {
++  sender: string;
++  author: string;
++  production: string;
++  forAuthor: string;
++  forProduction: string;
++};
++
++/** Password bytes are used exactly as entered; the normalized community is the salt. */
++export async function productionKey(
++  password: string,
++  relay: string,
++): Promise<ProductionKey> {
++  const secret = await scryptAsync(
++    password,
++    `buzz-availability-v1:${normalizeRelayUrl(relay)}`,
++    { N: 16384, r: 8, p: 1, dkLen: 32 },
++  );
++  return { secret, pubkey: getPublicKey(secret) };
++}
++
++/** Only the derived secret is remembered, scoped to account and community. */
++export function productionStorageKey(pubkey: string, relay: string): string {
++  return `buzz-availability-production:${pubkey}:${normalizeRelayUrl(relay)}`;
++}
++
++/** Invalid or obsolete device state never opens production mode. */
++export function restoreProduction(
++  value: string | null,
++  expected: string | undefined,
++): ProductionKey | null {
++  try {
++    if (!value || !/^[0-9a-f]{64}$/.test(value)) return null;
++    const secret = hexToBytes(value);
++    const pubkey = getPublicKey(secret);
++    return pubkey === expected ? { secret, pubkey } : null;
++  } catch {
++    return null;
++  }
++}
++/** Device-local representation; never include this in a shared document. */
++export const productionSecretHex = (key: ProductionKey) =>
++  bytesToHex(key.secret);
++
++/** A fresh sender protects the same reason separately for its author and production. */
++export function lockRule(
++  rule: AvailabilityRule,
++  author: string,
++  production: string,
++): AvailabilityRule {
++  const secret = generateSecretKey();
++  const encrypt = (recipient: string) =>
++    nip44.encrypt(rule.title, nip44.getConversationKey(secret, recipient));
++  return {
++    ...rule,
++    title: RULE_KIND_LABELS[rule.kind],
++    lockedTitle: {
++      sender: getPublicKey(secret),
++      author,
++      production,
++      forAuthor: encrypt(author),
++      forProduction: encrypt(production),
++    },
++  };
++}
++
++/** Throws for a non-recipient or damaged payload, rather than returning a false reason. */
++export function unlockTitle(locked: LockedTitle, key: ProductionKey): string {
++  const payload =
++    key.pubkey === locked.author
++      ? locked.forAuthor
++      : key.pubkey === locked.production
++        ? locked.forProduction
++        : null;
++  if (!payload) throw new Error("이 사유를 볼 수 없습니다.");
++  return nip44.decrypt(
++    payload,
++    nip44.getConversationKey(key.secret, locked.sender),
++  );
++}
++
++/** Native account decryption keeps the account secret outside JavaScript. */
++export async function visiblePeople(
++  people: PeopleById,
++  pubkey: string,
++  production: ProductionKey | null,
++  decrypt: (ciphertext: string, sender: string) => Promise<string>,
++): Promise<PeopleById> {
++  const result: PeopleById = {};
++  for (const person of Object.values(people)) {
++    result[person.id] = {
++      ...person,
++      rules: await Promise.all(
++        person.rules.map(async (rule) => {
++          const locked = rule.lockedTitle;
++          if (!locked) return rule;
++          let title = RULE_KIND_LABELS[rule.kind];
++          try {
++            if (production?.pubkey === locked.production)
++              title = unlockTitle(locked, production);
++            else if (pubkey === locked.author)
++              title = await decrypt(locked.forAuthor, locked.sender);
++          } catch {
++            /* An unreadable reason stays hidden; the stored payload is retained. */
++          }
++          return { ...rule, title };
++        }),
++      ),
++    };
++  }
++  return result;
++}
++
++/** Production signs inside the member's envelope (the relay requires the logged-in author). */
++export function signProductionPeople(
++  people: PeopleById,
++  dTag: string,
++  key: ProductionKey,
++  createdAt: number,
++): RelayEvent {
++  return finalizeEvent(
++    {
++      kind: 30078,
++      created_at: createdAt,
++      tags: [["d", dTag]],
++      content: encodePeople(people),
++    },
++    key.secret,
++  );
++}
++
++/** Decode the actual writer, never the editable updatedBy field. */
++export function availabilityCopies(
++  event: RelayEvent,
++  dTag: string,
++  production?: string,
++): { writer: string; people: PeopleById }[] {
++  if (
++    event.kind !== 30078 ||
++    event.tags.filter((t) => t[0] === "d").length !== 1 ||
++    !event.tags.some((t) => t[0] === "d" && t[1] === dTag)
++  )
++    return [];
++  const result = [
++    { writer: event.pubkey, people: decodePeople(event.content) },
++  ];
++  try {
++    const inner = JSON.parse(event.content).production;
++    if (
++      production &&
++      inner?.pubkey === production &&
++      inner.kind === 30078 &&
++      inner.tags?.length === 1 &&
++      inner.tags[0]?.[0] === "d" &&
++      inner.tags[0]?.[1] === dTag &&
++      verifyEvent(inner)
++    )
++      result.push({ writer: production, people: decodePeople(inner.content) });
++  } catch {
++    /* Invalid optional proof confers no permission. */
++  }
++  return result;
++}
++
++/** Enforce the existing binding too: omitting pubkey cannot bypass ownership. */
++export function mergeAuthorizedPeople(
++  base: PeopleById,
++  people: PeopleById,
++  writer: string,
++  production?: string,
++): PeopleById {
++  const accepted: PeopleById = {};
++  for (const [id, person] of Object.entries(people)) {
++    const owner = base[id]?.pubkey;
++    if (writer !== production) {
++      if (
++        (owner && owner !== writer) ||
++        (person.pubkey && person.pubkey !== writer)
++      )
++        continue;
++      if (owner && person.pubkey !== owner) continue;
++    }
++    accepted[id] = { ...person, updatedBy: writer };
++  }
++  return mergePeople(base, accepted);
++}
+diff --git a/desktop/src/features/team-calendar/lib/availabilityStore.ts b/desktop/src/features/team-calendar/lib/availabilityStore.ts
+new file mode 100644
+index 000000000..7dbd945d1
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/availabilityStore.ts
+@@ -0,0 +1,296 @@
++import {
++  type ProductionSettings,
++  mergeAvailabilityEvents,
++  newestAvailabilityEvents,
++  readProductionSettings,
++} from "./availabilityMerge";
++export {
++  mergeAvailabilityEvents,
++  readProductionSettings,
++} from "./availabilityMerge";
++import { relayClient } from "@/shared/api/relayClient";
++import { listRelayMembers } from "@/shared/api/relayMembers";
++import { signRelayEvent } from "@/shared/api/tauri";
++import type { RelayEvent } from "@/shared/api/types";
++import {
++  type PeopleById,
++  type TeamPerson,
++  encodePeopleForPublish,
++  mergePeople,
++  teamAvailabilityDTag,
++} from "./teamAvailability";
++import {
++  type ProductionKey,
++  availabilityCopies,
++  lockRule,
++  signProductionPeople,
++  unlockTitle,
++} from "./availabilityPrivacy";
++
++/** Community-scoped coordinate for manager-authored production settings. */
++export const productionDTag = (relay: string) =>
++  `${teamAvailabilityDTag(relay)}:production`;
++/** Fresh authorized state used both for display and write-time permission checks. */
++export type AvailabilitySnapshot = {
++  people: PeopleById;
++  events: RelayEvent[];
++  settings: ProductionSettings | null;
++  managers: Set<string>;
++};
++/** One bounded community read. Membership failures propagate instead of disabling protection. */
++export async function readAvailabilitySnapshot(
++  relay: string,
++): Promise<AvailabilitySnapshot> {
++  const members = await listRelayMembers();
++  const managers = new Set(
++    members
++      .filter((m) => m.role === "owner" || m.role === "admin")
++      .map((m) => m.pubkey),
++  );
++  const [events, config] = await Promise.all([
++    relayClient.fetchEvents({
++      kinds: [30078],
++      "#d": [teamAvailabilityDTag(relay)],
++      limit: 200,
++    }),
++    relayClient.fetchEvents({
++      kinds: [30078],
++      "#d": [productionDTag(relay)],
++      limit: 200,
++    }),
++  ]);
++  const settings = readProductionSettings(
++    config,
++    managers,
++    productionDTag(relay),
++  );
++  return {
++    people: mergeAvailabilityEvents(
++      events,
++      teamAvailabilityDTag(relay),
++      settings,
++    ),
++    settings,
++    events,
++    managers,
++  };
++}
++
++/** UI and write seam share the same ownership rule. */
++export function canEditAvailability(
++  person: Pick<TeamPerson, "pubkey">,
++  pubkey: string,
++  production: boolean,
++): boolean {
++  return production || !person.pubkey || person.pubkey === pubkey;
++}
++
++async function publish(
++  content: string,
++  dTag: string,
++  createdAt: number,
++  active: () => boolean,
++): Promise<RelayEvent> {
++  if (new TextEncoder().encode(content).length > 60_000)
++    throw new Error("팀원 일정이 너무 많습니다. 지난 일정을 정리해 주세요.");
++  const event = await signRelayEvent({
++    kind: 30078,
++    content,
++    createdAt,
++    tags: [
++      ["d", dTag],
++      ["t", "team-availability"],
++    ],
++  });
++  if (!active()) throw new Error("다른 팀으로 이동했습니다. 다시 열어 주세요.");
++  await relayClient.publishEvent(
++    event,
++    "저장이 오래 걸립니다. 다시 시도해 주세요.",
++    "팀원 일정을 저장하지 못했습니다.",
++    active,
++  );
++  return event;
++}
++
++/** Recheck fresh ownership, preserve unreadable reasons, and publish one snapshot per action. */
++export async function saveAvailability(
++  relay: string,
++  pubkey: string,
++  inputs: Omit<TeamPerson, "updatedAt" | "updatedBy">[],
++  key: ProductionKey | null,
++  active: () => boolean,
++): Promise<void> {
++  const snapshot = await readAvailabilitySnapshot(relay);
++  if (!active()) throw new Error("다른 팀으로 이동했습니다. 다시 열어 주세요.");
++  const production = key?.pubkey === snapshot.settings?.pubkey ? key : null;
++  const own = newestAvailabilityEvents(
++    snapshot.events,
++    teamAvailabilityDTag(relay),
++  ).find((e) => e.pubkey === pubkey);
++  const ownCopies = own
++    ? availabilityCopies(
++        own,
++        teamAvailabilityDTag(relay),
++        snapshot.settings?.pubkey,
++      )
++    : [];
++  // Do not echo stale plaintext after another member migrated this person's reasons.
++  let normal = Object.fromEntries(
++    Object.entries(
++      ownCopies.find((c) => c.writer === pubkey)?.people ?? {},
++    ).filter(
++      ([id, person]) =>
++        (!person.pubkey || person.pubkey === pubkey) &&
++        (snapshot.people[id]?.updatedAt ?? 0) <= person.updatedAt,
++    ),
++  );
++  let privileged =
++    ownCopies.find((c) => c.writer === production?.pubkey)?.people ?? {};
++  const changes: PeopleById = {};
++  for (const input of inputs) {
++    const previous = snapshot.people[input.id];
++    if (
++      !production &&
++      input.pubkey === pubkey &&
++      previous?.pubkey !== pubkey &&
++      Object.values(snapshot.people).some(
++        (p) => p.id !== input.id && p.pubkey === pubkey,
++      )
++    )
++      throw new Error("다른 이름으로 바꾸려면 제작부를 열어 주세요.");
++    if (
++      !canEditAvailability(previous ?? input, pubkey, !!production) ||
++      (!production && previous?.pubkey && previous.pubkey !== input.pubkey) ||
++      (!production && input.pubkey && input.pubkey !== pubkey)
++    )
++      throw new Error("본인과 제작부만 고칠 수 있어요.");
++    const rules = input.rules.map((rule) => {
++      const oldRule = previous?.rules.find((r) => r.id === rule.id);
++      if (
++        rule.lockedTitle &&
++        oldRule?.lockedTitle &&
++        JSON.stringify(rule.lockedTitle) === JSON.stringify(oldRule.lockedTitle)
++      ) {
++        if (production && input.pubkey && input.pubkey !== previous?.pubkey) {
++          return lockRule(
++            { ...rule, title: unlockTitle(rule.lockedTitle, production) },
++            input.pubkey,
++            production.pubkey,
++          );
++        }
++        return { ...rule, title: oldRule.title };
++      }
++      if (rule.lockedTitle) {
++        if (
++          rule.lockedTitle.production !== snapshot.settings?.pubkey ||
++          (input.pubkey && rule.lockedTitle.author !== input.pubkey)
++        )
++          throw new Error(
++            "이전 사유를 읽지 못했어요. 제작부에서 다시 가져와 주세요.",
++          );
++        return rule;
++      }
++      const { lockedTitle: _discard, ...plain } = rule;
++      return snapshot.settings
++        ? lockRule(plain, input.pubkey ?? pubkey, snapshot.settings.pubkey)
++        : plain;
++    });
++    changes[input.id] = {
++      ...input,
++      name: input.name.trim(),
++      role: input.role?.trim() || undefined,
++      rules,
++      updatedAt: Math.max(Date.now(), (previous?.updatedAt ?? 0) + 1),
++      updatedBy: production?.pubkey ?? pubkey,
++    };
++  }
++  const createdAt = Math.max(
++    Math.floor(Date.now() / 1000),
++    (own?.created_at ?? 0) + 1,
++  );
++  if (production) {
++    privileged = mergePeople(privileged, changes);
++    normal = { ...normal };
++    for (const id of Object.keys(changes)) delete normal[id];
++  } else normal = mergePeople(normal, changes);
++  const content = encodePeopleForPublish(normal);
++  if (content === null) throw new Error("팀원 일정이 너무 많습니다.");
++  const payload = JSON.parse(content);
++  // Retain this member's previous production writes when subsequently saving as self.
++  const priorProof = own && JSON.parse(own.content).production;
++  if (production)
++    payload.production = signProductionPeople(
++      privileged,
++      teamAvailabilityDTag(relay),
++      production,
++      createdAt,
++    );
++  else if (priorProof) payload.production = priorProof;
++  await publish(
++    JSON.stringify(payload),
++    teamAvailabilityDTag(relay),
++    createdAt,
++    active,
++  );
++}
++
++/** Rotate in one manager event; carry current data under the new production signer. */
++export async function setProductionPassword(
++  relay: string,
++  pubkey: string,
++  next: ProductionKey,
++  previous: ProductionKey | null,
++  active: () => boolean,
++): Promise<void> {
++  const snapshot = await readAvailabilitySnapshot(relay);
++  if (!snapshot.managers.has(pubkey))
++    throw new Error("방장과 관리자만 정할 수 있어요.");
++  if (snapshot.settings && previous?.pubkey !== snapshot.settings.pubkey)
++    throw new Error("제작부를 먼저 열어 주세요.");
++  const people: PeopleById = {};
++  const carried = previous
++    ? Object.values(snapshot.people).filter(
++        (person) =>
++          person.updatedBy === previous.pubkey ||
++          person.rules.some((rule) => rule.lockedTitle),
++      )
++    : [];
++  for (const person of carried) {
++    people[person.id] = {
++      ...person,
++      updatedBy: next.pubkey,
++      updatedAt: Math.max(Date.now(), person.updatedAt + 1),
++      rules: person.rules.map((rule) => {
++        if (!rule.lockedTitle) return rule;
++        const title = previous
++          ? unlockTitle(rule.lockedTitle, previous)
++          : rule.title;
++        return lockRule(
++          { ...rule, title },
++          person.pubkey ?? rule.lockedTitle?.author ?? pubkey,
++          next.pubkey,
++        );
++      }),
++    };
++  }
++  const config = await relayClient.fetchEvents({
++    kinds: [30078],
++    "#d": [productionDTag(relay)],
++    limit: 200,
++  });
++  const createdAt = Math.max(
++    Math.floor(Date.now() / 1000),
++    ...config
++      .filter((e) => snapshot.managers.has(e.pubkey))
++      .map((e) => e.created_at + 1),
++  );
++  const baseline = carried.length
++    ? signProductionPeople(people, teamAvailabilityDTag(relay), next, createdAt)
++    : undefined;
++  await publish(
++    JSON.stringify({ v: 1, pubkey: next.pubkey, baseline }),
++    productionDTag(relay),
++    createdAt,
++    active,
++  );
++}
+diff --git a/desktop/src/features/team-calendar/lib/calendarImport.ts b/desktop/src/features/team-calendar/lib/calendarImport.ts
+index 456e3b1d6..b1f78ad7d 100644
+--- a/desktop/src/features/team-calendar/lib/calendarImport.ts
++++ b/desktop/src/features/team-calendar/lib/calendarImport.ts
+@@ -6,6 +6,8 @@ import {
+   type RuleKind,
+   type TeamPerson,
+   validateRule,
++  readAvailabilityRule,
++  RULE_KIND_LABELS,
+ } from "./teamAvailability";
+ import {
+   CALENDAR_COLORS,
+@@ -139,6 +141,16 @@ function readImportRule(raw: unknown, who: string, index: number) {
+         )
+       : [],
+   };
++  if (value.lockedTitle !== undefined) {
++    const stored = readAvailabilityRule({
++      ...rule,
++      lockedTitle: value.lockedTitle,
++    });
++    if (!stored?.lockedTitle)
++      fail(`${where}: 사유를 읽지 못했어요. 원본 파일을 확인해 주세요.`);
++    rule.lockedTitle = stored.lockedTitle;
++    rule.title = stored.title;
++  }
+   const problem = validateRule(rule);
+   if (problem) fail(`${where} (${rule.title || "제목 없음"}): ${problem}`);
+   return rule;
+@@ -276,7 +288,11 @@ export function buildCalendarBackup(input: {
+     const out: Record<string, unknown> = {
+       id: person.id,
+       name: person.name,
+-      rules: person.rules,
++      rules: person.rules.map((rule) =>
++        rule.lockedTitle
++          ? { ...rule, title: RULE_KIND_LABELS[rule.kind] }
++          : rule,
++      ),
+     };
+     if (person.role) out.role = person.role;
+     if (person.pubkey) out.pubkey = person.pubkey;
+diff --git a/desktop/src/features/team-calendar/lib/teamAvailability.ts b/desktop/src/features/team-calendar/lib/teamAvailability.ts
+index 99b967200..a711a499f 100644
+--- a/desktop/src/features/team-calendar/lib/teamAvailability.ts
++++ b/desktop/src/features/team-calendar/lib/teamAvailability.ts
+@@ -1,6 +1,13 @@
+ import type { RelayEvent } from "@/shared/api/types";
+ import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
+ 
++import {
++  mergeAvailabilityEvents,
++  newestAvailabilityEvents,
++  type ProductionSettings,
++} from "./availabilityMerge";
++import type { LockedTitle } from "./availabilityPrivacy";
++
+ import { daysBetween } from "./teamCalendar";
+ 
+ /**
+@@ -17,7 +24,8 @@ import { daysBetween } from "./teamCalendar";
+  * Shared like the calendar: every member publishes their merged copy of the
+  * whole list at their own `(pubkey, kind 30078, d)` coordinate and readers
+  * merge them, person by person, last writer wins. Anyone in the community can
+- * edit anyone's schedule (as on the page this replaces).
++ * edit unlinked schedules. Protected reads and production proofs are handled
++ * by availabilityStore; locked reasons retain public time/status fields.
+  */
+ export const TEAM_AVAILABILITY_D_TAG = "team-availability";
+ 
+@@ -59,6 +67,8 @@ export type AvailabilityRule = {
+   start: number;
+   end: number;
+   title: string;
++  /** Stored reason; title is only a status label when this is present. */
++  lockedTitle?: LockedTitle;
+   /** Days of the period the rule does not apply on. */
+   exclude: string[];
+ };
+@@ -110,7 +120,8 @@ export function validateRule(
+   return null;
+ }
+ 
+-function readRule(raw: unknown): AvailabilityRule | null {
++/** Read one stored rule, retaining protected reasons for backups as well as relay copies. */
++export function readAvailabilityRule(raw: unknown): AvailabilityRule | null {
+   if (!raw || typeof raw !== "object") return null;
+   const value = raw as Record<string, unknown>;
+   if (typeof value.id !== "string" || !ID_PATTERN.test(value.id)) return null;
+@@ -144,6 +155,20 @@ function readRule(raw: unknown): AvailabilityRule | null {
+     title: text(value.title, MAX_RULE_TITLE_LENGTH),
+     exclude,
+   };
++  const locked = value.lockedTitle as Record<string, unknown> | undefined;
++  if (
++    locked &&
++    isPubkey(locked.sender) &&
++    isPubkey(locked.author) &&
++    isPubkey(locked.production) &&
++    typeof locked.forAuthor === "string" &&
++    typeof locked.forProduction === "string" &&
++    locked.forAuthor.length <= 2048 &&
++    locked.forProduction.length <= 2048
++  ) {
++    rule.lockedTitle = locked as LockedTitle;
++    rule.title = RULE_KIND_LABELS[rule.kind];
++  }
+   return validateRule(rule) === null ? rule : null;
+ }
+ 
+@@ -173,7 +198,7 @@ function readPerson(id: string, raw: unknown): TeamPerson | null {
+   if (Array.isArray(value.rules)) {
+     const seen = new Set<string>();
+     for (const rawRule of value.rules) {
+-      const rule = readRule(rawRule);
++      const rule = readAvailabilityRule(rawRule);
+       if (!rule || seen.has(rule.id)) continue;
+       seen.add(rule.id);
+       person.rules.push(rule);
+@@ -208,7 +233,10 @@ export function decodePeople(content: string): PeopleById {
+ /** A rule as stored: an empty `exclude` and a `null` weekday are left out. */
+ function compactRule(rule: AvailabilityRule): Record<string, unknown> {
+   const { exclude, weekday, ...rest } = rule;
+-  const out: Record<string, unknown> = rest;
++  const out: Record<string, unknown> = {
++    ...rest,
++    title: rule.lockedTitle ? RULE_KIND_LABELS[rule.kind] : rule.title,
++  };
+   if (weekday !== null) out.weekday = weekday;
+   if (exclude.length > 0) out.exclude = exclude;
+   return out;
+@@ -286,28 +314,13 @@ export function mergePeopleEvents(
+   events: RelayEvent[],
+   dTag: string,
+   pubkey: string,
++  settings: ProductionSettings | null = null,
+ ): { merged: PeopleById; own: PeopleById; ownCreatedAt: number } {
+-  const newest = new Map<string, RelayEvent>();
+-  for (const event of events) {
+-    const d = event.tags.filter((tag) => tag[0] === "d");
+-    if (d.length !== 1 || d[0]?.[1] !== dTag) continue;
+-    const current = newest.get(event.pubkey);
+-    if (
+-      current &&
+-      !(
+-        event.created_at > current.created_at ||
+-        (event.created_at === current.created_at && event.id < current.id)
+-      )
+-    )
+-      continue;
+-    newest.set(event.pubkey, event);
+-  }
+-  let merged: PeopleById = {};
++  const merged = mergeAvailabilityEvents(events, dTag, settings);
+   let own: PeopleById = {};
+   let ownCreatedAt = 0;
+-  for (const event of newest.values()) {
++  for (const event of newestAvailabilityEvents(events, dTag)) {
+     const copy = decodePeople(event.content);
+-    merged = mergePeople(merged, copy);
+     if (event.pubkey === pubkey) {
+       own = copy;
+       ownCreatedAt = event.created_at;
+diff --git a/desktop/src/features/team-calendar/lib/useAvailabilityPrivacy.ts b/desktop/src/features/team-calendar/lib/useAvailabilityPrivacy.ts
+new file mode 100644
+index 000000000..7103321d7
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/useAvailabilityPrivacy.ts
+@@ -0,0 +1,212 @@
++import { useQuery } from "@tanstack/react-query";
++import * as React from "react";
++import { relayClient } from "@/shared/api/relayClient";
++import { nip44DecryptFromSelf } from "@/shared/api/tauri";
++import { normalizeRelayUrl } from "@/shared/lib/normalizeRelayUrl";
++import {
++  livePeople,
++  teamAvailabilityDTag,
++  type PeopleById,
++} from "./teamAvailability";
++import {
++  type ProductionKey,
++  productionKey,
++  productionSecretHex,
++  productionStorageKey,
++  restoreProduction,
++  visiblePeople,
++} from "./availabilityPrivacy";
++import {
++  productionDTag,
++  readAvailabilitySnapshot,
++  saveAvailability,
++  setProductionPassword,
++} from "./availabilityStore";
++import type { PersonInput } from "./useTeamSprint";
++
++/** Availability-specific reads always keep the signed writer, unlike generic shared documents. */
++export function useTeamAvailability(pubkey: string, relayUrl: string) {
++  const relay = normalizeRelayUrl(relayUrl);
++  const scope = `${pubkey}|${relay}`;
++  const query = useQuery({
++    queryKey: ["team-availability-private", scope],
++    queryFn: () => readAvailabilitySnapshot(relay),
++    retry: false,
++    refetchInterval: 30_000,
++  });
++  const [device, setDevice] = React.useState<{
++    scope: string;
++    key: ProductionKey;
++  } | null>(null);
++  const expected = query.data?.settings?.pubkey;
++  const key =
++    device?.scope === scope && device.key.pubkey === expected
++      ? device.key
++      : null;
++  const generation = React.useRef({ scope, active: true });
++  const busy = React.useRef(false);
++  React.useEffect(() => {
++    const current = { scope, active: true };
++    generation.current = current;
++    return () => {
++      current.active = false;
++    };
++  }, [scope]);
++  React.useEffect(() => {
++    try {
++      const restored = restoreProduction(
++        localStorage.getItem(productionStorageKey(pubkey, relay)),
++        expected,
++      );
++      setDevice(restored ? { scope, key: restored } : null);
++    } catch {
++      setDevice(null);
++    }
++  }, [scope, pubkey, relay, expected]);
++  const refetch = query.refetch;
++  const refresh = React.useCallback(() => refetch(), [refetch]);
++  React.useEffect(() => {
++    let cancelled = false;
++    let dispose: (() => Promise<void>) | undefined;
++    const reload = () => {
++      if (!cancelled) void refresh();
++    };
++    void relayClient
++      .subscribeLive(
++        {
++          kinds: [30078],
++          "#d": [teamAvailabilityDTag(relay), productionDTag(relay)],
++          limit: 0,
++        },
++        reload,
++      )
++      .then((unsub) => {
++        if (cancelled) void unsub();
++        else {
++          dispose = unsub;
++          reload();
++        }
++      }, reload);
++    const reconnect = relayClient.subscribeToReconnects(reload);
++    return () => {
++      cancelled = true;
++      reconnect();
++      if (dispose) void dispose();
++    };
++  }, [relay, refresh]);
++  const raw = query.data?.people;
++  const [decoded, setDecoded] = React.useState<{
++    scope: string;
++    raw: PeopleById;
++    key: ProductionKey | null;
++    value: PeopleById;
++  } | null>(null);
++  React.useEffect(() => {
++    let cancelled = false;
++    if (raw)
++      void visiblePeople(raw, pubkey, key, nip44DecryptFromSelf).then(
++        (value) => {
++          if (!cancelled) setDecoded({ scope, raw, key, value });
++        },
++      );
++    return () => {
++      cancelled = true;
++    };
++  }, [scope, raw, pubkey, key]);
++  const value =
++    decoded?.scope === scope && decoded.raw === raw && decoded.key === key
++      ? decoded.value
++      : (raw ?? {});
++  const people = React.useMemo(() => livePeople(value), [value]);
++  const run = async (action: (active: () => boolean) => Promise<void>) => {
++    if (busy.current) throw new Error("저장이 끝난 뒤 다시 눌러 주세요.");
++    const current = generation.current;
++    const active = () =>
++      current.active &&
++      generation.current === current &&
++      current.scope === scope;
++    busy.current = true;
++    try {
++      await action(active);
++      if (active()) await refresh();
++    } finally {
++      busy.current = false;
++    }
++  };
++  const remember = (next: ProductionKey) => {
++    localStorage.setItem(
++      productionStorageKey(pubkey, relay),
++      productionSecretHex(next),
++    );
++    setDevice({ scope, key: next });
++  };
++  const savePeople = (inputs: PersonInput[]) =>
++    run((active) => saveAvailability(relay, pubkey, inputs, key, active));
++  const deletePerson = (id: string) =>
++    run(async (active) => {
++      const snapshot = await readAvailabilitySnapshot(relay);
++      const person = snapshot.people[id];
++      if (person)
++        await saveAvailability(
++          relay,
++          pubkey,
++          [{ ...person, name: "", rules: [], deleted: true }],
++          key,
++          active,
++        );
++    });
++  const unlock = (password: string) =>
++    run(async (active) => {
++      const next = await productionKey(password, relay);
++      const snapshot = await readAvailabilitySnapshot(relay);
++      if (next.pubkey !== snapshot.settings?.pubkey)
++        throw new Error("비밀번호가 맞지 않아요");
++      if (active()) remember(next);
++    });
++  const lock = () => {
++    localStorage.removeItem(productionStorageKey(pubkey, relay));
++    setDevice(null);
++  };
++  const setPassword = (password: string) =>
++    run(async (active) => {
++      const next = await productionKey(password, relay);
++      await setProductionPassword(relay, pubkey, next, key, active);
++      if (active()) remember(next);
++    });
++  const hideLegacy = () =>
++    run(async (active) => {
++      const snapshot = await readAvailabilitySnapshot(relay);
++      if (!key || key.pubkey !== snapshot.settings?.pubkey)
++        throw new Error("제작부를 먼저 열어 주세요.");
++      const inputs = Object.values(snapshot.people).filter(
++        (p) => !p.deleted && p.rules.some((r) => !r.lockedTitle),
++      );
++      if (inputs.length)
++        await saveAvailability(relay, pubkey, inputs, key, active);
++    });
++  return {
++    people,
++    status: query.isError
++      ? ("error" as const)
++      : query.isPending
++        ? ("loading" as const)
++        : ("ready" as const),
++    savePeople,
++    deletePerson,
++    retry: refresh,
++    refresh,
++    production: {
++      configured: !!expected,
++      unlocked: !!key,
++      canManage: query.data?.managers.has(pubkey) ?? false,
++      unlock,
++      lock,
++      setPassword,
++      hideLegacy,
++    },
++  };
++}
++/** Password controls exposed by the availability hook. */
++export type AvailabilityProduction = ReturnType<
++  typeof useTeamAvailability
++>["production"];
+diff --git a/desktop/src/features/team-calendar/lib/useTeamSprint.ts b/desktop/src/features/team-calendar/lib/useTeamSprint.ts
+index be3d1f9bd..19d618bef 100644
+--- a/desktop/src/features/team-calendar/lib/useTeamSprint.ts
++++ b/desktop/src/features/team-calendar/lib/useTeamSprint.ts
+@@ -1,17 +1,7 @@
+ import * as React from "react";
+ 
+-import {
+-  type PeopleById,
+-  type TeamPerson,
+-  TEAM_AVAILABILITY_D_TAG,
+-  decodePeople,
+-  encodePeopleForPublish,
+-  hasNewerPeople,
+-  livePeople,
+-  mergePeople,
+-  mergePeopleEvents,
+-  teamAvailabilityDTag,
+-} from "./teamAvailability";
++import type { TeamPerson } from "./teamAvailability";
++export { useTeamAvailability } from "./useAvailabilityPrivacy";
+ import {
+   type SprintPlan,
+   TEAM_SPRINT_D_TAG,
+@@ -67,78 +57,7 @@ export function useTeamSprintPlan(pubkey: string, relayUrl: string) {
+   return { plan: value, status, savePlan, refresh };
+ }
+ 
+-const peopleCodec: SharedDocCodec<PeopleById> = {
+-  empty: {},
+-  mergeEvents: mergePeopleEvents,
+-  decode: decodePeople,
+-  merge: (base, other) => mergePeople(base, other),
+-  hasNewer: hasNewerPeople,
+-  encode: encodePeopleForPublish,
+-  tooBigMessage:
+-    "팀원 일정이 너무 많아 더 저장할 수 없습니다. 지난 일정을 정리해 주세요.",
+-  slowMessage: "팀원 일정을 저장하는 데 시간이 너무 오래 걸립니다.",
+-  failedMessage: "팀원 일정을 저장하지 못했습니다.",
+-  topic: TEAM_AVAILABILITY_D_TAG,
+-};
+-
+ export type PersonInput = Omit<
+   TeamPerson,
+   "updatedAt" | "updatedBy" | "deleted"
+ >;
+-
+-/** Everyone's schedules (who can work when), shared by the community. */
+-export function useTeamAvailability(pubkey: string, relayUrl: string) {
+-  const { value, status, commit, retry, refresh } = useSharedTeamDoc(
+-    pubkey,
+-    relayUrl,
+-    teamAvailabilityDTag(relayUrl),
+-    peopleCodec,
+-  );
+-  const people = React.useMemo(() => livePeople(value), [value]);
+-
+-  const stamp = React.useCallback(
+-    (previous: TeamPerson | undefined) =>
+-      Math.max(Date.now(), (previous?.updatedAt ?? 0) + 1),
+-    [],
+-  );
+-
+-  /** Creates or replaces people (one commit, one publish). */
+-  const savePeople = React.useCallback(
+-    (inputs: PersonInput[]): Promise<void> =>
+-      commit((all) => {
+-        const next: PeopleById = {};
+-        for (const input of inputs) {
+-          next[input.id] = {
+-            ...input,
+-            name: input.name.trim(),
+-            role: input.role?.trim() || undefined,
+-            updatedAt: stamp(all[input.id]),
+-            updatedBy: pubkey,
+-          };
+-        }
+-        return mergePeople(all, next);
+-      }),
+-    [commit, pubkey, stamp],
+-  );
+-
+-  const deletePerson = React.useCallback(
+-    (id: string): Promise<void> =>
+-      commit((all) => {
+-        const person = all[id];
+-        if (!person || person.deleted) return all;
+-        return mergePeople(all, {
+-          [id]: {
+-            id,
+-            name: "",
+-            rules: [],
+-            updatedAt: stamp(person),
+-            updatedBy: pubkey,
+-            deleted: true,
+-          },
+-        });
+-      }),
+-    [commit, pubkey, stamp],
+-  );
+-
+-  return { people, status, savePeople, deletePerson, retry, refresh };
+-}
+diff --git a/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx b/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
+index e4e4ac66d..c79282493 100644
+--- a/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
++++ b/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
+@@ -24,6 +24,9 @@ import {
+   emptyRuleDraft,
+   ruleDraftOf,
+ } from "./AvailabilityRuleForm";
++import { canEditAvailability } from "../lib/availabilityStore";
++import type { AvailabilityProduction } from "../lib/useAvailabilityPrivacy";
++import { ProductionControls } from "./ProductionControls";
+ import { SELECT_CLASS } from "./EntryForm";
+ 
+ export const KIND_BADGE: Record<RuleKind, string> = {
+@@ -44,7 +47,7 @@ const newPersonId = () =>
+ 
+ /**
+  * Member schedules (team patch): everyone's 불가/가능/조율 times, which
+- * anyone in the community can add to. Ported from the team's "빈칸" page so
++ * owners and production can edit, with unlinked people open to everyone. Ported from the team's "빈칸" page so
+  * members put their schedules into Buzz instead.
+  */
+ export function AvailabilityPanel({
+@@ -55,6 +58,8 @@ export function AvailabilityPanel({
+   nameOf,
+   today,
+   onSave,
++  onSavePeople,
++  production,
+   onDelete,
+ }: {
+   pubkey: string;
+@@ -64,8 +69,11 @@ export function AvailabilityPanel({
+   nameOf: (pubkey: string) => string;
+   today: string;
+   onSave: (person: PersonInput) => Promise<void>;
++  onSavePeople?: (people: PersonInput[]) => Promise<void>;
++  production?: AvailabilityProduction;
+   onDelete: (id: string) => Promise<void>;
+ }) {
++  const formId = React.useId();
+   const mine = people.find((person) => person.pubkey === pubkey);
+   const [selectedId, setSelectedId] = React.useState<string | null>(
+     () => mine?.id ?? null,
+@@ -80,6 +88,16 @@ export function AvailabilityPanel({
+   const [saving, setSaving] = React.useState(false);
+ 
+   const selected = people.find((person) => person.id === selectedId) ?? null;
++  const unlocked = production?.unlocked ?? false;
++  const canEdit = selected
++    ? canEditAvailability(selected, pubkey, unlocked)
++    : false;
++  // biome-ignore lint/correctness/useExhaustiveDependencies: discard private drafts when the viewer or mode changes
++  React.useEffect(() => {
++    setRuleDraft(null);
++    setPersonDraft(null);
++    setConfirming(null);
++  }, [unlocked, pubkey]);
+   const shown = people.filter((person) =>
+     `${person.name} ${person.role ?? ""}`
+       .toLowerCase()
+@@ -125,7 +143,7 @@ export function AvailabilityPanel({
+     });
+ 
+   const submitRule = async (rule: AvailabilityRule) => {
+-    if (!selected) return;
++    if (!selected || !canEdit) return;
+     const others = selected.rules.filter((item) => item.id !== rule.id);
+     if (others.length >= MAX_RULES_PER_PERSON) {
+       toast.error(`한 사람당 일정은 ${MAX_RULES_PER_PERSON}개까지입니다.`);
+@@ -139,7 +157,7 @@ export function AvailabilityPanel({
+   };
+ 
+   const removeRule = (rule: AvailabilityRule) => {
+-    if (!selected) return;
++    if (!selected || !canEdit) return;
+     setConfirming(null);
+     void run(
+       () =>
+@@ -181,6 +199,7 @@ export function AvailabilityPanel({
+         aria-label="팀원 목록"
+         className="flex w-full shrink-0 flex-col gap-2 md:w-64"
+       >
++        {production ? <ProductionControls production={production} /> : null}
+         <div className="flex items-center gap-2">
+           <div className="relative min-w-0 flex-1">
+             <Search className="pointer-events-none absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
+@@ -280,23 +299,31 @@ export function AvailabilityPanel({
+                 : "팀원 추가"}
+             </h3>
+             <div className="grid grid-cols-2 gap-2">
+-              <label className="flex flex-col gap-1">
++              <label htmlFor={`${formId}-name`} className="flex flex-col gap-1">
+                 이름
+                 <Input
+                   autoFocus
++                  id={`${formId}-name`}
+                   maxLength={MAX_NAME_LENGTH}
+                   onChange={(event) =>
+-                    setPersonDraft({ ...personDraft, name: event.target.value })
++                    setPersonDraft({
++                      ...personDraft,
++                      name: event.target.value,
++                    })
+                   }
+                   value={personDraft.name}
+                 />
+               </label>
+-              <label className="flex flex-col gap-1">
++              <label htmlFor={`${formId}-role`} className="flex flex-col gap-1">
+                 역할 (선택)
+                 <Input
++                  id={`${formId}-role`}
+                   maxLength={MAX_ROLE_LENGTH}
+                   onChange={(event) =>
+-                    setPersonDraft({ ...personDraft, role: event.target.value })
++                    setPersonDraft({
++                      ...personDraft,
++                      role: event.target.value,
++                    })
+                   }
+                   placeholder="예: 촬영감독"
+                   value={personDraft.role ?? ""}
+@@ -307,6 +334,7 @@ export function AvailabilityPanel({
+               Buzz 멤버 연결 (선택)
+               <select
+                 className={SELECT_CLASS}
++                disabled={!!personDraft.pubkey && !unlocked}
+                 onChange={(event) =>
+                   setPersonDraft({
+                     ...personDraft,
+@@ -316,11 +344,13 @@ export function AvailabilityPanel({
+                 value={personDraft.pubkey ?? ""}
+               >
+                 <option value="">연결 안 함</option>
+-                {members.map((member) => (
+-                  <option key={member.pubkey} value={member.pubkey}>
+-                    {member.name}
+-                  </option>
+-                ))}
++                {members
++                  .filter((member) => unlocked || member.pubkey === pubkey)
++                  .map((member) => (
++                    <option key={member.pubkey} value={member.pubkey}>
++                      {member.name}
++                    </option>
++                  ))}
+               </select>
+             </label>
+             <div className="flex justify-end gap-2">
+@@ -367,20 +397,18 @@ export function AvailabilityPanel({
+                 </p>
+               </div>
+               <div className="flex flex-wrap gap-1">
+-                {selected.pubkey !== pubkey ? (
++                {!selected.pubkey && (!mine || unlocked) ? (
+                   <Button
++                    disabled={saving}
+                     onClick={() =>
+                       void run(async () => {
+-                        // One person per member: unlink the old "me" first.
+-                        if (mine && mine.id !== selected.id)
+-                          await savePerson(
++                        const claim = { ...selected, pubkey };
++                        if (mine && mine.id !== selected.id && onSavePeople)
++                          await onSavePeople([
+                             { ...mine, pubkey: undefined },
+-                            mine.rules,
+-                          );
+-                        await savePerson(
+-                          { ...selected, pubkey },
+-                          selected.rules,
+-                        );
++                            claim,
++                          ]);
++                        else await onSave(claim);
+                       }, "연결하지 못했습니다.")
+                     }
+                     size="xs"
+@@ -390,40 +418,44 @@ export function AvailabilityPanel({
+                     <UserRound className="h-3 w-3" />이 사람이 나예요
+                   </Button>
+                 ) : null}
+-                <Button
+-                  onClick={() => {
+-                    setRuleDraft(null);
+-                    setPersonDraft({
+-                      id: selected.id,
+-                      name: selected.name,
+-                      role: selected.role,
+-                      pubkey: selected.pubkey,
+-                      rules: selected.rules,
+-                    });
+-                  }}
+-                  size="xs"
+-                  type="button"
+-                  variant="ghost"
+-                >
+-                  <Pencil className="h-3 w-3" />
+-                  정보 수정
+-                </Button>
+-                <Button
+-                  onClick={() =>
+-                    setConfirming(
+-                      confirming === selected.id ? null : selected.id,
+-                    )
+-                  }
+-                  size="xs"
+-                  type="button"
+-                  variant="ghost"
+-                >
+-                  <Trash2 className="h-3 w-3" />
+-                  팀원 삭제
+-                </Button>
++                {canEdit ? (
++                  <>
++                    <Button
++                      onClick={() => {
++                        setRuleDraft(null);
++                        setPersonDraft({
++                          id: selected.id,
++                          name: selected.name,
++                          role: selected.role,
++                          pubkey: selected.pubkey,
++                          rules: selected.rules,
++                        });
++                      }}
++                      size="xs"
++                      type="button"
++                      variant="ghost"
++                    >
++                      <Pencil className="h-3 w-3" />
++                      정보 수정
++                    </Button>
++                    <Button
++                      onClick={() =>
++                        setConfirming(
++                          confirming === selected.id ? null : selected.id,
++                        )
++                      }
++                      size="xs"
++                      type="button"
++                      variant="ghost"
++                    >
++                      <Trash2 className="h-3 w-3" />
++                      팀원 삭제
++                    </Button>
++                  </>
++                ) : null}
+               </div>
+             </div>
+-            {confirming === selected.id ? (
++            {canEdit && confirming === selected.id ? (
+               <div className="flex items-center justify-between gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs">
+                 <span>
+                   {selected.name}님과 일정 {selected.rules.length}개를 모두
+@@ -471,7 +503,7 @@ export function AvailabilityPanel({
+                   </Button>
+                 ))}
+               </div>
+-              {ruleDraft ? null : (
++              {!canEdit || ruleDraft ? null : (
+                 <Button
+                   data-testid="availability-add-rule"
+                   onClick={() => setRuleDraft(emptyRuleDraft(today))}
+@@ -484,12 +516,14 @@ export function AvailabilityPanel({
+               )}
+             </div>
+ 
+-            {ruleDraft ? (
++            {canEdit && ruleDraft ? (
+               <AvailabilityRuleForm
+                 draft={ruleDraft}
+                 onCancel={() => setRuleDraft(null)}
+                 onChange={(update) =>
+-                  setRuleDraft((current) => (current ? update(current) : current))
++                  setRuleDraft((current) =>
++                    current ? update(current) : current,
++                  )
+                 }
+                 onSubmit={(rule) => void submitRule(rule)}
+                 saving={saving}
+@@ -527,7 +561,7 @@ export function AvailabilityPanel({
+                     <p className="text-xs text-muted-foreground">
+                       {ruleWhenLabel(rule)}
+                     </p>
+-                    {confirming === rule.id ? (
++                    {canEdit && confirming === rule.id ? (
+                       <div className="mt-1 flex justify-end">
+                         <Button
+                           disabled={saving}
+@@ -541,28 +575,32 @@ export function AvailabilityPanel({
+                       </div>
+                     ) : null}
+                   </div>
+-                  <Button
+-                    aria-label={`${rule.title} 수정`}
+-                    disabled={saving}
+-                    onClick={() => setRuleDraft(ruleDraftOf(rule))}
+-                    size="icon-xs"
+-                    type="button"
+-                    variant="ghost"
+-                  >
+-                    <Pencil />
+-                  </Button>
+-                  <Button
+-                    aria-label={`${rule.title} 삭제`}
+-                    disabled={saving}
+-                    onClick={() =>
+-                      setConfirming(confirming === rule.id ? null : rule.id)
+-                    }
+-                    size="icon-xs"
+-                    type="button"
+-                    variant="ghost"
+-                  >
+-                    <Trash2 />
+-                  </Button>
++                  {canEdit ? (
++                    <>
++                      <Button
++                        aria-label={`${rule.title} 수정`}
++                        disabled={saving}
++                        onClick={() => setRuleDraft(ruleDraftOf(rule))}
++                        size="icon-xs"
++                        type="button"
++                        variant="ghost"
++                      >
++                        <Pencil />
++                      </Button>
++                      <Button
++                        aria-label={`${rule.title} 삭제`}
++                        disabled={saving}
++                        onClick={() =>
++                          setConfirming(confirming === rule.id ? null : rule.id)
++                        }
++                        size="icon-xs"
++                        type="button"
++                        variant="ghost"
++                      >
++                        <Trash2 />
++                      </Button>
++                    </>
++                  ) : null}
+                 </li>
+               ))}
+               {rules.length === 0 ? (
+@@ -575,7 +613,7 @@ export function AvailabilityPanel({
+           </>
+         ) : personDraft ? null : (
+           <p className="px-2 py-10 text-center text-sm text-muted-foreground">
+-            왼쪽에서 팀원을 고르면 그 사람의 일정을 보고 고칠 수 있어요.
++            왼쪽에서 팀원을 고르면 일정을 볼 수 있어요.
+           </p>
+         )}
+       </section>
+diff --git a/desktop/src/features/team-calendar/ui/AvailabilityRuleForm.tsx b/desktop/src/features/team-calendar/ui/AvailabilityRuleForm.tsx
+index d389313dd..b11653222 100644
+--- a/desktop/src/features/team-calendar/ui/AvailabilityRuleForm.tsx
++++ b/desktop/src/features/team-calendar/ui/AvailabilityRuleForm.tsx
+@@ -33,6 +33,8 @@ const HALF_HOURS = Array.from({ length: 48 }, (_, index) => (index + 1) * 30);
+ 
+ export type RuleDraft = {
+   id?: string;
++  lockedTitle?: AvailabilityRule["lockedTitle"];
++  originalTitle?: string;
+   title: string;
+   kind: RuleKind;
+   weekly: boolean;
+@@ -68,6 +70,8 @@ export function emptyRuleDraft(date: string): RuleDraft {
+ export function ruleDraftOf(rule: AvailabilityRule): RuleDraft {
+   return {
+     id: rule.id,
++    lockedTitle: rule.lockedTitle,
++    originalTitle: rule.title,
+     title: rule.title,
+     kind: rule.kind,
+     weekly: rule.weekday !== null,
+@@ -103,6 +107,8 @@ export function ruleOfDraft(
+         )
+       : [],
+   };
++  if (draft.lockedTitle && draft.title === draft.originalTitle)
++    rule.lockedTitle = draft.lockedTitle;
+   const error = validateRule(rule);
+   return error ? { error } : { rule };
+ }
+@@ -126,6 +132,7 @@ export function AvailabilityRuleForm({
+   onCancel: () => void;
+   onSubmit: (rule: AvailabilityRule) => void;
+ }) {
++  const formId = React.useId();
+   const [excludeDay, setExcludeDay] = React.useState("");
+   const result = ruleOfDraft(draft);
+   const error = "error" in result ? result.error : null;
+@@ -141,9 +148,10 @@ export function AvailabilityRuleForm({
+         if ("rule" in result) onSubmit(result.rule);
+       }}
+     >
+-      <label className="flex flex-col gap-1">
++      <label htmlFor={`${formId}-reason`} className="flex flex-col gap-1">
+         어떤 일정인가요?
+         <Input
++          id={`${formId}-reason`}
+           autoFocus
+           maxLength={MAX_RULE_TITLE_LENGTH}
+           onChange={(event) => set({ title: event.target.value })}
+@@ -200,9 +208,10 @@ export function AvailabilityRuleForm({
+               ))}
+             </select>
+           </label>
+-          <label className="flex flex-col gap-1">
++          <label htmlFor={`${formId}-from`} className="flex flex-col gap-1">
+             기간 시작
+             <Input
++              id={`${formId}-from`}
+               onChange={(event) => {
+                 const startDate = event.target.value;
+                 onChange((current) => ({
+@@ -219,9 +228,10 @@ export function AvailabilityRuleForm({
+               value={draft.startDate}
+             />
+           </label>
+-          <label className="flex flex-col gap-1">
++          <label htmlFor={`${formId}-through`} className="flex flex-col gap-1">
+             기간 끝
+             <Input
++              id={`${formId}-through`}
+               min={draft.startDate}
+               onChange={(event) => set({ endDate: event.target.value })}
+               type="date"
+@@ -230,9 +240,10 @@ export function AvailabilityRuleForm({
+           </label>
+         </div>
+       ) : (
+-        <label className="flex flex-col gap-1">
++        <label htmlFor={`${formId}-date`} className="flex flex-col gap-1">
+           날짜
+           <Input
++            id={`${formId}-date`}
+             onChange={(event) =>
+               set({
+                 startDate: event.target.value,
+@@ -255,9 +266,10 @@ export function AvailabilityRuleForm({
+       </label>
+       {draft.allDay ? null : (
+         <div className="grid grid-cols-2 gap-2">
+-          <label className="flex flex-col gap-1">
++          <label htmlFor={`${formId}-start`} className="flex flex-col gap-1">
+             시작
+             <Input
++              id={`${formId}-start`}
+               onChange={(event) => set({ start: event.target.value })}
+               step={300}
+               type="time"
+@@ -309,7 +321,9 @@ export function AvailabilityRuleForm({
+               onClick={() => {
+                 onChange((current) => ({
+                   ...current,
+-                  exclude: [...new Set([...current.exclude, excludeDay])].sort(),
++                  exclude: [
++                    ...new Set([...current.exclude, excludeDay]),
++                  ].sort(),
+                 }));
+                 setExcludeDay("");
+               }}
+diff --git a/desktop/src/features/team-calendar/ui/ProductionControls.tsx b/desktop/src/features/team-calendar/ui/ProductionControls.tsx
+new file mode 100644
+index 000000000..9cc84f1a0
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/ProductionControls.tsx
+@@ -0,0 +1,144 @@
++import * as React from "react";
++import type { AvailabilityProduction } from "../lib/useAvailabilityPrivacy";
++import { Button } from "@/shared/ui/button";
++import { Input } from "@/shared/ui/input";
++
++/** A short password form, usable by keyboard as well as pointer. */
++export function ProductionControls({
++  production,
++}: {
++  production: AvailabilityProduction;
++}) {
++  const passwordId = React.useId();
++  const [mode, setMode] = React.useState<"set" | "open" | null>(null);
++  const [password, setPassword] = React.useState("");
++  const [saving, setSaving] = React.useState(false);
++  const [error, setError] = React.useState("");
++  const run = async (action: () => Promise<void>) => {
++    setSaving(true);
++    setError("");
++    try {
++      await action();
++      setPassword("");
++      setMode(null);
++    } catch (e) {
++      const message = e instanceof Error ? e.message : "저장하지 못했어요.";
++      setError(message);
++    } finally {
++      setSaving(false);
++    }
++  };
++  return (
++    <div className="flex flex-col gap-2">
++      <div className="flex flex-wrap gap-2">
++        {production.canManage ? (
++          <Button
++            size="sm"
++            variant="outline"
++            type="button"
++            disabled={saving}
++            onClick={() => {
++              setMode("set");
++              setError("");
++            }}
++          >
++            제작부 비밀번호 정하기
++          </Button>
++        ) : null}
++        {production.configured ? (
++          production.unlocked ? (
++            <>
++              <Button
++                size="sm"
++                variant="outline"
++                type="button"
++                disabled={saving}
++                onClick={() => {
++                  try {
++                    production.lock();
++                    setMode(null);
++                    setPassword("");
++                  } catch {
++                    setError("이 기기에서 잠그지 못했어요.");
++                  }
++                }}
++              >
++                제작부 잠그기
++              </Button>
++              <Button
++                size="sm"
++                variant="outline"
++                type="button"
++                disabled={saving}
++                onClick={() => void run(production.hideLegacy)}
++              >
++                예전 사유 숨기기
++              </Button>
++            </>
++          ) : (
++            <Button
++              size="sm"
++              variant="outline"
++              type="button"
++              disabled={saving}
++              onClick={() => {
++                setMode("open");
++                setError("");
++              }}
++            >
++              제작부 열기
++            </Button>
++          )
++        ) : null}
++      </div>
++      {mode ? (
++        <form
++          className="flex flex-wrap items-end gap-2"
++          onSubmit={(event) => {
++            event.preventDefault();
++            void run(() =>
++              mode === "set"
++                ? production.setPassword(password)
++                : production.unlock(password),
++            );
++          }}
++        >
++          <label htmlFor={passwordId} className="flex flex-col gap-1 text-xs">
++            {mode === "set" ? "새 제작부 비밀번호" : "제작부 비밀번호"}
++            <Input
++              id={passwordId}
++              autoFocus
++              type="password"
++              autoComplete={
++                mode === "set" ? "new-password" : "current-password"
++              }
++              value={password}
++              onChange={(e) => setPassword(e.target.value)}
++            />
++          </label>
++          <Button size="sm" type="submit" disabled={saving}>
++            {mode === "set" ? "정하기" : "열기"}
++          </Button>
++          <Button
++            size="sm"
++            variant="ghost"
++            type="button"
++            disabled={saving}
++            onClick={() => {
++              setMode(null);
++              setPassword("");
++              setError("");
++            }}
++          >
++            취소
++          </Button>
++        </form>
++      ) : null}
++      {error ? (
++        <p role="alert" className="text-xs text-destructive">
++          {error}
++        </p>
++      ) : null}
++    </div>
++  );
++}
+diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+index 55eca5e44..c3081d5e7 100644
+--- a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
++++ b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+@@ -580,6 +580,9 @@ export function TeamCalendarDialog({
+             <CommonTimePanel people={people} onPick={pickCommonTime} />
+           ) : null}
+           <AvailabilityPanel
++            key={`${pubkey}|${relayUrl}`}
++            production={availability.production}
++            onSavePeople={availability.savePeople}
+             members={members}
+             nameOf={nameOf}
+             onDelete={availability.deletePerson}
+diff --git a/desktop/src/features/team-calendar/ui/availabilityPrivacy.jsdom-test.mjs b/desktop/src/features/team-calendar/ui/availabilityPrivacy.jsdom-test.mjs
+new file mode 100644
+index 000000000..eee009be2
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/availabilityPrivacy.jsdom-test.mjs
+@@ -0,0 +1,291 @@
++import assert from "node:assert/strict";
++import { afterEach, test, mock } from "node:test";
++import React from "react";
++import {
++  cleanup,
++  fireEvent,
++  render,
++  waitFor,
++  within,
++  act,
++} from "@testing-library/react";
++import { getPublicKey, verifyEvent } from "nostr-tools/pure";
++import { TeamCalendarDialog } from "./TeamCalendarDialog.tsx";
++import { useTeamAvailability } from "../lib/useAvailabilityPrivacy.ts";
++import {
++  productionKey,
++  productionStorageKey,
++  lockRule,
++} from "../lib/availabilityPrivacy.ts";
++import { productionDTag } from "../lib/availabilityStore.ts";
++import { encodePeople, teamAvailabilityDTag } from "../lib/teamAvailability.ts";
++import { koreanToday } from "../lib/commonTime.ts";
++import {
++  prepareScheduleDom,
++  pubkey,
++  relayUrl,
++} from "../../team-schedule/ui/scheduleTestSupport.mjs";
++import { relayClient } from "@/shared/api/relayClient";
++
++let env;
++afterEach(() => {
++  cleanup();
++  env?.client.clear();
++  mock.restoreAll();
++  localStorage.clear();
++  delete globalThis.isTauri;
++});
++const aliceSecret = new Uint8Array(32);
++aliceSecret[31] = 1;
++const alice = getPublicKey(aliceSecret);
++const today = koreanToday();
++const rule = {
++  id: "r1",
++  title: "가짜 알바",
++  kind: "busy",
++  startDate: today,
++  endDate: today,
++  weekday: null,
++  start: 540,
++  end: 720,
++  exclude: [],
++};
++const person = (id, extra = {}) => ({
++  id,
++  name: `가짜 ${id}`,
++  rules: [rule],
++  updatedAt: 1,
++  updatedBy: alice,
++  pubkey: alice,
++  ...extra,
++});
++const d = teamAvailabilityDTag(relayUrl);
++const makeEvent = (people) => ({
++  id: "1".repeat(64),
++  pubkey: alice,
++  kind: 30078,
++  created_at: 1,
++  tags: [["d", d]],
++  content: encodePeople(people),
++  sig: "",
++});
++
++async function fixture({ manager = false, configured = true } = {}) {
++  const key = await productionKey("테스트", relayUrl);
++  let events = [
++    makeEvent({
++      p1: person("p1", {
++        rules: [configured ? lockRule(rule, alice, key.pubkey) : rule],
++      }),
++      p2: person("p2", { pubkey: undefined, rules: [] }),
++    }),
++  ];
++  let settings = configured
++    ? [
++        {
++          id: "2".repeat(64),
++          pubkey: alice,
++          kind: 30078,
++          created_at: 1,
++          tags: [["d", productionDTag(relayUrl)]],
++          content: JSON.stringify({ pubkey: key.pubkey }),
++          sig: "",
++        },
++      ]
++    : [];
++  const membership = {
++    kind: 13534,
++    created_at: 1,
++    tags: [
++      ["member", alice, "owner"],
++      ["member", pubkey, manager ? "admin" : "member"],
++    ],
++  };
++  const fetch = async (f) =>
++    f.kinds?.[0] === 13534
++      ? [membership]
++      : f["#d"]?.[0] === d
++        ? events
++        : f["#d"]?.[0] === productionDTag(relayUrl)
++          ? settings
++          : [];
++  env = prepareScheduleDom(fetch);
++  const listeners = [];
++  mock.method(relayClient, "subscribeLive", async (filter, receive) => {
++    if (filter["#d"]?.includes(d)) listeners.push(receive);
++    return async () => {};
++  });
++  const publishes = [];
++  mock.method(relayClient, "publishEvent", async (event) => {
++    publishes.push(event);
++    if (event.tags[0][1] === d)
++      events = [...events.filter((e) => e.pubkey !== event.pubkey), event];
++    else settings = [event];
++  });
++  const originalInvoke = window.__TAURI_INTERNALS__.invoke;
++  window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
++    if (cmd === "sign_event")
++      return JSON.stringify({
++        id: String(publishes.length + 3)
++          .repeat(64)
++          .slice(0, 64),
++        pubkey,
++        kind: args.kind,
++        created_at: args.createdAt,
++        tags: args.tags,
++        content: args.content,
++        sig: "",
++      });
++    return originalInvoke(cmd, args);
++  };
++  return {
++    key,
++    publishes,
++    listeners,
++    get events() {
++      return events;
++    },
++    replace(eventsNext) {
++      events = eventsNext;
++    },
++  };
++}
++function calendar() {
++  return render(
++    React.createElement(TeamCalendarDialog, {
++      embedded: true,
++      open: true,
++      onOpenChange() {},
++      pubkey,
++      relayUrl,
++    }),
++    { wrapper: env.Providers },
++  );
++}
++async function selectPerson(view) {
++  fireEvent.click(view.getByRole("tab", { name: "팀원 일정", exact: true }));
++  await waitFor(() => assert.ok(view.getByText("가짜 p1")));
++  fireEvent.click(view.getByText("가짜 p1"));
++  return within(view.getByTestId("availability-panel"));
++}
++
++test("member UI hides reasons and edit/claim controls; password keyboard flow restores, locks, and clears device memory", async () => {
++  const f = await fixture();
++  let view = calendar();
++  let panel = await selectPerson(view);
++  assert.equal(panel.queryByText("가짜 알바"), null);
++  assert.equal(panel.queryByRole("button", { name: "정보 수정" }), null);
++  assert.equal(panel.queryByRole("button", { name: "팀원 삭제" }), null);
++  assert.equal(panel.queryByRole("button", { name: "이 사람이 나예요" }), null);
++  assert.equal(
++    view.queryByRole("button", { name: "제작부 비밀번호 정하기" }),
++    null,
++  );
++  fireEvent.click(view.getByRole("button", { name: "제작부 열기" }));
++  fireEvent.change(view.getByLabelText("제작부 비밀번호"), {
++    target: { value: "틀림" },
++  });
++  fireEvent.submit(
++    view.getByRole("button", { name: "열기", exact: true }).closest("form"),
++  );
++  await waitFor(() =>
++    assert.match(view.getByRole("alert").textContent, /비밀번호가 맞지 않아요/),
++  );
++  assert.equal(
++    localStorage.getItem(productionStorageKey(pubkey, relayUrl)),
++    null,
++  );
++  fireEvent.change(view.getByLabelText("제작부 비밀번호"), {
++    target: { value: "테스트" },
++  });
++  fireEvent.submit(
++    view.getByRole("button", { name: "열기", exact: true }).closest("form"),
++  );
++  await waitFor(() => assert.ok(panel.getByText("가짜 알바")));
++  assert.ok(panel.getByRole("button", { name: "정보 수정" }));
++  assert.equal(f.publishes.length, 0);
++  view.unmount();
++  view = calendar();
++  panel = await selectPerson(view);
++  await waitFor(() => assert.ok(panel.getByText("가짜 알바")));
++  fireEvent.click(view.getByRole("button", { name: "제작부 잠그기" }));
++  assert.equal(panel.queryByText("가짜 알바"), null);
++  assert.equal(panel.queryByRole("button", { name: "정보 수정" }), null);
++  assert.equal(
++    localStorage.getItem(productionStorageKey(pubkey, relayUrl)),
++    null,
++  );
++});
++
++test("manager sets password, leaves legacy plaintext until explicit migration, and production edits arrive with verifiable proof", async () => {
++  const f = await fixture({ manager: true, configured: false });
++  const view = calendar();
++  const panel = await selectPerson(view);
++  fireEvent.click(view.getByRole("button", { name: "제작부 비밀번호 정하기" }));
++  const input = view.getByLabelText("새 제작부 비밀번호");
++  assert.equal(input.hasAttribute("maxlength"), false);
++  assert.equal(input.hasAttribute("minlength"), false);
++  fireEvent.change(input, { target: { value: "테스트" } });
++  fireEvent.submit(input.closest("form"));
++  await waitFor(() =>
++    assert.ok(view.getByRole("button", { name: "제작부 잠그기" })),
++  );
++  assert.equal(f.publishes.length, 1);
++  fireEvent.click(view.getByRole("button", { name: "예전 사유 숨기기" }));
++  await waitFor(() => assert.equal(f.publishes.length, 2));
++  assert.equal(f.publishes[1].content.includes("가짜 알바"), false);
++  const proof = JSON.parse(f.publishes[1].content).production;
++  assert.equal(proof.pubkey, f.key.pubkey);
++  assert.equal(verifyEvent(proof), true);
++  await waitFor(() => assert.ok(panel.getByText("가짜 알바")));
++  fireEvent.click(panel.getByRole("button", { name: "가짜 알바 수정" }));
++  const reason = within(
++    panel.getByTestId("availability-rule-form"),
++  ).getByPlaceholderText(/수업/);
++  fireEvent.change(reason, { target: { value: "수정된 사유" } });
++  fireEvent.click(panel.getByRole("button", { name: "수정 저장" }));
++  await waitFor(() => assert.equal(f.publishes.length, 3));
++  await waitFor(() => assert.ok(panel.getByText("수정된 사유")));
++  fireEvent.click(view.getByRole("button", { name: "제작부 잠그기" }));
++  assert.equal(panel.queryByText("수정된 사유"), null);
++});
++
++test("live third-party edits are filtered at the real hook; a stale decrypt cannot reveal after lock or scope change", async () => {
++  const f = await fixture();
++  let current;
++  function Probe({ relay = relayUrl, account = pubkey }) {
++    current = useTeamAvailability(account, relay);
++    return React.createElement("div", null, JSON.stringify(current.people));
++  }
++  const view = render(React.createElement(Probe), { wrapper: env.Providers });
++  await waitFor(() => assert.equal(current.status, "ready"));
++  const forged = {
++    ...f.events[0],
++    id: "9".repeat(64),
++    pubkey,
++    created_at: 9,
++    content: encodePeople({
++      p1: person("p1", { name: "변조", updatedAt: 99 }),
++    }),
++  };
++  f.replace([...f.events, forged]);
++  await act(async () => {
++    for (const receive of f.listeners) receive(forged);
++  });
++  await waitFor(() => assert.equal(current.people[0].name, "가짜 p1"));
++  let resolveDecrypt;
++  const originalInvoke = window.__TAURI_INTERNALS__.invoke;
++  window.__TAURI_INTERNALS__.invoke = async (cmd, args) =>
++    cmd === "nip44_decrypt_from_self"
++      ? new Promise((resolve) => {
++          resolveDecrypt = resolve;
++        })
++      : originalInvoke(cmd, args);
++  view.rerender(React.createElement(Probe, { account: alice }));
++  await waitFor(() => assert.equal(typeof resolveDecrypt, "function"));
++  view.rerender(React.createElement(Probe, { account: pubkey }));
++  await act(async () => {
++    resolveDecrypt("가짜 알바");
++  });
++  assert.equal(view.queryByText(/가짜 알바/), null);
++});
+diff --git a/desktop/src/shared/api/tauri.ts b/desktop/src/shared/api/tauri.ts
+index 3824df838..12d963f3a 100644
+--- a/desktop/src/shared/api/tauri.ts
++++ b/desktop/src/shared/api/tauri.ts
+@@ -1032,8 +1032,12 @@ export async function nip44EncryptToSelf(plaintext: string): Promise<string> {
+ 
+ export async function nip44DecryptFromSelf(
+   ciphertext: string,
++  senderPublicKey?: string,
+ ): Promise<string> {
+-  return invokeTauri<string>("nip44_decrypt_from_self", { ciphertext });
++  return invokeTauri<string>("nip44_decrypt_from_self", {
++    ciphertext,
++    senderPublicKey,
++  });
+ }
+ 
+ export async function startPairing(): Promise<string> {
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 3847cdc5e..2650b851a 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -255,10 +255,13 @@ importers:
+       zod:
+         specifier: ^4.4.3
+         version: 4.4.3
+-    devDependencies:
+       '@noble/hashes':
+         specifier: ^2.0.1
+         version: 2.2.0
++      nostr-tools:
++        specifier: ^2.23.3
++        version: 2.23.12(typescript@6.0.3)
++    devDependencies:
+       '@playwright/test':
+         specifier: ^1.58.2
+         version: 1.60.0
+@@ -289,9 +292,6 @@ importers:
+       jsdom:
+         specifier: ^27.4.0
+         version: 27.4.0(@noble/hashes@2.2.0)
+-      nostr-tools:
+-        specifier: ^2.23.3
+-        version: 2.23.12(typescript@6.0.3)
+       postcss:
+         specifier: ^8.5.8
+         version: 8.5.26
