@@ -1,0 +1,861 @@
+diff --git a/desktop/src/features/team-calendar/README.md b/desktop/src/features/team-calendar/README.md
+index 02999b2aa..a24cdc033 100644
+--- a/desktop/src/features/team-calendar/README.md
++++ b/desktop/src/features/team-calendar/README.md
+@@ -25,3 +25,11 @@
+ - `cargo test --manifest-path desktop/src-tauri/Cargo.toml --features mesh-llm availability_reason`
+ 
+ 단위 테스트는 결정성·두 수신자의 사유 읽기·타인의 실패·평문 호환·설정 전 저장·작성자 검사·설정 권한·비밀번호 교체·게시 실패를 검사한다. DOM 테스트는 실제 캘린더와 조회/저장 훅에서 설정→열기→기기 기억→잠그기→자동 사유 숨기기→제작부 수정을 실행하고, 실시간 변조 및 늦게 끝난 사유 읽기를 검사한다. 상태별 단일 버튼·관리자 권한·재입력 확인·자동 숨기기 성공 알림과 실패 재시도·이름 검색/확인/연결·내 일정 자동 선택/정렬·사유 자물쇠도 실제 화면 경로로 검사한다. 나를 추가하기는 버튼 상시 표시·표시 이름 미리 채움·생성/연결/선택의 한 번 저장·107 권한 검사 통과(제작부 설정 전/후)·동명인 연결과 기존 일정 보존·취소·저장 실패 후 재시도를 검사한다. 테스트는 가짜 계정과 가짜 일정만 사용하며 실제 릴레이에 게시하지 않는다.
++
++## 좁은 일정 화면 (108)
++
++- 앱 창이 아닌 일정 본문 폭을 관찰한다. 본문이 860px보다 좁으면 달력의 날짜 패널과 스프린트 편집창, 팀원 목록/상세를 위아래로 배치한다. 860px부터는 나란히 표시한다.
++- 실제 날짜 칸이 110px보다 좁으면 종일 불가 배지를 `●N`으로 줄이고 전체 뜻은 툴팁과 날짜 버튼의 읽기 이름으로 유지한다. 날짜·`+N` 머리줄과 배지 줄을 분리하며 배지/일정 막대는 한 줄 말줄임으로 표시한다.
++- 날짜 칸은 좁을 때 5rem, 넓을 때 7rem 높이다. 실제 칸 높이와 글자 확대 크기에 들어가는 막대만 최대 3줄까지 표시하고 나머지는 날짜 머리줄의 `+N`에 센다. 날짜를 누르면 아래/오른쪽 패널에서 전체 일정을 볼 수 있다.
++- 도구줄과 팀원 일정의 필터는 줄바꿈한다. 스프린트와 30분 표는 내부 가로 스크롤을 사용하며, 시간 찾기의 입력칸/추천 카드는 패널 폭에 맞춰 열 수를 바꾼다.
++- `calendarLayout.test.mjs`는 폭/높이/글자 확대 경계를 검사한다. `calendarLayout.jsdom-test.mjs`는 실제 달력과 화면의 크기 변경·배지/막대 클래스·숨긴 일정 수·날짜 선택을 검사한다. 실제 브라우저 레이아웃 검증과 네이티브 앱 검증은 별도로 기록한다.
+diff --git a/desktop/src/features/team-calendar/lib/calendarLayout.test.mjs b/desktop/src/features/team-calendar/lib/calendarLayout.test.mjs
+new file mode 100644
+index 000000000..ce6d68d6f
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/calendarLayout.test.mjs
+@@ -0,0 +1,45 @@
++import assert from "node:assert/strict";
++import { test } from "node:test";
++import { calendarCellLayout, stackScheduleColumns } from "./calendarLayout.ts";
++
++test("columns use body width, with the 860px boundary included", () => {
++  for (const [width, stacked] of [
++    [0, true],
++    [600, true],
++    [800, true],
++    [859.99, true],
++    [860, false],
++    [960, false],
++    [1200, false],
++  ])
++    assert.equal(stackScheduleColumns(width), stacked, `body ${width}`);
++});
++
++test("availability abbreviates only below the actual 110px cell boundary", () => {
++  for (const [width, compact] of [
++    [40, true],
++    [85, true],
++    [109.99, true],
++    [110, false],
++    [172, false],
++  ])
++    assert.equal(calendarCellLayout(width, 112, 16).compact, compact);
++});
++
++test("lanes fit the measured height and root font scaling, with zero and three bounds", () => {
++  for (const [height, rem, lanes] of [
++    [0, 16, 0],
++    [46, 16, 0],
++    [62, 16, 1],
++    [80, 16, 2],
++    [112, 16, 3],
++    [500, 16, 3],
++    [100, 20, 2],
++    [140, 20, 3],
++  ])
++    assert.equal(
++      calendarCellLayout(85, height, rem).lanes,
++      lanes,
++      `${height}/${rem}`,
++    );
++});
+diff --git a/desktop/src/features/team-calendar/lib/calendarLayout.ts b/desktop/src/features/team-calendar/lib/calendarLayout.ts
+new file mode 100644
+index 000000000..dc64285b6
+--- /dev/null
++++ b/desktop/src/features/team-calendar/lib/calendarLayout.ts
+@@ -0,0 +1,23 @@
++/** The schedule body, excluding the app sidebar, needs this width for two columns. */
++export const SCHEDULE_COLUMNS_MIN_WIDTH = 860;
++
++/** Unknown or narrow body widths keep the detail panel below the main view. */
++export function stackScheduleColumns(bodyWidth: number): boolean {
++  return bodyWidth < SCHEDULE_COLUMNS_MIN_WIDTH;
++}
++
++/**
++ * Reserve 2.75rem for date/count and availability, then fit at most three
++ * 1rem bars with 0.125rem gaps. Dimensions come from the actual day button,
++ * including root font scaling, rather than the viewport or a fixed lane count.
++ */
++export function calendarCellLayout(width: number, height: number, rem: number) {
++  const available = Math.max(0, height - 2.875 * rem);
++  return {
++    compact: width < 110,
++    lanes: Math.max(
++      0,
++      Math.min(3, Math.floor((available + 0.125 * rem) / (1.125 * rem))),
++    ),
++  };
++}
+diff --git a/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx b/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
+index 818627025..7f6d54a79 100644
+--- a/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
++++ b/desktop/src/features/team-calendar/ui/AvailabilityPanel.tsx
+@@ -47,6 +47,7 @@ import {
+   TooltipProvider,
+ } from "@/shared/ui/tooltip";
+ import { SELECT_CLASS } from "./EntryForm";
++import { ScheduleColumns } from "./ScheduleColumns";
+ import { AddMyselfDialog } from "./AddMyselfDialog";
+ 
+ export const KIND_BADGE: Record<RuleKind, string> = {
+@@ -220,13 +221,10 @@ export function AvailabilityPanel({
+   const counts = (person: TeamPerson) => person.rules.length;
+ 
+   return (
+-    <div
+-      className="flex min-h-[28rem] flex-col gap-4 md:flex-row"
+-      data-testid="availability-panel"
+-    >
++    <ScheduleColumns className="min-h-[28rem]" data-testid="availability-panel">
+       <section
+         aria-label="팀원 목록"
+-        className="flex w-full shrink-0 flex-col gap-2 md:w-64"
++        className="flex min-w-0 w-full shrink-0 flex-col gap-2 group-data-[stacked=false]/schedule:w-64"
+       >
+         <div className="flex items-center gap-2">
+           <div className="relative min-w-0 flex-1">
+@@ -246,11 +244,13 @@ export function AvailabilityPanel({
+               setRuleDraft(null);
+               setPersonDraft({ id: newPersonId(), name: "", rules: [] });
+             }}
+-            size="icon"
++            className="shrink-0 gap-1"
++            size="sm"
+             type="button"
+             variant="outline"
+           >
+             <Plus className="h-4 w-4" />
++            팀원 추가
+           </Button>
+         </div>
+         {status === "ready" && !mine ? (
+@@ -601,8 +601,8 @@ export function AvailabilityPanel({
+               </div>
+             ) : null}
+ 
+-            <div className="flex items-center justify-between gap-2">
+-              <div className="flex gap-1" role="tablist">
++            <div className="flex flex-wrap items-center justify-between gap-2">
++              <div className="flex flex-wrap gap-1" role="tablist">
+                 {(
+                   [
+                     ["all", "전체"],
+@@ -695,7 +695,7 @@ export function AvailabilityPanel({
+                       ) : null}
+                       <span
+                         className={cn(
+-                          "rounded px-1.5 text-2xs font-semibold",
++                          "min-w-0 truncate whitespace-nowrap rounded px-1.5 text-2xs font-semibold",
+                           KIND_BADGE[rule.kind],
+                         )}
+                       >
+@@ -761,6 +761,6 @@ export function AvailabilityPanel({
+           </p>
+         )}
+       </section>
+-    </div>
++    </ScheduleColumns>
+   );
+ }
+diff --git a/desktop/src/features/team-calendar/ui/CalendarGrid.tsx b/desktop/src/features/team-calendar/ui/CalendarGrid.tsx
+index 20610eab0..4cb118d1d 100644
+--- a/desktop/src/features/team-calendar/ui/CalendarGrid.tsx
++++ b/desktop/src/features/team-calendar/ui/CalendarGrid.tsx
+@@ -1,3 +1,4 @@
++import { calendarCellLayout } from "../lib/calendarLayout";
+ import { ChevronLeft, ChevronRight } from "lucide-react";
+ import * as React from "react";
+ 
+@@ -19,8 +20,39 @@ import { Checkbox } from "@/shared/ui/checkbox";
+ import { COLOR_STYLES } from "./EntryForm";
+ 
+ export const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토"] as const;
+-/** Bars drawn under the day number; more are counted as "+N" in the cell. */
+-const MAX_LANES = 3;
++/** Measure the real day button, including font zoom and container resizing. */
++function useCellLayout() {
++  // Callback ref: the grid can mount before its first day cell exists
++  // (loading state), so re-measure whenever the measured cell changes.
++  const [cell, ref] = React.useState<HTMLButtonElement | null>(null);
++  const [layout, setLayout] = React.useState({ compact: true, lanes: 2 });
++  React.useEffect(() => {
++    if (!cell) return;
++    const measure = () => {
++      const { width, height } = cell.getBoundingClientRect();
++      if (width <= 0 || height <= 0) return;
++      const rem =
++        Number.parseFloat(
++          getComputedStyle(document.documentElement).fontSize,
++        ) || 16;
++      const next = calendarCellLayout(width, height, rem);
++      setLayout((previous) =>
++        previous.compact === next.compact && previous.lanes === next.lanes
++          ? previous
++          : next,
++      );
++    };
++    measure();
++    if (typeof ResizeObserver === "undefined") {
++      window.addEventListener("resize", measure);
++      return () => window.removeEventListener("resize", measure);
++    }
++    const observer = new ResizeObserver(measure);
++    observer.observe(cell);
++    return () => observer.disconnect();
++  }, [cell]);
++  return { ref, ...layout };
++}
+ 
+ /** The seven days of each of the grid's six weeks. */
+ export function weeksOf<T>(cells: T[]): T[][] {
+@@ -76,6 +108,8 @@ export function CalendarGrid({
+   onMineOnly: (value: boolean) => void;
+   onShowPeople: (value: boolean) => void;
+ }) {
++  const controlId = React.useId();
++  const { ref: cellRef, compact, lanes } = useCellLayout();
+   const weeks = React.useMemo(() => weeksOf(monthGrid(month)), [month]);
+ 
+   return (
+@@ -106,16 +140,24 @@ export function CalendarGrid({
+         >
+           <ChevronRight className="h-4 w-4" />
+         </Button>
+-        <label className="ml-auto flex items-center gap-1.5 text-xs">
++        <label
++          htmlFor={`${controlId}-people`}
++          className="ml-auto flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs"
++        >
+           <Checkbox
++            id={`${controlId}-people`}
+             checked={showPeople}
+             data-testid="team-calendar-show-people"
+             onCheckedChange={(checked) => onShowPeople(checked === true)}
+           />
+           팀원 일정 표시
+         </label>
+-        <label className="mx-2 flex items-center gap-1.5 text-xs">
++        <label
++          htmlFor={`${controlId}-mine`}
++          className="mx-2 flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs"
++        >
+           <Checkbox
++            id={`${controlId}-mine`}
+             checked={mineOnly}
+             data-testid="team-calendar-mine-only"
+             onCheckedChange={(checked) => onMineOnly(checked === true)}
+@@ -152,12 +194,12 @@ export function CalendarGrid({
+             entries,
+             week.map((cell) => cell.date),
+           );
+-          const shown = bars.filter((bar) => bar.lane < MAX_LANES);
++          const shown = bars.filter((bar) => bar.lane < lanes);
+           const hidden = week.map(
+             (_, column) =>
+               bars.filter(
+                 (bar) =>
+-                  bar.lane >= MAX_LANES &&
++                  bar.lane >= lanes &&
+                   bar.startColumn <= column &&
+                   column < bar.startColumn + bar.span,
+               ).length,
+@@ -176,41 +218,51 @@ export function CalendarGrid({
+                       }`}
+                       aria-pressed={isSelected}
+                       className={cn(
+-                        "flex h-20 min-w-0 flex-col items-stretch gap-0.5 bg-background p-1 text-left transition-colors hover:bg-muted/70 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring",
++                        "flex min-w-0 flex-col items-stretch gap-0.5 overflow-hidden bg-background p-1 text-left transition-colors hover:bg-muted/70 focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring",
++                        compact ? "h-20" : "h-28",
+                         !cell.inMonth && "text-muted-foreground/50",
+                         isSelected && "bg-accent hover:bg-accent",
+                       )}
+                       data-testid={`team-calendar-day-${cell.date}`}
+                       key={cell.date}
++                      ref={
++                        cell.date === weeks[0]?.[0]?.date ? cellRef : undefined
++                      }
+                       onClick={() => onSelectDate(cell.date)}
+                       type="button"
+                     >
+-                      <span className="flex items-center justify-between gap-1">
++                      <span
++                        className="flex h-5 min-w-0 shrink-0 items-center justify-between gap-1"
++                        data-testid="calendar-day-header"
++                      >
+                         <span
+                           className={cn(
+-                            "flex h-5 w-5 items-center justify-center rounded-full text-xs",
++                            "flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-xs",
+                             cell.date === today &&
+                               "bg-primary font-semibold text-primary-foreground",
+                           )}
+                         >
+                           {cell.day}
+                         </span>
+-                        <span className="flex items-center gap-1">
+-                          {busy ? (
+-                            <span
+-                              className="rounded bg-red-500/15 px-1 text-2xs font-medium text-red-700 dark:text-red-300"
+-                              data-testid="team-calendar-busy-badge"
+-                              title={`팀원 ${busy}명이 이 날 종일 불가예요`}
+-                            >
+-                              종일불가 {busy}
+-                            </span>
+-                          ) : null}
+-                          {hidden[column] ? (
+-                            <span className="px-0.5 text-2xs text-muted-foreground">
+-                              +{hidden[column]}
+-                            </span>
+-                          ) : null}
+-                        </span>
++                        {hidden[column] ? (
++                          <span
++                            className="min-w-0 truncate whitespace-nowrap text-2xs text-muted-foreground"
++                            data-testid="calendar-more"
++                          >
++                            +{hidden[column]}
++                          </span>
++                        ) : null}
++                      </span>
++                      <span className="flex h-4 min-w-0 shrink-0 items-center">
++                        {busy ? (
++                          <span
++                            className="min-w-0 max-w-full truncate whitespace-nowrap rounded bg-red-500/15 px-1 text-2xs font-medium leading-4 text-red-700 dark:text-red-300"
++                            data-testid="team-calendar-busy-badge"
++                            title={`종일 불가 ${busy}명 · 팀원 ${busy}명이 이 날 종일 불가예요`}
++                          >
++                            {compact ? `●${busy}` : `종일 불가 ${busy}`}
++                          </span>
++                        ) : null}
+                       </span>
+                     </button>
+                   );
+@@ -219,12 +271,12 @@ export function CalendarGrid({
+               {/* Bars sit over the day buttons; clicks go through to them. */}
+               <div
+                 aria-hidden="true"
+-                className="pointer-events-none absolute inset-x-0 top-6 grid auto-rows-[1rem] grid-cols-7 gap-x-px gap-y-0.5"
++                className="pointer-events-none absolute inset-x-0 top-11 grid auto-rows-[1rem] grid-cols-7 gap-x-px gap-y-0.5"
+               >
+                 {shown.map((bar) => (
+                   <span
+                     className={cn(
+-                      "truncate text-2xs leading-4 text-foreground",
++                      "h-4 min-w-0 truncate whitespace-nowrap text-2xs leading-4 text-foreground",
+                       COLOR_STYLES[
+                         bar.entry.color ?? colorOfDept(bar.entry.dept)
+                       ].bar,
+diff --git a/desktop/src/features/team-calendar/ui/CommonTimePanel.tsx b/desktop/src/features/team-calendar/ui/CommonTimePanel.tsx
+index a0be70d7b..8f78828a9 100644
+--- a/desktop/src/features/team-calendar/ui/CommonTimePanel.tsx
++++ b/desktop/src/features/team-calendar/ui/CommonTimePanel.tsx
+@@ -111,7 +111,7 @@ export function CommonTimePanel({
+   return (
+     <section
+       aria-labelledby={headingId}
+-      className="space-y-4 rounded-xl border border-border/70 p-4"
++      className="@container/common-time min-w-0 space-y-4 rounded-xl border border-border/70 p-4"
+       data-testid="common-time-panel"
+     >
+       <div>
+@@ -122,8 +122,11 @@ export function CommonTimePanel({
+           한국시간 · 등록하지 않은 시간은 가능으로 봅니다.
+         </p>
+       </div>
+-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+-        <label htmlFor={`${headingId}-from`} className="space-y-1 text-xs">
++      <div className="grid grid-cols-2 gap-3 @min-[960px]/common-time:grid-cols-5">
++        <label
++          htmlFor={`${headingId}-from`}
++          className="min-w-0 space-y-1 text-xs"
++        >
+           시작 날짜
+           <Input
+             id={`${headingId}-from`}
+@@ -132,7 +135,10 @@ export function CommonTimePanel({
+             onChange={(event) => setFrom(event.target.value)}
+           />
+         </label>
+-        <label htmlFor={`${headingId}-through`} className="space-y-1 text-xs">
++        <label
++          htmlFor={`${headingId}-through`}
++          className="min-w-0 space-y-1 text-xs"
++        >
+           종료 날짜
+           <Input
+             id={`${headingId}-through`}
+@@ -141,10 +147,10 @@ export function CommonTimePanel({
+             onChange={(event) => setThrough(event.target.value)}
+           />
+         </label>
+-        <label className="space-y-1 text-xs">
++        <label className="min-w-0 space-y-1 text-xs">
+           필요한 시간
+           <select
+-            className={SELECT_CLASS}
++            className={cn(SELECT_CLASS, "min-w-0 w-full")}
+             value={duration}
+             onChange={(event) => setDuration(Number(event.target.value))}
+           >
+@@ -155,10 +161,10 @@ export function CommonTimePanel({
+             ))}
+           </select>
+         </label>
+-        <label className="space-y-1 text-xs">
++        <label className="min-w-0 space-y-1 text-xs">
+           찾을 시작 시간
+           <select
+-            className={SELECT_CLASS}
++            className={cn(SELECT_CLASS, "min-w-0 w-full")}
+             value={start}
+             onChange={(event) => setStart(Number(event.target.value))}
+           >
+@@ -169,10 +175,10 @@ export function CommonTimePanel({
+             ))}
+           </select>
+         </label>
+-        <label className="space-y-1 text-xs">
++        <label className="min-w-0 space-y-1 text-xs">
+           찾을 종료 시간
+           <select
+-            className={SELECT_CLASS}
++            className={cn(SELECT_CLASS, "min-w-0 w-full")}
+             value={end}
+             onChange={(event) => setEnd(Number(event.target.value))}
+           >
+@@ -244,7 +250,7 @@ export function CommonTimePanel({
+         <>
+           <section aria-label="추천 시간" className="space-y-2">
+             <h4 className="text-sm font-semibold">추천 시간</h4>
+-            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
++            <div className="grid min-w-0 gap-2 @min-[480px]/common-time:grid-cols-2 @min-[960px]/common-time:grid-cols-4">
+               {result.recommendations.map((slot) => (
+                 <div
+                   key={slotKey(slot)}
+@@ -300,7 +306,7 @@ export function CommonTimePanel({
+                     }
+                     명
+                   </h5>
+-                  <ul className="space-y-1 text-xs">
++                  <ul className="min-w-0 space-y-1 text-xs">
+                     {detail.people
+                       .filter((member) => member.status === kind)
+                       .map(({ person, rules }) => (
+@@ -317,15 +323,18 @@ export function CommonTimePanel({
+               ))}
+             </section>
+           ) : null}
+-          <div className="max-h-[32rem] overflow-auto rounded-lg border border-border">
+-            <table className="w-full border-collapse text-xs">
++          <div className="min-w-0 max-h-[32rem] overflow-auto rounded-lg border border-border">
++            <table className="w-max min-w-full border-collapse text-xs">
+               <caption className="p-2 text-left text-muted-foreground">
+                 30분마다 시작 · {duration}분 전체 기준 · 색이 진할수록 가능
+                 인원이 많아요. 칸을 누르면 명단이 열립니다.
+               </caption>
+               <thead>
+                 <tr>
+-                  <th scope="col" className="sticky left-0 bg-background p-2">
++                  <th
++                    scope="col"
++                    className="sticky left-0 whitespace-nowrap bg-background p-2"
++                  >
+                     시작
+                   </th>
+                   {result.dates.map((date) => (
+@@ -342,7 +351,10 @@ export function CommonTimePanel({
+               <tbody>
+                 {rows.map((row) => (
+                   <tr key={row.start}>
+-                    <th scope="row" className="sticky left-0 bg-background p-2">
++                    <th
++                      scope="row"
++                      className="sticky left-0 whitespace-nowrap bg-background p-2"
++                    >
+                       {minuteLabel(row.start)}
+                     </th>
+                     {result.dates.map((date) => {
+@@ -355,7 +367,7 @@ export function CommonTimePanel({
+                               aria-pressed={selected === slotKey(slot)}
+                               aria-label={`${slotLabel(slot)} · 가능 ${slot.available}/${slot.people.length}명${slot.requiredAvailable ? "" : " · 필수 인원 불가·조율"}`}
+                               className={cn(
+-                                "w-full rounded p-2 text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
++                                "w-full whitespace-nowrap rounded p-2 text-foreground focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
+                                 cellColor(slot.available, slot.people.length),
+                               )}
+                               onClick={() => setSelected(slotKey(slot))}
+diff --git a/desktop/src/features/team-calendar/ui/ScheduleColumns.tsx b/desktop/src/features/team-calendar/ui/ScheduleColumns.tsx
+new file mode 100644
+index 000000000..2109a2806
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/ScheduleColumns.tsx
+@@ -0,0 +1,26 @@
++import type { ComponentProps } from "react";
++
++import { stackScheduleColumns } from "../lib/calendarLayout";
++import { useElementWidth } from "@/shared/hooks/use-mobile";
++import { cn } from "@/shared/lib/cn";
++
++/** Keeps calendar, sprint editor and member detail columns within their own body. */
++export function ScheduleColumns({
++  className,
++  ...props
++}: ComponentProps<"div">) {
++  const [ref, width] = useElementWidth<HTMLDivElement>();
++  const stacked = stackScheduleColumns(width);
++  return (
++    <div
++      {...props}
++      ref={ref}
++      data-stacked={stacked}
++      className={cn(
++        "group/schedule flex min-w-0 w-full gap-4",
++        stacked ? "flex-col" : "flex-row",
++        className,
++      )}
++    />
++  );
++}
+diff --git a/desktop/src/features/team-calendar/ui/SprintBoard.tsx b/desktop/src/features/team-calendar/ui/SprintBoard.tsx
+index 77217f2df..50afc9bc2 100644
+--- a/desktop/src/features/team-calendar/ui/SprintBoard.tsx
++++ b/desktop/src/features/team-calendar/ui/SprintBoard.tsx
+@@ -207,7 +207,7 @@ export function SprintBoard({
+         className="max-h-[min(60vh,40rem)] overflow-auto rounded-lg border border-border/70"
+         ref={scrollerRef}
+       >
+-        <table className="w-max min-w-full border-separate border-spacing-0 text-left text-xs">
++        <table className="w-max min-w-full table-fixed border-separate border-spacing-0 text-left text-xs">
+           <thead>
+             <tr>
+               <th
+@@ -328,7 +328,7 @@ export function SprintBoard({
+                           return (
+                             <button
+                               className={cn(
+-                                "grid grid-cols-[0.75rem_1fr] gap-1 rounded px-1 py-0.5 text-left leading-snug hover:bg-foreground/5 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
++                                "grid min-w-0 grid-cols-[0.75rem_minmax(0,1fr)] gap-1 rounded px-1 py-0.5 text-left leading-snug hover:bg-foreground/5 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
+                                 editingId === item.entry.id &&
+                                   "bg-primary/10 ring-1 ring-primary",
+                               )}
+@@ -358,7 +358,7 @@ export function SprintBoard({
+                               )}
+                               <span
+                                 className={cn(
+-                                  "break-words",
++                                  "min-w-0 truncate whitespace-nowrap",
+                                   item.milestone && "font-semibold",
+                                 )}
+                               >
+diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+index c22c8a59e..50862c459 100644
+--- a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
++++ b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+@@ -77,6 +77,8 @@ import { type PollPick, PollsPanel } from "./PollsPanel";
+ import { SprintBoard } from "./SprintBoard";
+ import { SprintPlanForm } from "./SprintPlanForm";
+ 
++import { ScheduleColumns } from "./ScheduleColumns";
++
+ type Tab = "board" | "people" | "polls" | "digest" | "google";
+ type View = "sprint" | "calendar";
+ type Panel = "export" | "import" | "plan" | null;
+@@ -393,10 +395,13 @@ export function TeamCalendarDialog({
+         </DialogHeader>
+       )}
+ 
+-      <div className="flex flex-wrap items-center gap-2">
++      <div
++        className="flex min-w-0 flex-wrap items-center gap-2"
++        data-testid="calendar-toolbar"
++      >
+         <div
+           aria-label="보기 방식"
+-          className="flex rounded-lg bg-muted p-0.5"
++          className="flex shrink-0 whitespace-nowrap rounded-lg bg-muted p-0.5"
+           role="tablist"
+         >
+           {(
+@@ -430,7 +435,10 @@ export function TeamCalendarDialog({
+             );
+           })}
+         </div>
+-        <div className="flex flex-wrap items-center gap-1" role="tablist">
++        <div
++          className="flex min-w-0 flex-wrap items-center gap-1"
++          role="tablist"
++        >
+           {(
+             [
+               ["people", "팀원 일정"],
+@@ -456,7 +464,7 @@ export function TeamCalendarDialog({
+             </Button>
+           ))}
+         </div>
+-        <div className="ml-auto flex items-center gap-1">
++        <div className="ml-auto flex shrink-0 flex-wrap items-center gap-1">
+           <Button
+             data-testid="team-calendar-import"
+             onClick={() => setPanel(panel === "import" ? null : "import")}
+@@ -601,7 +609,7 @@ export function TeamCalendarDialog({
+           />
+         </div>
+       ) : view === "sprint" ? (
+-        <div className="flex flex-col gap-4 lg:flex-row">
++        <ScheduleColumns data-testid="sprint-columns">
+           <div className="min-w-0 flex-1">
+             <SprintBoard
+               editingId={draft?.id}
+@@ -622,7 +630,7 @@ export function TeamCalendarDialog({
+           {draft || unsaved ? (
+             <aside
+               aria-label="일정 편집"
+-              className="flex w-full shrink-0 flex-col gap-3 lg:w-80"
++              className="flex min-w-0 w-full shrink-0 flex-col gap-3 group-data-[stacked=false]/schedule:w-80"
+             >
+               {draft ? (
+                 <h3
+@@ -683,9 +691,9 @@ export function TeamCalendarDialog({
+               ) : null}
+             </aside>
+           ) : null}
+-        </div>
++        </ScheduleColumns>
+       ) : (
+-        <div className="flex flex-col gap-4 md:flex-row">
++        <ScheduleColumns data-testid="calendar-columns">
+           <CalendarGrid
+             colorOfDept={colorOfDept}
+             entries={monthEntries}
+@@ -703,9 +711,9 @@ export function TeamCalendarDialog({
+           />
+           <section
+             aria-label={`${dateLabel(selectedDate)} 일정`}
+-            className="flex w-full shrink-0 flex-col gap-3 md:w-80"
++            className="flex min-w-0 w-full shrink-0 flex-col gap-3 group-data-[stacked=false]/schedule:w-80"
+           >
+-            <div className="flex items-center justify-between gap-2">
++            <div className="flex flex-wrap items-center justify-between gap-2">
+               <h3 className="text-sm font-semibold">
+                 {dateLabel(selectedDate)}
+                 {selectedWeek >= 0 ? (
+@@ -761,7 +769,7 @@ export function TeamCalendarDialog({
+               />
+             )}
+           </section>
+-        </div>
++        </ScheduleColumns>
+       )}
+     </>
+   );
+diff --git a/desktop/src/features/team-calendar/ui/calendarLayout.jsdom-test.mjs b/desktop/src/features/team-calendar/ui/calendarLayout.jsdom-test.mjs
+new file mode 100644
+index 000000000..e04d95e0c
+--- /dev/null
++++ b/desktop/src/features/team-calendar/ui/calendarLayout.jsdom-test.mjs
+@@ -0,0 +1,197 @@
++import assert from "node:assert/strict";
++import { afterEach, mock, test } from "node:test";
++import React from "react";
++import {
++  act,
++  cleanup,
++  fireEvent,
++  render,
++  within,
++} from "@testing-library/react";
++import { CalendarGrid } from "./CalendarGrid.tsx";
++import { ScheduleColumns } from "./ScheduleColumns.tsx";
++import { TeamCalendarDialog } from "./TeamCalendarDialog.tsx";
++import {
++  prepareScheduleDom,
++  pubkey,
++  relayUrl,
++} from "../../team-schedule/ui/scheduleTestSupport.mjs";
++
++let env;
++afterEach(() => {
++  cleanup();
++  env?.client.clear();
++  mock.restoreAll();
++  localStorage.clear();
++  delete globalThis.isTauri;
++  delete globalThis.ResizeObserver;
++});
++function measure(initialWidth, initialHeight = 80) {
++  let width = initialWidth;
++  let height = initialHeight;
++  const observers = new Set();
++  mock.method(HTMLElement.prototype, "getBoundingClientRect", () => ({
++    width,
++    height,
++  }));
++  globalThis.ResizeObserver = class {
++    constructor(callback) {
++      this.callback = callback;
++    }
++    observe() {
++      observers.add(this);
++    }
++    unobserve() {
++      observers.delete(this);
++    }
++    disconnect() {
++      observers.delete(this);
++    }
++  };
++  return {
++    resize(w, h = height) {
++      width = w;
++      height = h;
++      act(() => {
++        for (const observer of observers) observer.callback([]);
++      });
++    },
++    observers,
++  };
++}
++const date = "2026-11-06";
++const entry = (index) => ({
++  id: `entry-${index}`,
++  title: `아주 긴 일정 제목 ${index}`,
++  date,
++  updatedAt: 1,
++  updatedBy: pubkey,
++});
++const people = [0, 1].map((n) => ({
++  id: `p${n}`,
++  name: `가짜 ${n}`,
++  updatedAt: 1,
++  updatedBy: pubkey,
++  rules: [
++    {
++      id: `r${n}`,
++      title: "가짜 불가",
++      kind: "busy",
++      startDate: date,
++      endDate: date,
++      weekday: null,
++      start: 0,
++      end: 1440,
++      exclude: [],
++    },
++  ],
++}));
++const props = {
++  month: "2026-11",
++  entries: Array.from({ length: 6 }, (_, i) => entry(i)),
++  selectedDate: date,
++  today: date,
++  people,
++  mineOnly: false,
++  showPeople: true,
++  status: "ready",
++  colorOfDept: () => "",
++  onMonth() {},
++  onSelectDate() {},
++  onMineOnly() {},
++  onShowPeople() {},
++};
++
++test("real columns resize at body widths 600/800/1200, independent of viewport", () => {
++  const measurements = measure(600);
++  const view = render(
++    React.createElement(ScheduleColumns, { "data-testid": "columns" }, "본문"),
++  );
++  const columns = view.getByTestId("columns");
++  for (const [width, stacked] of [
++    [600, true],
++    [800, true],
++    [1200, false],
++    [859, true],
++    [860, false],
++  ]) {
++    measurements.resize(width);
++    assert.equal(columns.dataset.stacked, String(stacked));
++    assert.ok(columns.classList.contains(stacked ? "flex-col" : "flex-row"));
++    assert.ok(columns.classList.contains("min-w-0"));
++  }
++  view.unmount();
++  assert.equal(measurements.observers.size, 0);
++});
++
++test("real month cells abbreviate, separate the date/count, clip bars, and recount on resize", () => {
++  const measurements = measure(85, 80);
++  const selected = [];
++  const view = render(
++    React.createElement(CalendarGrid, {
++      ...props,
++      onSelectDate: (value) => selected.push(value),
++    }),
++  );
++  const day = view.getByTestId(`team-calendar-day-${date}`);
++  const badge = within(day).getByTestId("team-calendar-busy-badge");
++  const header = within(day).getByTestId("calendar-day-header");
++  assert.equal(badge.textContent, "●2");
++  assert.match(badge.title, /종일 불가 2명/);
++  assert.equal(header.contains(badge), false);
++  assert.equal(within(header).getByTestId("calendar-more").textContent, "+4");
++  assert.equal(view.getAllByTestId("team-calendar-bar").length, 2);
++  for (const element of [badge, ...view.getAllByTestId("team-calendar-bar")])
++    for (const token of ["min-w-0", "truncate", "whitespace-nowrap"])
++      assert.ok(
++        element.classList.contains(token),
++        `${element.textContent}: ${token}`,
++      );
++  for (const bar of view.getAllByTestId("team-calendar-bar"))
++    assert.ok(bar.classList.contains("h-4"));
++  measurements.resize(110, 112);
++  assert.equal(badge.textContent, "종일 불가 2");
++  assert.equal(view.getAllByTestId("team-calendar-bar").length, 3);
++  assert.equal(within(header).getByTestId("calendar-more").textContent, "+3");
++  measurements.resize(85, 62);
++  assert.equal(view.getAllByTestId("team-calendar-bar").length, 1);
++  assert.equal(within(header).getByTestId("calendar-more").textContent, "+5");
++  fireEvent.click(day);
++  assert.deepEqual(selected, [date]);
++  assert.match(day.getAttribute("aria-label"), /일정 6개, 종일 불가 2명/);
++  view.unmount();
++  assert.equal(measurements.observers.size, 0);
++});
++
++test("actual calendar dialog keeps wrapping toolbar and applies body columns to calendar, sprint editor and people", () => {
++  env = prepareScheduleDom();
++  const measurements = measure(600);
++  localStorage.setItem("buzz-team-calendar-view", "calendar");
++  const view = render(
++    React.createElement(TeamCalendarDialog, {
++      embedded: true,
++      open: true,
++      onOpenChange() {},
++      pubkey,
++      relayUrl,
++    }),
++    { wrapper: env.Providers },
++  );
++  const toolbar = view.getByTestId("calendar-toolbar");
++  assert.ok(toolbar.classList.contains("flex-wrap"));
++  for (const width of [600, 800, 1200]) {
++    measurements.resize(width);
++    assert.equal(
++      view.getByTestId("calendar-columns").dataset.stacked,
++      String(width < 860),
++    );
++  }
++  fireEvent.click(view.getByRole("tab", { name: "스프린트", exact: true }));
++  fireEvent.click(view.getAllByTestId("sprint-add")[0]);
++  measurements.resize(600);
++  const sprint = view.getByTestId("sprint-columns");
++  assert.equal(sprint.dataset.stacked, "true");
++  assert.ok(within(sprint).getByRole("complementary", { name: "일정 편집" }));
++  fireEvent.click(view.getByRole("tab", { name: "팀원 일정", exact: true }));
++  assert.equal(view.getByTestId("availability-panel").dataset.stacked, "true");
++});

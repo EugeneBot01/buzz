@@ -2,8 +2,8 @@
 
 Kept out of `patches/`, which upstream uses for pnpm `patchedDependencies`.
 
-Patches applied on top of an upstream `desktop-vX.Y.Z` tag, in file-name order,
-with `git apply --3way`.
+Patches applied on top of an upstream `desktop-vX.Y.Z` tag, in patch-number order
+(`sort -V`, so 99 comes before 100), with `git apply --3way`.
 
 | File | What it does | Details |
 |---|---|---|
@@ -33,6 +33,15 @@ with `git apply --3way`.
 | `97-files-and-deletes.patch` | Files dialog name search; "download all" under a message with 2+ files; deleted messages leave the thread panel too; Korean download error advice | `BUZZ-FILES-AND-DELETES-PATCH.md` |
 | `98-artcraft.patch` | ArtCraft (open-source Word/Excel/PowerPoint/PDF apps): "열기" next to file cards opens them in the matching app (else the default app; documents and pictures only); WordCraft/GridCraft MCP presets for agents. Apps and tools come from `install-artcraft.sh` | `BUZZ-ARTCRAFT-PATCH.md` |
 | `99-agent-files.patch` | Agents attach the files they make (documents, sheets, slides, PDF, zip; up to 100 MB) to their messages with `buzz messages send --file`, shown as file cards with the file name; base prompt tells them to; DeckCraft (PowerPoint) MCP preset | `BUZZ-AGENT-FILES-PATCH.md` |
+| `100-meet-button.patch` | Channel header: a Google Meet button always first in the shortcut row — the channel's saved Meet room, else Google's new-room page. Storage unchanged (`team-links`) | `BUZZ-MEET-BUTTON-PATCH.md` |
+| `102-team-welcome.patch` | Team welcome: owners/admins pick default channels in Settings → 팀 안내; a newcomer (first joined a team channel within 7 days) joins them once. Existing members are never pulled into channels they were not in when they updated. A 5-step Korean guide shows once per device, including when join time or default-channel lookup fails. Failed default lookup is retried without marking auto-join attempted. Same `team-onboarding` document as the Buzz Team 0.7 build | `BUZZ-TEAM-WELCOME-PATCH.md` |
+| `103-sprint-calendar.patch` | Sprint/calendar views, member schedules, import and export (gnuskim PR #18, unchanged) | `BUZZ-SPRINT-CALENDAR-PATCH.md` |
+| `104-schedule-tabs.patch` | Shared schedule link tabs, local device URLs and embedded child webviews | `BUZZ-SCHEDULE-TABS-PATCH.md` |
+| `105-team-hub.patch` | Six team feature tiles, full-page schedule and existing feature navigation | `BUZZ-TEAM-HUB-PATCH.md` |
+| `106-common-time.patch` | Find common meeting time from member schedules, ranked cards and 30-minute table | `BUZZ-COMMON-TIME-PATCH.md` |
+| `107-availability-production-lock.patch` | Member schedule privacy, one production button, automatic legacy hiding, easy name linking/self-add and verified edit ownership | `BUZZ-AVAILABILITY-PRODUCTION-LOCK-PATCH.md` |
+| `108-calendar-responsive.patch` | Narrow-window calendar layout: stacked detail panel, compact badges, no overlaps | `BUZZ-CALENDAR-RESPONSIVE-PATCH.md` |
+
 
 
 If a patch stops applying to a new upstream tag, re-implement it from section 3

@@ -1,0 +1,133 @@
+diff --git a/desktop/src/features/team-links/lib/teamLinks.test.mjs b/desktop/src/features/team-links/lib/teamLinks.test.mjs
+index c3c284c2f..8dfe41b0d 100644
+--- a/desktop/src/features/team-links/lib/teamLinks.test.mjs
++++ b/desktop/src/features/team-links/lib/teamLinks.test.mjs
+@@ -12,12 +12,14 @@ import {
+   withCurrentPresets,
+ } from "./mcpCatalog.ts";
+ import {
++  NEW_MEET_URL,
+   decodeTeamLinks,
+   encodeTeamLinks,
+   guessLinkKind,
+   linksForChannel,
+   mergeTeamLinkEvents,
+   mergeTeamLinks,
++  splitMeetShortcut,
+   normalizeLinkUrl,
+   validateTeamLink,
+ } from "./teamLinks.ts";
+@@ -126,3 +128,25 @@ test("MCP servers are stored in one environment variable", () => {
+   assert.ok("error" in customMcpServer("x", "http://a.b"));
+   assert.ok("error" in customMcpServer("x", ""));
+ });
++
++test("the header's Meet button takes the channel's first Meet room", () => {
++  const link = (id, kind) => ({
++    id,
++    kind,
++    title: id,
++    url: `https://example.com/${id}`,
++    updatedAt: 1,
++    updatedBy: "a".repeat(64),
++  });
++  const figma = link("f", "figma");
++  const meet1 = link("m1", "meet");
++  const meet2 = link("m2", "meet");
++  const split = splitMeetShortcut([figma, meet1, meet2]);
++  assert.equal(split.meet, meet1);
++  assert.deepEqual(split.others, [figma, meet2]);
++  assert.deepEqual(splitMeetShortcut([figma]), {
++    meet: null,
++    others: [figma],
++  });
++  assert.equal(NEW_MEET_URL, "https://meet.google.com/new");
++});
+diff --git a/desktop/src/features/team-links/lib/teamLinks.ts b/desktop/src/features/team-links/lib/teamLinks.ts
+index 352c6f334..9ebf7db14 100644
+--- a/desktop/src/features/team-links/lib/teamLinks.ts
++++ b/desktop/src/features/team-links/lib/teamLinks.ts
+@@ -231,3 +231,18 @@ export function linksForChannel(
+         a.id.localeCompare(b.id),
+     );
+ }
++
++/** Google's page that makes a fresh Meet room. */
++export const NEW_MEET_URL = "https://meet.google.com/new";
++
++/**
++ * Splits a channel's shortcuts for the header: its Google Meet room (the
++ * first one, if any), which always has its own button, and the rest.
++ */
++export function splitMeetShortcut(shown: readonly TeamLink[]): {
++  meet: TeamLink | null;
++  others: TeamLink[];
++} {
++  const meet = shown.find((link) => link.kind === "meet") ?? null;
++  return { meet, others: shown.filter((link) => link !== meet) };
++}
+diff --git a/desktop/src/features/team-links/ui/ChannelConnections.tsx b/desktop/src/features/team-links/ui/ChannelConnections.tsx
+index e421bfca3..6b99a47ad 100644
+--- a/desktop/src/features/team-links/ui/ChannelConnections.tsx
++++ b/desktop/src/features/team-links/ui/ChannelConnections.tsx
+@@ -8,10 +8,12 @@ import {
+   LINK_KIND_LABELS,
+   type LinkKind,
+   MAX_LINK_TITLE_LENGTH,
++  NEW_MEET_URL,
+   type TeamLink,
+   guessLinkKind,
+   linksForChannel,
+   normalizeLinkUrl,
++  splitMeetShortcut,
+   validateTeamLink,
+ } from "@/features/team-links/lib/teamLinks";
+ import { useTeamLinks } from "@/features/team-links/lib/useTeamLinks";
+@@ -91,10 +93,37 @@ function ChannelConnectionsInner({
+   );
+   const [dialogOpen, setDialogOpen] = React.useState(false);
+   const shown = linksForChannel(links, channelId);
++  // The Meet button is always there: the channel's room, else a new one.
++  const { meet, others } = splitMeetShortcut(shown);
+ 
+   return (
+     <span className="flex items-center gap-[6px]" data-no-translate="">
+-      {shown.slice(0, MAX_HEADER_SHORTCUTS).map((link) => {
++      <Tooltip disableHoverableContent>
++        <TooltipTrigger asChild>
++          <Button
++            aria-label={meet ? `${meet.title} 열기` : "새 구글 미트 방 만들기"}
++            data-testid="channel-meet"
++            onClick={() =>
++              meet
++                ? open(meet)
++                : void openUrl(NEW_MEET_URL).catch(() =>
++                    toast.error("링크를 열지 못했습니다."),
++                  )
++            }
++            size="icon"
++            type="button"
++            variant="outline"
++          >
++            <Video />
++          </Button>
++        </TooltipTrigger>
++        <TooltipContent>
++          {meet
++            ? `${meet.title} 들어가기`
++            : "새 구글 미트 방 만들기 (만든 주소는 옆 바로가기 버튼에 붙여 두세요)"}
++        </TooltipContent>
++      </Tooltip>
++      {others.slice(0, MAX_HEADER_SHORTCUTS).map((link) => {
+         const Icon = KIND_ICONS[link.kind];
+         return (
+           <Tooltip disableHoverableContent key={link.id}>
+@@ -338,7 +367,7 @@ function ConnectionsDialog({
+               </label>
+               <Button
+                 onClick={() =>
+-                  void openUrl("https://meet.google.com/new").catch(() =>
++                  void openUrl(NEW_MEET_URL).catch(() =>
+                     toast.error("링크를 열지 못했습니다."),
+                   )
+                 }
