@@ -1,0 +1,301 @@
+diff --git a/desktop/src/app/navigation/useAppNavigation.ts b/desktop/src/app/navigation/useAppNavigation.ts
+index ea8f16bf2..003462e5e 100644
+--- a/desktop/src/app/navigation/useAppNavigation.ts
++++ b/desktop/src/app/navigation/useAppNavigation.ts
+@@ -83,7 +83,12 @@ export function useAppNavigation() {
+   );
+ 
+   const goSchedule = React.useCallback(
+-    () => commitNavigation({ to: "/schedule" }),
++    (panel?: string) =>
++      commitNavigation({
++        to: "/schedule",
++        // `at` makes asking for the same panel again reopen it.
++        search: panel ? { panel, at: String(Date.now()) } : {},
++      }),
+     [commitNavigation],
+   );
+ 
+diff --git a/desktop/src/app/routes/schedule.tsx b/desktop/src/app/routes/schedule.tsx
+index 6f0710215..08e92c751 100644
+--- a/desktop/src/app/routes/schedule.tsx
++++ b/desktop/src/app/routes/schedule.tsx
+@@ -1,6 +1,12 @@
+ import { createFileRoute } from "@tanstack/react-router";
+ import { TeamScheduleScreen } from "@/features/team-schedule/ui/TeamScheduleScreen";
+ 
++type ScheduleSearch = { panel?: string; at?: string };
++
+ export const Route = createFileRoute("/schedule")({
++  validateSearch: (search: Record<string, unknown>): ScheduleSearch => ({
++    panel: typeof search.panel === "string" ? search.panel : undefined,
++    at: typeof search.at === "string" ? search.at : undefined,
++  }),
+   component: TeamScheduleScreen,
+ });
+diff --git a/desktop/src/features/team-calendar/lib/calendarNavigation.ts b/desktop/src/features/team-calendar/lib/calendarNavigation.ts
+index 3501ca16e..018f2f9b0 100644
+--- a/desktop/src/features/team-calendar/lib/calendarNavigation.ts
++++ b/desktop/src/features/team-calendar/lib/calendarNavigation.ts
+@@ -1,8 +1,7 @@
+ /** Existing calendar panels, also used by the team's feature hub. */
+ export type CalendarPanel = "calendar" | "polls" | "digest" | "google";
+ 
+-/** Imperative navigation to the mounted sidebar's existing calendar dialogs. */
++/** Opens the full-page schedule, optionally on one of its panels. */
+ export type TeamCalendarNavigation = {
+-  openCalendar: (panel?: CalendarPanel) => void;
+-  openSchedule: () => void;
++  openSchedule: (panel?: CalendarPanel) => void;
+ };
+diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
+index 5105f9418..215ab3995 100644
+--- a/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
++++ b/desktop/src/features/team-calendar/ui/TeamCalendarSidebarEntry.tsx
+@@ -1,7 +1,4 @@
+-import type {
+-  CalendarPanel,
+-  TeamCalendarNavigation,
+-} from "../lib/calendarNavigation";
++import type { TeamCalendarNavigation } from "../lib/calendarNavigation";
+ import { useAppNavigation } from "@/app/navigation/useAppNavigation";
+ import { CalendarDays } from "lucide-react";
+ import * as React from "react";
+@@ -16,13 +13,11 @@ import { useWeeklyDigest } from "@/features/team-calendar/lib/useWeeklyDigest";
+ import { SidebarMenuButton, SidebarMenuItem } from "@/shared/ui/sidebar";
+ import { SidebarMenuLabel } from "@/shared/ui/sidebar-menu-label";
+ import { AddFromMessageDialog } from "./AddFromMessageDialog";
+-import { TeamCalendarDialog } from "./TeamCalendarDialog";
+ 
+ /**
+- * Sidebar entry for the team calendar (team patch). The calendar window is
+- * mounted only while open. Reminders and "add to calendar" from a message are
+- * handled here too, because this is mounted for as long as a community is
+- * shown.
++ * Sidebar entry for the full-page schedule (team patch). Reminders and "add
++ * to calendar" from a message are handled here too, because this is mounted
++ * for as long as a community is shown.
+  */
+ export function TeamCalendarSidebarEntry({
+   pubkey,
+@@ -46,22 +41,15 @@ function TeamCalendarEntry({
+   relayUrl: string;
+   ref?: React.Ref<TeamCalendarNavigation>;
+ }) {
+-  const [initialPanel, setInitialPanel] =
+-    React.useState<CalendarPanel>("calendar");
+   const { goSchedule } = useAppNavigation();
+-  const [open, setOpen] = React.useState(false);
+   const [request, setRequest] = React.useState<AddFromMessageRequest | null>(
+     null,
+   );
+   React.useImperativeHandle(
+     ref,
+     () => ({
+-      openCalendar(panel = "calendar") {
+-        setInitialPanel(panel);
+-        setOpen(true);
+-      },
+-      openSchedule() {
+-        void goSchedule();
++      openSchedule(panel) {
++        void goSchedule(panel);
+       },
+     }),
+     [goSchedule],
+@@ -73,18 +61,6 @@ function TeamCalendarEntry({
+ 
+   return (
+     <SidebarMenuItem data-no-translate="">
+-      <SidebarMenuButton
+-        data-testid="open-team-calendar"
+-        onClick={() => {
+-          setInitialPanel("calendar");
+-          setOpen(true);
+-        }}
+-        tooltip="팀 캘린더"
+-        type="button"
+-      >
+-        <CalendarDays className="h-4 w-4" />
+-        <SidebarMenuLabel>캘린더</SidebarMenuLabel>
+-      </SidebarMenuButton>
+       <SidebarMenuButton
+         data-testid="open-team-schedule"
+         onClick={() => void goSchedule()}
+@@ -94,15 +70,6 @@ function TeamCalendarEntry({
+         <CalendarDays className="h-4 w-4" />
+         <SidebarMenuLabel>일정</SidebarMenuLabel>
+       </SidebarMenuButton>
+-      {open ? (
+-        <TeamCalendarDialog
+-          initialPanel={initialPanel}
+-          onOpenChange={setOpen}
+-          open={open}
+-          pubkey={pubkey}
+-          relayUrl={relayUrl}
+-        />
+-      ) : null}
+       {request ? (
+         <AddFromMessageDialog
+           key={request.eventId}
+diff --git a/desktop/src/features/team-hub/lib/featureGroups.ts b/desktop/src/features/team-hub/lib/featureGroups.ts
+index 687b19c42..a0c1a2d10 100644
+--- a/desktop/src/features/team-hub/lib/featureGroups.ts
++++ b/desktop/src/features/team-hub/lib/featureGroups.ts
+@@ -7,7 +7,6 @@ export const TEAM_FEATURE_CATEGORIES = [
+ ] as const;
+ export type FeatureAction =
+   | "schedule"
+-  | "calendar"
+   | "digest"
+   | "google"
+   | "notifications"
+@@ -52,15 +51,10 @@ export const teamFeatureGroups: ReadonlyArray<{
+     name: "일정",
+     items: [
+       {
+-        name: "일정 창",
+-        description: "일정 페이지를 탭으로 보기",
++        name: "일정",
++        description: "팀 일정을 함께 보고 고치기 · 링크 탭",
+         action: "schedule",
+       },
+-      {
+-        name: "팀 캘린더",
+-        description: "팀 일정 함께 보고 고치기",
+-        action: "calendar",
+-      },
+       {
+         name: "주간 요약·당일 알림",
+         description: "일정을 채널에 알려 주기",
+diff --git a/desktop/src/features/team-hub/ui/TeamFeatureHubSidebarEntry.tsx b/desktop/src/features/team-hub/ui/TeamFeatureHubSidebarEntry.tsx
+index fb23139fd..772ac2860 100644
+--- a/desktop/src/features/team-hub/ui/TeamFeatureHubSidebarEntry.tsx
++++ b/desktop/src/features/team-hub/ui/TeamFeatureHubSidebarEntry.tsx
+@@ -80,7 +80,7 @@ export function TeamFeatureHubSidebarEntry({
+             openAfterExit(() => {
+               if (action === "schedule") calendar.current?.openSchedule();
+               else if (action === "digest")
+-                calendar.current?.openCalendar("digest");
++                calendar.current?.openSchedule("digest");
+               else if (action === "help") setHelp(true);
+               else if (action === "files") {
+                 if (channel) setFiles(true);
+diff --git a/desktop/src/features/team-hub/ui/teamHub.jsdom-test.mjs b/desktop/src/features/team-hub/ui/teamHub.jsdom-test.mjs
+index fa34c7a61..6b3017763 100644
+--- a/desktop/src/features/team-hub/ui/teamHub.jsdom-test.mjs
++++ b/desktop/src/features/team-hub/ui/teamHub.jsdom-test.mjs
+@@ -61,8 +61,7 @@ function mount(selected = channel, meet = null) {
+   const actions = [];
+   const calendar = {
+     current: {
+-      openSchedule: () => actions.push("schedule"),
+-      openCalendar: (panel) => actions.push(panel),
++      openSchedule: (panel) => actions.push(panel ?? "schedule"),
+     },
+   };
+   const view = render(
+diff --git a/desktop/src/features/team-schedule/ui/TeamScheduleScreen.tsx b/desktop/src/features/team-schedule/ui/TeamScheduleScreen.tsx
+index 96c414fd9..aa3e03fd8 100644
+--- a/desktop/src/features/team-schedule/ui/TeamScheduleScreen.tsx
++++ b/desktop/src/features/team-schedule/ui/TeamScheduleScreen.tsx
+@@ -1,16 +1,26 @@
++import { useSearch } from "@tanstack/react-router";
++import type { CalendarPanel } from "@/features/team-calendar/lib/calendarNavigation";
+ import { useCommunities } from "@/features/communities/useCommunities";
+ import { useIdentityQuery } from "@/shared/api/hooks";
+ import { TeamScheduleView } from "./TeamScheduleView";
+ 
++const PANELS: CalendarPanel[] = ["calendar", "polls", "digest", "google"];
++
+ /** Route content fills the body beside the sidebar and retires on navigation. */
+ export function TeamScheduleScreen() {
+   const { activeCommunity } = useCommunities();
+   const { data: identity } = useIdentityQuery();
++  const search = useSearch({ strict: false }) as {
++    panel?: string;
++    at?: string;
++  };
++  const initialPanel = PANELS.find((panel) => panel === search.panel);
+   if (!activeCommunity || !identity)
+     return <p role="status">일정을 불러오는 중…</p>;
+   return (
+     <TeamScheduleView
+-      key={`${activeCommunity.id}|${activeCommunity.relayUrl}|${identity.pubkey}`}
++      key={`${activeCommunity.id}|${activeCommunity.relayUrl}|${identity.pubkey}|${initialPanel ?? ""}|${search.at ?? ""}`}
++      initialPanel={initialPanel}
+       pubkey={identity.pubkey}
+       relayUrl={activeCommunity.relayUrl}
+     />
+diff --git a/desktop/src/features/team-schedule/ui/TeamScheduleView.tsx b/desktop/src/features/team-schedule/ui/TeamScheduleView.tsx
+index 61312a2f6..2376618c0 100644
+--- a/desktop/src/features/team-schedule/ui/TeamScheduleView.tsx
++++ b/desktop/src/features/team-schedule/ui/TeamScheduleView.tsx
+@@ -1,5 +1,6 @@
+ import { MoreHorizontal, RefreshCw } from "lucide-react";
+ import * as React from "react";
++import type { CalendarPanel } from "@/features/team-calendar/lib/calendarNavigation";
+ import { TeamCalendarDialog } from "@/features/team-calendar/ui/TeamCalendarDialog";
+ import { Button } from "@/shared/ui/button";
+ import {
+@@ -23,7 +24,11 @@ import { ScheduleTabForm } from "./ScheduleTabForm";
+ import { ScheduleOrderForm } from "./ScheduleOrderForm";
+ 
+ /** Shared schedule links and calendar, rendered inside the app's route outlet. */
+-export function TeamScheduleView(props: { pubkey: string; relayUrl: string }) {
++export function TeamScheduleView(props: {
++  pubkey: string;
++  relayUrl: string;
++  initialPanel?: CalendarPanel;
++}) {
+   const state = useScheduleTabs(props.pubkey, props.relayUrl);
+   return <ScheduleContent {...props} {...state} />;
+ }
+@@ -39,9 +44,11 @@ export function ScheduleContent({
+   retry,
+   saving,
+   save,
++  initialPanel,
+ }: {
+   pubkey: string;
+   relayUrl: string;
++  initialPanel?: CalendarPanel;
+ } & ReturnType<typeof useScheduleTabs>) {
+   const [selected, setSelected] = React.useState("calendar");
+   const [editing, setEditing] = React.useState<string | null>(null);
+@@ -275,6 +282,7 @@ export function ScheduleContent({
+           <TeamCalendarDialog
+             ref={calendar}
+             embedded
++            initialPanel={initialPanel}
+             open
+             onOpenChange={() => {}}
+             pubkey={pubkey}
+diff --git a/desktop/src/features/team-welcome/ui/WelcomeGuide.tsx b/desktop/src/features/team-welcome/ui/WelcomeGuide.tsx
+index d6844840f..bf14e6994 100644
+--- a/desktop/src/features/team-welcome/ui/WelcomeGuide.tsx
++++ b/desktop/src/features/team-welcome/ui/WelcomeGuide.tsx
+@@ -33,7 +33,7 @@ const STEPS: readonly { title: string; body: (joined: string) => string }[] = [
+       "채널 이름을 오른쪽 클릭 → 알림에서 고르세요. 기본값은 설정 → 알림에 있어요. @everyone 을 쓰면 채널의 사람 모두에게 알림이 가요.",
+   },
+   {
+-    title: "왼쪽 위 '캘린더'",
++    title: "왼쪽 위 '일정'",
+     body: () =>
+       "팀 모두가 함께 보고 고치는 달력이에요. 촬영·회의 일정을 여기에 올리면 팀원 모두에게 보여요.",
+   },
+diff --git a/desktop/tests/e2e/team12.spec.ts b/desktop/tests/e2e/team12.spec.ts
+index 9596fa86e..f3a6414e2 100644
+--- a/desktop/tests/e2e/team12.spec.ts
++++ b/desktop/tests/e2e/team12.spec.ts
+@@ -54,8 +54,8 @@ test("six tiles and keyboard navigation open the full schedule while retaining t
+     page.getByRole("menuitem", { name: "탭 추가", exact: true }),
+   ).toHaveCount(0);
+   await page.keyboard.press("Escape");
+-  await page.getByTestId("open-team-calendar").click();
+-  await expect(page.getByTestId("team-calendar-dialog")).toBeVisible();
++  // One way in: the old calendar window is gone.
++  await expect(page.getByTestId("open-team-calendar")).toHaveCount(0);
+ });
+ 
+ test("hub retains digest, settings and help actions", async ({ page }) => {
