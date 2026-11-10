@@ -41,6 +41,7 @@ Patches applied on top of an upstream `desktop-vX.Y.Z` tag, in patch-number orde
 | `106-common-time.patch` | Find common meeting time from member schedules, ranked cards and 30-minute table | `BUZZ-COMMON-TIME-PATCH.md` |
 | `107-availability-production-lock.patch` | Member schedule privacy, one production button, automatic legacy hiding, easy name linking/self-add and verified edit ownership | `BUZZ-AVAILABILITY-PRODUCTION-LOCK-PATCH.md` |
 | `108-calendar-responsive.patch` | Narrow-window calendar layout: stacked detail panel, compact badges, no overlaps | `BUZZ-CALENDAR-RESPONSIVE-PATCH.md` |
+| `110-schedule-show-target.patch` | Per-entry show target (both / sprint / calendar); repeating entries default to calendar only | `BUZZ-SCHEDULE-SHOW-PATCH.md` |
 
 
 
