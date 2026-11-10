@@ -1,0 +1,414 @@
+diff --git a/desktop/src/features/team-calendar/lib/calendarImport.ts b/desktop/src/features/team-calendar/lib/calendarImport.ts
+index b1f78ad7d..75d00a7f6 100644
+--- a/desktop/src/features/team-calendar/lib/calendarImport.ts
++++ b/desktop/src/features/team-calendar/lib/calendarImport.ts
+@@ -11,8 +11,10 @@ import {
+ } from "./teamAvailability";
+ import {
+   CALENDAR_COLORS,
++  CALENDAR_SHOW_VALUES,
+   type CalendarColor,
+   type CalendarEntry,
++  type CalendarShow,
+   DEPT_KEY_PATTERN,
+   MAX_NOTE_LENGTH,
+   MAX_TITLE_LENGTH,
+@@ -96,6 +98,13 @@ function readImportEntry(raw: unknown, index: number): CalendarEntryInput {
+     entry.dept = value.dept;
+   }
+   if (value.milestone === true) entry.milestone = true;
++  if (value.show !== undefined) {
++    if (!(CALENDAR_SHOW_VALUES as readonly unknown[]).includes(value.show))
++      fail(
++        `${where} (${title}): 표시 위치는 both, sprint, calendar 중 하나여야 합니다.`,
++      );
++    entry.show = value.show as CalendarShow;
++  }
+   if (value.repeat !== undefined) {
+     const repeat = value.repeat as Record<string, unknown> | null;
+     if (
+@@ -281,6 +290,7 @@ export function buildCalendarBackup(input: {
+     if (entry.note) out.note = entry.note;
+     if (entry.dept) out.dept = entry.dept;
+     if (entry.milestone) out.milestone = true;
++    if (entry.show) out.show = entry.show;
+     if (entry.repeat) out.repeat = entry.repeat;
+     return out;
+   });
+diff --git a/desktop/src/features/team-calendar/lib/exportModel.ts b/desktop/src/features/team-calendar/lib/exportModel.ts
+index 61d3d3687..b171ea844 100644
+--- a/desktop/src/features/team-calendar/lib/exportModel.ts
++++ b/desktop/src/features/team-calendar/lib/exportModel.ts
+@@ -5,6 +5,7 @@ import {
+   entryEndDate,
+   expandRepeats,
+   monthGrid,
++  showsOnCalendar,
+ } from "./teamCalendar";
+ import {
+   type PhaseTone,
+@@ -171,7 +172,11 @@ export function calendarPages(input: {
+     const grid = monthGrid(month);
+     const first = grid[0]?.date ?? `${month}-01`;
+     const last = grid[grid.length - 1]?.date ?? `${month}-28`;
+-    const shown = expandRepeats(input.entries, first, last);
++    const shown = expandRepeats(
++      input.entries.filter(showsOnCalendar),
++      first,
++      last,
++    );
+     const weeks: (typeof grid)[] = [];
+     for (let start = 0; start < grid.length; start += 7)
+       weeks.push(grid.slice(start, start + 7));
+diff --git a/desktop/src/features/team-calendar/lib/teamCalendar.ts b/desktop/src/features/team-calendar/lib/teamCalendar.ts
+index 999974874..0177f7806 100644
+--- a/desktop/src/features/team-calendar/lib/teamCalendar.ts
++++ b/desktop/src/features/team-calendar/lib/teamCalendar.ts
+@@ -135,6 +135,13 @@ export type CalendarEntry = {
+   dept?: string;
+   /** A one-day deadline or event (◆ on the sprint board). */
+   milestone?: true;
++  /**
++   * Which view shows the entry (see `entryShow`). Absent = decided by the
++   * entry: a repeating entry (a regular meeting) shows on the calendar only,
++   * any other entry on both. Added by patch 110; older team apps drop it
++   * when they re-save the entry.
++   */
++  show?: CalendarShow;
+   /** Milliseconds since epoch of the last edit. */
+   updatedAt: number;
+   /** Pubkey of the member who made the last edit. */
+@@ -142,6 +149,31 @@ export type CalendarEntry = {
+   deleted?: true;
+ };
+ 
++/**
++ * Where an entry shows: `both` views, the sprint board only (a goal) or the
++ * calendar only (a step such as a meeting).
++ */
++export type CalendarShow = "both" | "sprint" | "calendar";
++
++export const CALENDAR_SHOW_VALUES: readonly CalendarShow[] = [
++  "both",
++  "sprint",
++  "calendar",
++];
++
++/** The view(s) `entry` shows in; an entry without `show` uses the default. */
++export function entryShow(entry: Pick<CalendarEntry, "show" | "repeat">) {
++  if (entry.show) return entry.show;
++  return entry.repeat ? "calendar" : "both";
++}
++
++export const showsOnSprint = (entry: Pick<CalendarEntry, "show" | "repeat">) =>
++  entryShow(entry) !== "calendar";
++
++export const showsOnCalendar = (
++  entry: Pick<CalendarEntry, "show" | "repeat">,
++) => entryShow(entry) !== "sprint";
++
+ /** Every entry of one month by id, deletions included. */
+ export type CalendarMonth = Record<string, CalendarEntry>;
+ 
+@@ -352,6 +384,11 @@ function readEntry(
+   if (typeof value.dept === "string" && DEPT_KEY_PATTERN.test(value.dept))
+     entry.dept = value.dept;
+   if (value.milestone === true) entry.milestone = true;
++  if (
++    typeof value.show === "string" &&
++    (CALENDAR_SHOW_VALUES as readonly string[]).includes(value.show)
++  )
++    entry.show = value.show as CalendarShow;
+   if (deleted) entry.deleted = true;
+   return entry;
+ }
+@@ -394,7 +431,8 @@ const richness = (entry: CalendarEntry) =>
+   (entry.sourceEventId ? 1 : 0) +
+   (entry.notify ? 1 : 0) +
+   (entry.dept ? 1 : 0) +
+-  (entry.milestone ? 1 : 0);
++  (entry.milestone ? 1 : 0) +
++  (entry.show ? 1 : 0);
+ 
+ /**
+  * True when `candidate` replaces `current` (later edit, then higher pubkey).
+diff --git a/desktop/src/features/team-calendar/lib/teamSprint.test.mjs b/desktop/src/features/team-calendar/lib/teamSprint.test.mjs
+index 68df5e547..8f3892e88 100644
+--- a/desktop/src/features/team-calendar/lib/teamSprint.test.mjs
++++ b/desktop/src/features/team-calendar/lib/teamSprint.test.mjs
+@@ -2,6 +2,13 @@ import assert from "node:assert/strict";
+ import test from "node:test";
+ 
+ import { assignMonthSlots } from "./monthSlots.ts";
++import {
++  decodeMonth,
++  encodeMonth,
++  entryShow,
++  showsOnCalendar,
++  showsOnSprint,
++} from "./teamCalendar.ts";
+ import {
+   UNASSIGNED_ROW,
+   dDayLabel,
+@@ -160,7 +167,7 @@ test("an entry shows in every week it covers, in its department's row", () => {
+   assert.equal(post[12].length, 0);
+ });
+ 
+-test("repeating entries fill every week until their end", () => {
++test("repeating entries marked for the board fill every week until their end", () => {
+   const cells = sprintCells(plan(), [
+     entry("meet", {
+       title: "기획",
+@@ -168,6 +175,7 @@ test("repeating entries fill every week until their end", () => {
+       time: "14:30",
+       dept: "MEET",
+       repeat: { every: "weekly", until: "2026-12-28" },
++      show: "both",
+     }),
+   ]);
+   const meet = cells.get("MEET");
+@@ -177,6 +185,50 @@ test("repeating entries fill every week until their end", () => {
+   assert.equal(meet[1][0].label, "월 14:30 기획");
+ });
+ 
++test("show decides the view: repeats default to the calendar, the rest to both", () => {
++  const weekly = { every: "weekly", until: "2026-12-28" };
++  const entries = [
++    entry("keystaff", { date: "2026-09-16", time: "20:00", repeat: weekly }),
++    entry("goal", { date: "2026-10-01", dept: "ALL", show: "sprint" }),
++    entry("meeting", { date: "2026-10-02", dept: "ALL", show: "calendar" }),
++    entry("both", { date: "2026-10-03", dept: "ALL" }),
++  ];
++  assert.deepEqual(
++    entries.map(entryShow),
++    ["calendar", "sprint", "calendar", "both"],
++  );
++  assert.deepEqual(
++    entries.filter(showsOnSprint).map((e) => e.id),
++    ["goal", "both"],
++  );
++  assert.deepEqual(
++    entries.filter(showsOnCalendar).map((e) => e.id),
++    ["keystaff", "meeting", "both"],
++  );
++  const cells = sprintCells(plan(), entries);
++  // The weekly meeting has no department: it would have made a 부서 미지정
++  // row on every week. Now it stays on the calendar only.
++  assert.equal(cells.has(UNASSIGNED_ROW), false);
++  assert.equal(
++    sprintRows(plan(), entries).some((row) => row.key === UNASSIGNED_ROW),
++    false,
++  );
++  assert.deepEqual(
++    cells.get("ALL")[2].map((item) => item.entry.id),
++    ["goal", "both"],
++  );
++});
++
++test("show survives a round trip and bad values are dropped", () => {
++  const month = {
++    a: entry("a", { date: "2026-10-01", show: "sprint" }),
++    b: { ...entry("b", { date: "2026-10-02" }), show: "nowhere" },
++  };
++  const back = decodeMonth(encodeMonth(month), "2026-10");
++  assert.equal(back.a.show, "sprint");
++  assert.equal(back.b.show, undefined);
++});
++
+ test("entries without a known department go to the 부서 미지정 row", () => {
+   const entries = [
+     entry("loose", { date: "2026-10-01" }),
+diff --git a/desktop/src/features/team-calendar/lib/teamSprint.ts b/desktop/src/features/team-calendar/lib/teamSprint.ts
+index 555bc1321..6b0c5e6ca 100644
+--- a/desktop/src/features/team-calendar/lib/teamSprint.ts
++++ b/desktop/src/features/team-calendar/lib/teamSprint.ts
+@@ -13,6 +13,7 @@ import {
+   expandRepeats,
+   monthOfDate,
+   shiftMonth,
++  showsOnSprint,
+ } from "./teamCalendar";
+ 
+ /**
+@@ -417,7 +418,7 @@ export function sprintRows(
+   const known = new Set(plan.depts.map((dept) => dept.key));
+   const start = plan.start;
+   const end = planEnd(plan);
+-  const hasLoose = expandRepeats(entries, start, end).some(
++  const hasLoose = expandRepeats(entries.filter(showsOnSprint), start, end).some(
+     (entry) =>
+       (!entry.dept || !known.has(entry.dept)) &&
+       entry.date <= end &&
+@@ -431,7 +432,8 @@ export function sprintRows(
+  * Items of every cell: `cells[rowKey][weekIndex]`. An entry shows in every
+  * week it covers (a 12/20–12/22 edit shows in both of its weeks), in its
+  * department's row; an entry without a known department goes to the
+- * "부서 미지정" row so nothing on the calendar is missing from the board.
++ * "부서 미지정" row. Entries marked for the calendar only (`entryShow`, e.g.
++ * a regular meeting) are left off the board.
+  */
+ export function sprintCells(
+   plan: SprintPlan,
+@@ -449,7 +451,11 @@ export function sprintCells(
+     return row;
+   };
+   for (const dept of plan.depts) rowOf(dept.key);
+-  const occurrences = expandRepeats(entries, plan.start, planEnd(plan));
++  const occurrences = expandRepeats(
++    entries.filter(showsOnSprint),
++    plan.start,
++    planEnd(plan),
++  );
+   for (const entry of occurrences) {
+     const key =
+       entry.dept && known.has(entry.dept) ? entry.dept : UNASSIGNED_ROW;
+diff --git a/desktop/src/features/team-calendar/lib/useTeamCalendar.ts b/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
+index 4f235e9f7..e339d24e8 100644
+--- a/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
++++ b/desktop/src/features/team-calendar/lib/useTeamCalendar.ts
+@@ -10,6 +10,8 @@ import {
+   type CalendarMonth,
+   type CalendarNotify,
+   type CalendarRepeat,
++  type CalendarShow,
++  CALENDAR_SHOW_VALUES,
+   DEPT_KEY_PATTERN,
+   MAX_ATTENDEES,
+   MAX_NOTE_LENGTH,
+@@ -54,6 +56,8 @@ export type CalendarEntryInput = {
+   /** Sprint board department key; leave out for none. */
+   dept?: string;
+   milestone?: boolean;
++  /** Which view shows the entry; leave out for the default (`entryShow`). */
++  show?: CalendarShow;
+ };
+ 
+ /** The input that saves `entry` again unchanged (to change one field of it). */
+@@ -73,6 +77,7 @@ export const inputOfEntry = (entry: CalendarEntry): CalendarEntryInput => ({
+   notify: entry.notify,
+   dept: entry.dept,
+   milestone: entry.milestone,
++  show: entry.show,
+ });
+ 
+ export type TeamCalendarStatus = "loading" | "ready" | "error";
+@@ -176,6 +181,8 @@ function buildEntry(
+   }
+   if (input.dept && DEPT_KEY_PATTERN.test(input.dept)) entry.dept = input.dept;
+   if (input.milestone) entry.milestone = true;
++  if (input.show && CALENDAR_SHOW_VALUES.includes(input.show))
++    entry.show = input.show;
+   return entry;
+ }
+ 
+diff --git a/desktop/src/features/team-calendar/ui/EntryForm.tsx b/desktop/src/features/team-calendar/ui/EntryForm.tsx
+index df12a6fca..f06f37632 100644
+--- a/desktop/src/features/team-calendar/ui/EntryForm.tsx
++++ b/desktop/src/features/team-calendar/ui/EntryForm.tsx
+@@ -3,6 +3,7 @@ import type * as React from "react";
+ import {
+   type CalendarColor,
+   type CalendarOccurrence,
++  type CalendarShow,
+   CALENDAR_COLORS,
+   MAX_NOTE_LENGTH,
+   MAX_TITLE_LENGTH,
+@@ -79,6 +80,8 @@ export type Draft = {
+   dept: string;
+   /** A one-day deadline/event (◆). */
+   milestone: boolean;
++  /** Which view shows the entry ("" = default, see `entryShow`). */
++  show: CalendarShow | "";
+ };
+ 
+ export const emptyDraft = (date: string): Draft => ({
+@@ -98,6 +101,7 @@ export const emptyDraft = (date: string): Draft => ({
+   notifyNow: false,
+   dept: "",
+   milestone: false,
++  show: "",
+ });
+ 
+ /** The draft that edits `entry` (for a repeating entry: the whole series). */
+@@ -124,6 +128,7 @@ export function draftOf(entry: CalendarOccurrence): Draft {
+     notifyNow: false,
+     dept: entry.dept ?? "",
+     milestone: entry.milestone === true,
++    show: entry.show ?? "",
+   };
+ }
+ 
+@@ -190,6 +195,7 @@ export function inputOfDraft(draft: Draft): CalendarEntryInput {
+       : undefined,
+     dept: draft.dept || undefined,
+     milestone: draft.milestone || undefined,
++    show: draft.show || undefined,
+   };
+ }
+ 
+@@ -295,6 +301,31 @@ export function EntryForm({
+           </label>
+         </div>
+       ) : null}
++      {depts.length > 0 ? (
++        <label className="flex flex-col gap-1 text-xs">
++          어디에 보일까요
++          <select
++            className={SELECT_CLASS}
++            data-testid="team-calendar-show"
++            onChange={(event) =>
++              onChange({
++                ...draft,
++                show: event.target.value as CalendarShow | "",
++              })
++            }
++            value={draft.show}
++          >
++            <option value="">
++              {draft.repeat
++                ? "자동 (반복 일정이라 캘린더만)"
++                : "자동 (스프린트·캘린더 둘 다)"}
++            </option>
++            <option value="both">스프린트·캘린더 둘 다</option>
++            <option value="sprint">스프린트만 (목표)</option>
++            <option value="calendar">캘린더만 (회의 같은 과정)</option>
++          </select>
++        </label>
++      ) : null}
+       <div className="flex gap-2">
+         <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs">
+           시작 날짜
+diff --git a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+index 50862c459..3c546660e 100644
+--- a/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
++++ b/desktop/src/features/team-calendar/ui/TeamCalendarDialog.tsx
+@@ -23,6 +23,7 @@ import {
+   monthGrid,
+   monthOfDate,
+   monthsAround,
++  showsOnCalendar,
+   todayKey,
+ } from "@/features/team-calendar/lib/teamCalendar";
+ import { channelNoticeText } from "@/features/team-calendar/lib/teamReminders";
+@@ -199,13 +200,18 @@ export function TeamCalendarDialog({
+     plan.depts.find((dept) => dept.key === key)?.label;
+ 
+   const gridWeeks = React.useMemo(() => weeksOf(monthGrid(month)), [month]);
++  /** Entries the month view shows (sprint-only goals stay on the board). */
++  const calendarEntries = React.useMemo(
++    () => entries.filter(showsOnCalendar),
++    [entries],
++  );
+   const monthEntries = React.useMemo(() => {
+     const first = gridWeeks[0]?.[0]?.date ?? `${month}-01`;
+     const last = gridWeeks[5]?.[6]?.date ?? `${month}-28`;
+-    return expandRepeats(entries, first, last);
+-  }, [entries, gridWeeks, month]);
++    return expandRepeats(calendarEntries, first, last);
++  }, [calendarEntries, gridWeeks, month]);
+   const selectedEntries = entriesOnDate(
+-    expandRepeats(entries, selectedDate, selectedDate),
++    expandRepeats(calendarEntries, selectedDate, selectedDate),
+     selectedDate,
+   );
+ 
